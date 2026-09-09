@@ -1,0 +1,34 @@
+# `reach.runtime`
+
+Agent execution runtime interfaces, CLI subprocess template drivers, Antigravity domain bridges, and trajectory telemetry.
+
+<!-- prettier-ignore -->
+::: reach.runtime
+    options:
+      show_root_heading: false
+      members:
+        - agent_default_model
+        - AgentOptions
+        - AgentRuntime
+        - AntigravityRuntime
+        - build_runtime
+        - build_text_generator
+        - CatalogFit
+        - cli_agents
+        - CliAgentRuntime
+        - CliOptions
+        - FAKE_AGENT
+        - find_agent_for_model
+        - known_agents
+        - options_model
+        - register_agent
+        - resolve_options
+        - SelectionOutcome
+        - SessionStatus
+        - SessionSummary
+        - SkillRoot
+        - SkillSelectionBase
+        - TextGenerator
+        - ToolCallInfo
+        - TrajectoryTracker
+        - TwoStageRetrieverRuntime

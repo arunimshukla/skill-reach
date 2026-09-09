@@ -1,0 +1,156 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Calculate statistical confidence intervals and power for rate metrics."""
+
+from __future__ import annotations
+
+import math
+from statistics import NormalDist
+from typing import Self
+
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+__all__ = [
+    "DEFAULT_CONFIDENCE",
+    "DEFAULT_POWER",
+    "Interval",
+    "critical_value",
+    "detectable_delta",
+    "required_probes",
+    "wilson_interval",
+]
+
+#: Default confidence level for statistical intervals (95%).
+DEFAULT_CONFIDENCE = 0.95
+
+#: Default statistical power for hypothesis comparisons (80%).
+DEFAULT_POWER = 0.80
+
+
+def _z(tail: float) -> float:
+    """Calculate the standard normal deviate leaving tail probability above it."""
+    return NormalDist().inv_cdf(1.0 - tail)
+
+
+def _checked_confidence(confidence: float) -> float:
+    """Validate that confidence level lies strictly in (0, 1)."""
+    if not 0.0 < confidence < 1.0:
+        msg = f"confidence must lie strictly between 0 and 1, got {confidence}"
+        raise ValueError(
+            msg,
+        )
+    return confidence
+
+
+def critical_value(confidence: float = DEFAULT_CONFIDENCE) -> float:
+    """Calculate two-sided normal critical value for a given confidence level."""
+    return _z((1.0 - _checked_confidence(confidence)) / 2.0)
+
+
+class Interval(BaseModel):
+    """Represent a statistical confidence interval with lower and upper bounds."""
+
+    model_config = ConfigDict(frozen=True)
+
+    low: float = Field(ge=0.0, le=1.0)
+    high: float = Field(ge=0.0, le=1.0)
+    confidence: float = Field(default=DEFAULT_CONFIDENCE, gt=0.0, lt=1.0)
+
+    @model_validator(mode="after")
+    def _bounds_are_ordered(self) -> Self:
+        """Validate that lower bound does not exceed upper bound."""
+        if self.low > self.high:
+            msg = f"interval bounds are inverted: [{self.low}, {self.high}]"
+            raise ValueError(msg)
+        return self
+
+    @property
+    def width(self) -> float:
+        """Return the span (high - low) of the confidence interval."""
+        return self.high - self.low
+
+    def excludes(self, rate: float) -> bool:
+        """Return True if rate falls strictly outside the interval bounds."""
+        return not self.low <= rate <= self.high
+
+    def overlaps(self, other: Interval) -> bool:
+        """Return True if this interval intersects with another interval."""
+        return self.low <= other.high and other.low <= self.high
+
+
+def wilson_interval(
+    hits: int,
+    probes: int,
+    confidence: float = DEFAULT_CONFIDENCE,
+) -> Interval | None:
+    """Calculate the Wilson score confidence interval for a binomial proportion."""
+    if probes < 0:
+        msg = f"probes cannot be negative, got {probes}"
+        raise ValueError(msg)
+    if not 0 <= hits <= probes:
+        msg = f"{hits} hits is not a possible count out of {probes} probes"
+        raise ValueError(msg)
+    if not probes:
+        return None
+
+    z = critical_value(confidence)
+    z2 = z * z
+    denominator = probes + z2
+    center = (hits + z2 / 2.0) / denominator
+    half = z / denominator * math.sqrt(hits * (probes - hits) / probes + z2 / 4.0)
+    return Interval(
+        low=0.0 if hits == 0 else max(0.0, center - half),
+        high=1.0 if hits == probes else min(1.0, center + half),
+        confidence=confidence,
+    )
+
+
+def _two_proportion_constant(alpha: float, power: float) -> float:
+    """Compute the pooled two-proportion sample size constant."""
+    return (_z(alpha / 2.0) + _z(1.0 - power)) ** 2 * 0.5
+
+
+def required_probes(
+    delta: float,
+    confidence: float = DEFAULT_CONFIDENCE,
+    power: float = DEFAULT_POWER,
+) -> int:
+    """Calculate sample size per arm required to detect a rate delta with power."""
+    if not 0.0 < delta <= 1.0:
+        msg = f"delta must lie in (0, 1], got {delta}"
+        raise ValueError(msg)
+    alpha = 1.0 - _checked_confidence(confidence)
+    if not 0.0 < power < 1.0:
+        msg = f"power must lie strictly between 0 and 1, got {power}"
+        raise ValueError(msg)
+    return math.ceil(_two_proportion_constant(alpha, power) / (delta * delta))
+
+
+def detectable_delta(
+    probes: int,
+    confidence: float = DEFAULT_CONFIDENCE,
+    power: float = DEFAULT_POWER,
+) -> float | None:
+    """Calculate the minimum detectable rate delta for a given sample size per arm."""
+    if probes < 0:
+        msg = f"probes cannot be negative, got {probes}"
+        raise ValueError(msg)
+    if not probes:
+        return None
+    alpha = 1.0 - _checked_confidence(confidence)
+    if not 0.0 < power < 1.0:
+        msg = f"power must lie strictly between 0 and 1, got {power}"
+        raise ValueError(msg)
+    return min(1.0, math.sqrt(_two_proportion_constant(alpha, power) / probes))

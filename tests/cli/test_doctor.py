@@ -1,0 +1,181 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Test suite for reach doctor environment diagnostics CLI command."""
+
+from __future__ import annotations
+
+from pathlib import Path
+from unittest.mock import patch
+
+import pytest
+
+from reach.cli import main
+from reach.cli.doctor import (
+    _check_cli_binary,
+    _check_config,
+    _check_env_var,
+    _check_google_adc,
+    _check_python,
+    _check_sdk,
+    _check_skills,
+)
+from reach.views import build_console, render_doctor_table
+
+
+def test_doctor_help(capsys: pytest.CaptureFixture[str]) -> None:
+    """Verify reach doctor --help displays options and exits 0."""
+    assert main(["doctor", "--help"]) == 0
+    captured = capsys.readouterr()
+    out = captured.out + captured.err
+    assert "doctor" in out
+    assert "--verbose" in out
+
+
+def test_doctor_runs_cleanly(capsys: pytest.CaptureFixture[str], tmp_path: Path) -> None:
+    """Verify reach doctor runs all diagnostics and outputs results."""
+    assert main(["doctor", "--path", str(tmp_path)]) == 0
+    captured = capsys.readouterr()
+    out = captured.out + captured.err
+    assert "Reach Environment & Runtime Diagnostics" in out
+    assert "Python Version" in out
+    assert "Claude Code" in out
+    assert "Keyword" in out
+
+
+def test_doctor_verbose_includes_remedy_panel(
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    """Verify reach doctor --verbose renders Recommended Actions panel."""
+    assert main(["doctor", "--verbose", "--path", str(tmp_path)]) == 0
+    captured = capsys.readouterr()
+    out = captured.out + captured.err
+    assert "Recommended Actions" in out
+
+
+def test_check_python_supported() -> None:
+    """Verify Python version check passes on Python >= 3.12."""
+    res = _check_python((3, 13, 0))
+    assert res.category == "Python Environment"
+    assert res.status == "ok"
+
+
+def test_check_python_unsupported() -> None:
+    """Verify Python check fails on unsupported major.minor versions."""
+    res = _check_python((3, 11, 0))
+    assert res.status == "fail"
+    assert "unsupported" in res.detail
+
+
+def test_check_cli_binary_found_and_missing() -> None:
+    """Verify CLI binary checks detect presence and absence properly."""
+    with patch("shutil.which", return_value="/usr/local/bin/claude"):
+        res = _check_cli_binary("Claude Code CLI", "claude", "claude-code")
+        assert res.status == "ok"
+        assert "/usr/local/bin/claude" in res.detail
+
+    with patch("shutil.which", return_value=None):
+        res = _check_cli_binary("Goose CLI", "goose", "goose")
+        assert res.status == "warn"
+        assert "not found in PATH" in res.detail
+
+
+def test_check_sdk_installed_and_missing() -> None:
+    """Verify SDK module checks reflect importability."""
+    with patch("importlib.util.find_spec", return_value=object()):
+        res = _check_sdk("Antigravity SDK", "google.antigravity", "antigravity-sdk")
+        assert res.status == "ok"
+
+    with patch("importlib.util.find_spec", return_value=None):
+        res = _check_sdk("Antigravity SDK", "google.antigravity", "antigravity-sdk")
+        assert res.status == "warn"
+        assert "not installed" in res.detail
+
+
+def test_check_env_var_reports_configured_without_displaying_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify environment check confirms configuration without leaking API keys."""
+    monkeypatch.setenv("TEST_API_KEY", "super-secret-key-12345")
+    res = _check_env_var("TEST_API_KEY", "testing purpose")
+    assert res.status == "ok"
+    assert res.detail == "configured"
+    assert "super-secret-key" not in res.detail
+
+
+def test_check_google_adc(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify Google ADC check identifies custom and standard credential files."""
+    custom_cred = tmp_path / "creds.json"
+    custom_cred.write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", str(custom_cred))
+    res = _check_google_adc()
+    assert res.status == "ok"
+    assert "GOOGLE_APPLICATION_CREDENTIALS" in res.detail
+
+
+@pytest.mark.parametrize(
+    ("rel_path", "expected_label"),
+    [
+        (".agents/skills", ".agents/skills/"),
+        (".claude/skills", ".claude/skills/"),
+        (".cursor/skills", ".cursor/skills/"),
+        (".github/skills", ".github/skills/"),
+        (".pi/skills", ".pi/skills/"),
+        ("skills", "skills/"),
+    ],
+)
+def test_check_skills_discovers_skills_across_standard_dirs(
+    tmp_path: Path, rel_path: str, expected_label: str
+) -> None:
+    """Verify skill detection finds skills in all standard subdirectories."""
+    skill_dir = tmp_path / Path(rel_path) / "test-skill"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: test-skill\ndescription: A test skill\n---\n",
+        encoding="utf-8",
+    )
+    res = _check_skills(tmp_path)
+    assert res.status == "ok"
+    assert f"1 in {expected_label}" in res.detail
+
+
+def test_check_skills_warns_when_empty(tmp_path: Path) -> None:
+    """Verify skill detection warns with all standard paths when no skills exist."""
+    res = _check_skills(tmp_path)
+    assert res.status == "warn"
+    assert ".github/skills" in res.detail
+    assert ".pi/skills" in res.detail
+
+
+def test_check_config_valid_and_invalid(tmp_path: Path) -> None:
+    """Verify reach.toml validation identifies valid and malformed configs."""
+    cfg = tmp_path / "reach.toml"
+    cfg.write_text('[runtime]\nagent = "keyword"\n', encoding="utf-8")
+    res = _check_config(tmp_path)
+    assert res.status == "ok"
+    assert "default agent: 'keyword'" in res.detail
+
+    cfg.write_text("invalid = toml [ broken", encoding="utf-8")
+    res_err = _check_config(tmp_path)
+    assert res_err.status == "fail"
+
+
+def test_render_doctor_returns_1_on_failure() -> None:
+    """Verify render_doctor exits 1 when any diagnostic failure is recorded."""
+    console = build_console(quiet=True)
+    fail_res = [
+        ("Env", "Python", "fail", "Version 3.9 unsupported", "Upgrade Python"),
+    ]
+    assert render_doctor_table(console, fail_res) == 1

@@ -1,0 +1,453 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Verify the two-stage CI/CD quality gate engine (`reach check`)."""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import TYPE_CHECKING
+from unittest.mock import patch
+
+import pytest
+from pydantic import ValidationError
+
+from reach.check import (
+    CheckStage,
+    EmpiricalMetrics,
+    _build_check_assertions,
+    changed_skills,
+    run_check,
+)
+from reach.config import CheckSettings, RunConfig
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+
+def test_stage1_fail_fast_on_error(
+    write_skill: Callable[..., Path],
+    write_queries: Callable[..., Path],
+    tmp_path: Path,
+) -> None:
+    """Verify that Stage 1 static errors abort execution instantly with exit code 1."""
+    # Create a skill with invalid naming
+    write_skill(
+        name="BadName",
+        description="A sufficiently detailed description that satisfies standard rules.",
+    )
+    queries_file = write_queries(target="BadName", count=5)
+
+    outcome = run_check(
+        skills_paths=[tmp_path / "BadName"],
+        queries_path=queries_file,
+    )
+
+    assert outcome.exit_code == 1
+    assert outcome.stage_failed is CheckStage.STATIC
+    assert outcome.lint_report.has_errors
+    assert outcome.probes_executed == 0  # Abort before issuing probes or API calls
+
+
+def test_stage1_fail_fast_on_strict_warning(
+    write_skill: Callable[..., Path],
+    tmp_path: Path,
+) -> None:
+    """Verify that Stage 1 warnings fail under strict=True with exit code 1."""
+    # Verify short descriptions trigger warnings under default configuration
+    write_skill(
+        name="short-skill",
+        description="Short desc",
+    )
+
+    outcome = run_check(
+        skills_paths=[tmp_path / "short-skill"],
+        strict=True,
+    )
+
+    assert outcome.exit_code == 1
+    assert outcome.stage_failed is CheckStage.STATIC
+    assert outcome.lint_report.warnings
+    assert outcome.probes_executed == 0
+
+
+def test_stage1_pass_on_warning_when_not_strict(
+    write_skill: Callable[..., Path],
+    tmp_path: Path,
+) -> None:
+    """Verify that Stage 1 warnings pass under strict=False."""
+    write_skill(
+        name="short-skill",
+        description="Short desc",
+    )
+
+    outcome = run_check(
+        skills_paths=[tmp_path / "short-skill"],
+        strict=False,
+    )
+
+    assert outcome.exit_code == 0
+    assert outcome.stage_failed is None
+
+
+def test_stage1_clean_without_queries_exits_0(
+    write_skill: Callable[..., Path],
+    tmp_path: Path,
+) -> None:
+    """Verify that clean skill manifests without queries pass Stage 1 and exit 0."""
+    write_skill(
+        name="valid-skill",
+        description="A sufficiently detailed description that satisfies standard rules.",
+    )
+
+    outcome = run_check(skills_paths=[tmp_path / "valid-skill"])
+
+    assert outcome.exit_code == 0
+    assert outcome.stage_failed is None
+    assert outcome.skills_checked == 1
+    assert outcome.probes_executed == 0
+
+
+def test_stage2_empirical_pass(
+    write_skill: Callable[..., Path],
+    write_queries: Callable[..., Path],
+) -> None:
+    """Verify Stage 2 passes when empirical assertions meet configured thresholds."""
+    skill_dir = write_skill(
+        name="calc-skill",
+        description="Perform calculations and math conversions accurately and quickly.",
+    )
+    queries_file = write_queries(target="calc-skill", count=4)
+
+    outcome = run_check(
+        skills_paths=[skill_dir],
+        queries_path=queries_file,
+        agent="keyword",
+        min_recall=0.75,
+        min_accuracy=0.75,
+        max_misroute=0.20,
+    )
+
+    assert outcome.exit_code == 0
+    assert outcome.stage_failed is None
+    assert outcome.probes_executed > 0
+    assert len(outcome.assertions) > 0
+    assert all(a.passed for a in outcome.assertions)
+
+
+def test_stage2_empirical_regression_recall(
+    write_skill: Callable[..., Path],
+    write_queries: Callable[..., Path],
+) -> None:
+    """Verify Stage 2 fails with exit code 2 when observed recall drops below threshold."""
+    skill_dir = write_skill(
+        name="deploy-skill",
+        description="Deploy containerized applications to cloud platforms seamlessly.",
+    )
+    queries_file = write_queries(target="deploy-skill", count=4)
+
+    outcome = run_check(
+        skills_paths=[skill_dir],
+        queries_path=queries_file,
+        agent="keyword",
+        min_recall=1.0,  # Enforce 100% recall requirement
+    )
+
+    if not all(a.passed for a in outcome.assertions):
+        assert outcome.exit_code == 2
+        assert outcome.stage_failed is CheckStage.EMPIRICAL
+        failed = [a for a in outcome.assertions if not a.passed]
+        assert len(failed) > 0
+
+
+def test_stage2_probe_budget_limit(
+    write_skill: Callable[..., Path],
+    write_queries: Callable[..., Path],
+) -> None:
+    """Verify check respects probe budget upper bound."""
+    skill_dir = write_skill(
+        name="math-skill",
+        description="A sufficiently detailed description that satisfies standard rules.",
+    )
+    queries_file = write_queries(target="math-skill", count=10)
+
+    outcome = run_check(
+        skills_paths=[skill_dir],
+        queries_path=queries_file,
+        agent="keyword",
+        budget=2,
+    )
+
+    assert outcome.probes_executed <= 2
+
+
+def test_changed_skills_parsing() -> None:
+    """Verify changed_skills extracts modified skill names from git diff output."""
+    mock_diff = (
+        ".agents/skills/deploy-service/SKILL.md\n"
+        "src/reach/main.py\n"
+        "skills/code-review/SKILL.md\n"
+        ".claude/skills/lint-code/scripts/run.py\n"
+        ".cursor/skills/editor-skill/SKILL.md\n"
+        ".pi/skills/pi-task/helper.py\n"
+        "skills/code-review/tests/test_aux.py\n"
+        ".agents/skills/README.md\n"
+        "README.md\n"
+    )
+    with patch("subprocess.run") as mock_run:
+        mock_run.return_value.returncode = 0
+        mock_run.return_value.stdout = mock_diff
+
+        changed = changed_skills(since="origin/main")
+        assert "deploy-service" in changed
+        assert "code-review" in changed
+        assert "lint-code" in changed
+        assert "editor-skill" in changed
+        assert "pi-task" in changed
+        assert "main.py" not in changed
+        assert len(changed) == 5
+
+
+def test_changed_skills_git_error_raises_value_error() -> None:
+    """Verify changed_skills raises ValueError when git diff fails."""
+    with patch("subprocess.run") as mock_run:
+        mock_run.return_value.returncode = 128
+        mock_run.return_value.stderr = "fatal: bad revision 'bad-ref'"
+
+        with pytest.raises(ValueError, match="git diff failed"):
+            changed_skills(since="bad-ref")
+
+
+@pytest.mark.parametrize(
+    "stderr_msg",
+    [
+        "fatal: bad revision 'HEAD~1'",
+        "fatal: ambiguous argument 'HEAD~1': unknown revision or path not in the working tree.",
+        "fatal: shallow clone has insufficient history",
+    ],
+)
+def test_changed_skills_shallow_or_bad_revision_includes_hint(stderr_msg: str) -> None:
+    """Verify changed_skills raises ValueError with CI shallow clone guidance on revision errors."""
+    with patch("subprocess.run") as mock_run:
+        mock_run.return_value.returncode = 128
+        mock_run.return_value.stderr = stderr_msg
+
+        with pytest.raises(ValueError, match="fetch-depth: 0"):
+            changed_skills(since="HEAD~1")
+
+
+def test_changed_skills_missing_git_returns_empty_tuple() -> None:
+    """Verify changed_skills returns () safely when git executable raises OSError."""
+    with patch("subprocess.run", side_effect=FileNotFoundError("git not found")):
+        assert changed_skills(since="HEAD~1") == ()
+
+
+def test_run_check_non_existent_path_raises_value_error() -> None:
+    """Verify run_check raises ValueError on missing skill paths."""
+    from pathlib import Path
+
+    with pytest.raises(ValueError, match="skill path does not exist"):
+        run_check(skills_paths=[Path("/non/existent/path")])
+
+
+def test_run_check_budget_less_than_one_raises_value_error(
+    write_skill: Callable[..., Path],
+) -> None:
+    """Verify run_check rejects budget < 1."""
+    skill_dir = write_skill(
+        name="valid-skill",
+        description="Valid description with sufficient length.",
+    )
+    with pytest.raises((ValueError, ValidationError)):
+        run_check(skills_paths=[skill_dir], budget=0)
+
+
+def test_run_check_changed_no_modified_skills_passes_instantly(
+    write_skill: Callable[..., Path],
+) -> None:
+    """Verify run_check passes with 0 probes when no skills changed."""
+    skill_dir = write_skill(
+        name="valid-skill",
+        description="Valid description with sufficient length.",
+    )
+    with patch("reach.check.changed_skills", return_value=()):
+        outcome = run_check(
+            skills_paths=[skill_dir],
+            changed=True,
+            since="origin/main",
+        )
+        assert outcome.passed
+        assert outcome.skills_checked == 0
+        assert outcome.probes_executed == 0
+        assert outcome.exit_code == 0
+
+
+def test_build_check_assertions_trajectory_metrics_pass() -> None:
+    """Verify _build_check_assertions generates passing assertions for all 5 trajectory metrics."""
+    metrics = EmpiricalMetrics(
+        recall=0.90,
+        accuracy=0.90,
+        misroute_rate=0.05,
+        entrypoint_accuracy=0.88,
+        trajectory_reachability=0.92,
+        step_efficiency=0.85,
+        skill_f1=0.90,
+        redundancy=0.20,
+    )
+    settings = CheckSettings(
+        min_recall=0.80,
+        min_accuracy=0.80,
+        max_misroute=0.10,
+        min_entrypoint=0.80,
+        min_reachability=0.85,
+        min_efficiency=0.80,
+        min_f1=0.80,
+        max_redundancy=0.50,
+    )
+    assertions = _build_check_assertions(metrics, settings)
+    assert len(assertions) == 8  # 3 standard + 5 trajectory
+    by_name = {a.name: a for a in assertions}
+    assert by_name["entrypoint"].passed is True
+    assert by_name["reachability"].passed is True
+    assert by_name["step_efficiency"].passed is True
+    assert by_name["skill_f1"].passed is True
+    assert by_name["redundancy"].passed is True
+
+
+@pytest.mark.parametrize(
+    ("metric_kwarg", "observed_kwarg", "metric_name", "expected_msg_fragment"),
+    [
+        (
+            {"min_entrypoint": 0.85},
+            {"entrypoint_accuracy": 0.70},
+            "entrypoint",
+            "Entrypoint accuracy regression",
+        ),
+        (
+            {"min_reachability": 0.90},
+            {"trajectory_reachability": 0.75},
+            "reachability",
+            "Reachability regression",
+        ),
+        (
+            {"min_efficiency": 0.80},
+            {"step_efficiency": 0.60},
+            "step_efficiency",
+            "Step efficiency regression",
+        ),
+        ({"min_f1": 0.80}, {"skill_f1": 0.50}, "skill_f1", "Skill F1 regression"),
+        ({"max_redundancy": 0.50}, {"redundancy": 1.20}, "redundancy", "Redundancy regression"),
+    ],
+)
+def test_build_check_assertions_trajectory_metrics_fail(
+    metric_kwarg: dict[str, float],
+    observed_kwarg: dict[str, float],
+    metric_name: str,
+    expected_msg_fragment: str,
+) -> None:
+    """Verify _build_check_assertions detects regressions on each trajectory metric."""
+    metrics = EmpiricalMetrics(
+        recall=0.90,
+        accuracy=0.90,
+        misroute_rate=0.05,
+        **observed_kwarg,
+    )
+    settings = CheckSettings.model_validate(
+        {
+            "min_recall": 0.80,
+            "min_accuracy": 0.80,
+            "max_misroute": 0.10,
+            **metric_kwarg,
+        }
+    )
+    assertions = _build_check_assertions(metrics, settings)
+    matching = [a for a in assertions if a.name == metric_name]
+    assert len(matching) == 1
+    assert matching[0].passed is False
+    assert expected_msg_fragment in matching[0].message
+
+
+def test_run_check_with_trajectory_thresholds_pass_and_fail(
+    write_skill: Callable[..., Path],
+    write_queries: Callable[..., Path],
+    tmp_path: Path,
+) -> None:
+    """Verify run_check evaluates trajectory thresholds end-to-end."""
+    skill_dir = write_skill(
+        name="valid-skill",
+        description="Valid description with sufficient length for deploy skill.",
+    )
+    query_file = write_queries(target="valid-skill", count=3)
+
+    # Happy path: realistic thresholds met
+    pass_outcome = run_check(
+        skills_paths=[skill_dir],
+        queries_path=query_file,
+        agent="keyword",
+        min_entrypoint=0.0,
+        min_reachability=0.0,
+        min_efficiency=0.0,
+        min_f1=0.0,
+        max_redundancy=10.0,
+    )
+    assert pass_outcome.passed is True
+    assert pass_outcome.exit_code == 0
+
+    # Sad path: unattainable entrypoint threshold fails empirical stage
+    query_file_fail = write_queries(target="other-skill", count=3, root=tmp_path / "fail")
+    fail_outcome = run_check(
+        skills_paths=[skill_dir],
+        queries_path=query_file_fail,
+        agent="keyword",
+        min_entrypoint=0.8,
+    )
+    assert fail_outcome.passed is False
+    assert fail_outcome.stage_failed == CheckStage.EMPIRICAL
+    assert fail_outcome.exit_code == 2
+
+
+def test_build_check_assertions_with_pydantic_models() -> None:
+    """Verify _build_check_assertions directly with EmpiricalMetrics and CheckSettings."""
+    metrics = EmpiricalMetrics(
+        recall=0.92,
+        accuracy=0.92,
+        misroute_rate=0.04,
+        entrypoint_accuracy=0.88,
+        trajectory_reachability=0.95,
+        step_efficiency=0.85,
+        skill_f1=0.89,
+        redundancy=0.15,
+    )
+    settings = CheckSettings(
+        min_recall=0.80,
+        min_accuracy=0.80,
+        max_misroute=0.10,
+        min_entrypoint=0.85,
+        min_reachability=0.90,
+        min_efficiency=0.80,
+        min_f1=0.85,
+        max_redundancy=0.50,
+    )
+    assertions = _build_check_assertions(metrics, settings)
+    assert len(assertions) == 8
+    assert all(a.passed for a in assertions)
+
+
+def test_run_config_resolve_check_settings() -> None:
+    """Verify RunConfig.resolve overrides baseline config cleanly with Pydantic."""
+    base = CheckSettings(min_recall=0.75, min_accuracy=0.80, budget=10)
+    resolved = RunConfig.resolve(CheckSettings, explicit_settings=base, min_recall=0.90, budget=25)
+    assert resolved.min_recall == 0.90
+    assert resolved.min_accuracy == 0.80
+    assert resolved.budget == 25

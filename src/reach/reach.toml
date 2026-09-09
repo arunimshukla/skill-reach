@@ -1,0 +1,86 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Bundled model specifications and registry for Reach.
+# Project-level configuration overrides can be placed in ./reach.toml.
+
+[agents.antigravity-cli]
+default_model = "gemini-3.8-flash"
+
+[agents.antigravity-sdk]
+default_model = "gemini-3.8-flash"
+
+[agents.claude-code]
+default_model = "claude-sonnet-5"
+
+[agents.goose]
+default_model = "gemini-3.6-flash"
+
+[agents.pi]
+default_model = "gemini-3.8-flash"
+
+[models.claude-haiku-4-5]
+completion_window = 200_000
+context_window = 200_000
+effort = "low"
+
+[models.claude-opus-5]
+chars_per_token = 3.0
+completion_window = 200_000
+context_window = 1_000_000
+effort = "low"
+
+[models.claude-sonnet-5]
+chars_per_token = 3.0
+completion_window = 200_000
+context_window = 1_000_000
+effort = "low"
+
+
+[models.gemini-3-8-flash]
+effort = "low"
+
+[models.gemini-3-7-flash]
+effort = "low"
+
+[models.gemini-3-6-flash]
+effort = "low"
+
+[models.gemini-3-flash-preview]
+effort = "low"
+
+[models.gemini-3-1-flash-lite]
+effort = "low"
+
+[models.gemini-3-5-flash]
+effort = "low"
+
+[models.gemini-3-5-flash-lite]
+effort = "low"
+
+[models.gemini-3-1-pro]
+effort = "low"
+
+[models.gemini-3-1-pro-preview]
+effort = "low"
+
+[models.gemini-2-5-flash]
+effort = "low"
+
+[models.gemini-2-5-pro]
+effort = "low"
+
+
+
+

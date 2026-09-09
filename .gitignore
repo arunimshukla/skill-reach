@@ -1,0 +1,43 @@
+# Python & Bytecode
+*.egg-info/
+*.pyc
+*.pyo
+.venv/
+__pycache__/
+
+# Build & Distribution
+build/
+dist/
+site/
+
+# Testing & Coverage
+.coverage
+.hypothesis/
+.mutmut-cache
+.mypy_cache/
+.pyrefly/
+.pytest_cache/
+.ruff_cache/
+htmlcov/
+mutants/
+
+# Environment & Secrets
+.DS_Store
+.env
+.env.*
+
+# IDE & Tooling
+*.swp
+.agents/
+.claude/
+.idea/
+.vscode/
+graphify-out/
+node_modules/
+skills-lock.json
+
+# Project Specific
+*.partial
+CONTEXT.md
+studies/
+.reach/

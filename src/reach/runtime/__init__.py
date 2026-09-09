@@ -1,0 +1,960 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Define the core AgentRuntime interface and shared runtime agent helpers."""
+
+from __future__ import annotations
+
+import importlib
+import json
+import os
+import time
+from abc import ABC, abstractmethod
+from collections.abc import Callable, Iterable, Sequence
+from enum import StrEnum
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, cast, override
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from reach.config import (
+    RuntimeSettings,
+    agent_default_model,
+    agent_profiles,
+    resolve_path,
+)
+from reach.runtime._env import raise_missing_agent_dependency
+from reach.runtime._fs import install_skills, resolve_catalog_skills
+from reach.runtime._subprocess import (
+    check_tool_leak,
+    process_failure_reason,
+    run_subprocess_probe,
+)
+from reach.runtime.generator import TextGenerator, build_text_generator
+from reach.runtime.profiles import model_profile
+
+if TYPE_CHECKING:
+    from reach.models import Catalog, Skill
+    from reach.runtime.retriever import TwoStageRetrieverRuntime
+
+#: Canonical identifier for the internal fake test runtime agent.
+FAKE_AGENT = "fake"
+
+__all__ = [
+    "FAKE_AGENT",
+    "AgentOptions",
+    "AgentRuntime",
+    "AntigravityRuntime",
+    "CatalogFit",
+    "CliAgentRuntime",
+    "CliOptions",
+    "SelectionOutcome",
+    "SessionStatus",
+    "SessionSummary",
+    "SkillRoot",
+    "SkillSelectionBase",
+    "TextGenerator",
+    "ToolCallInfo",
+    "TrajectoryTracker",
+    "TwoStageRetrieverRuntime",
+    "agent_default_model",
+    "build_runtime",
+    "build_text_generator",
+    "cli_agents",
+    "find_agent_for_model",
+    "known_agents",
+    "options_model",
+    "register_agent",
+    "resolve_options",
+]
+
+
+class AgentOptions(BaseModel):
+    """Base configuration common to all agent drivers."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    model: str = ""
+    effort: str | None = None
+    provider: str | None = None
+    max_turns: int = Field(default=3, ge=1)
+    early_exit: bool = True
+    allowed_tools: tuple[str, ...] | None = None
+    api_key: str | None = None
+    use_symlinks: bool = True
+    isolate_config_dir: bool = True
+    auto_clean: bool = False
+
+
+class CliOptions(AgentOptions):
+    """Hold common configuration options for CLI subprocess-driven agent runtimes."""
+
+    executable: str = ""
+    extra_args: tuple[str, ...] = ()
+
+    def effort_args(self, flag: str = "--effort") -> list[str]:
+        """Format CLI argument pair for non-empty effort setting."""
+        return [flag, self.effort] if self.effort else []
+
+    def provider_args(self, flag: str = "--provider") -> list[str]:
+        """Format CLI argument pair for non-empty provider setting."""
+        return [flag, self.provider] if self.provider else []
+
+    def max_turns_args(self, flag: str = "--max-turns") -> list[str]:
+        """Format CLI argument pair for non-None max_turns setting."""
+        return [flag, str(self.max_turns)] if self.max_turns is not None else []
+
+    def api_key_args(self, flag: str = "--api-key") -> list[str]:
+        """Format CLI argument pair for non-empty api_key setting."""
+        return [flag, self.api_key] if self.api_key else []
+
+
+class ToolCallInfo(BaseModel):
+    """Represent an observed tool invocation and its parameters."""
+
+    model_config = ConfigDict(frozen=True)
+
+    name: str = ""
+    parameters: dict[str, Any] = Field(default_factory=dict)
+
+    def __init__(
+        self,
+        name: str = "",
+        parameters: dict[str, Any] | None = None,
+        path: str | None = None,
+        **data: Any,  # noqa: ANN401
+    ) -> None:
+        """Initialize tool invocation with optional direct path argument."""
+        params = dict(parameters or data.pop("parameters", None) or {})
+        if path is not None and "path" not in params and "AbsolutePath" not in params:
+            params["path"] = str(path)
+        super().__init__(name=name, parameters=params, **data)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_path(cls, data: Any) -> Any:  # noqa: ANN401
+        """Populate parameters with path keyword argument when provided directly."""
+        if isinstance(data, dict) and "path" in data:
+            data = dict(data)
+            params = dict(data.get("parameters") or {})
+            val = data.pop("path")
+            if val is not None and "path" not in params and "AbsolutePath" not in params:
+                params["path"] = str(val)
+            data["parameters"] = params
+        return data
+
+    @property
+    def target_path(self) -> str | None:
+        """Extract path across AbsolutePath or path parameters."""
+        path = self.parameters.get("AbsolutePath") or self.parameters.get("path")
+        return str(path) if path else None
+
+    @property
+    def path(self) -> str | None:
+        """Return target path from parameters."""
+        return self.target_path
+
+
+class SessionStatus(StrEnum):
+    """Enumerate canonical terminal execution statuses of an agent session."""
+
+    SUCCESS = "SUCCESS"
+    ERROR = "ERROR"
+    TIMEOUT = "TIMEOUT"
+    CANCELLED = "CANCELLED"
+
+
+class SessionSummary(BaseModel):
+    """Hold parsed session outcomes and telemetry across CLI runtime logs."""
+
+    model_config = ConfigDict(frozen=True)
+
+    cost_usd: float | None = None
+    duration_ms: int | None = None
+    error: str | None = None
+    invoked_skills: tuple[str, ...] = ()
+    early_exit: bool = False
+    turns_taken: int = Field(default=1, ge=1)
+    tool_calls: tuple[ToolCallInfo, ...] = ()
+    observed_tools: tuple[str, ...] = ()
+    reasoning: tuple[str, ...] = ()
+    observed_catalog: tuple[str, ...] = ()
+    resolved_model: str = ""
+    status: SessionStatus | str | None = None
+    retries: int = 0
+
+    @property
+    def invoked_skill(self) -> str | None:
+        """Return the first invoked skill name, or None if none was invoked."""
+        return self.invoked_skills[0] if self.invoked_skills else None
+
+    @field_validator("status", mode="before")
+    @classmethod
+    def _normalize_status(cls, value: object) -> SessionStatus | str | None:
+        """Coerce known status variants to canonical SessionStatus enum members."""
+        if value is None or isinstance(value, SessionStatus):
+            return value
+        if isinstance(value, str):
+            normalized = value.strip()
+            upper = normalized.upper()
+            try:
+                return SessionStatus(upper)
+            except ValueError:
+                return normalized
+        return str(value)
+
+    @property
+    def saw_result(self) -> bool:
+        """Return True if stream contained a terminal result event or early exit."""
+        return self.status is not None or self.early_exit
+
+    @model_validator(mode="before")
+    @classmethod
+    def _derive_observed_tools(cls, data: Any) -> Any:  # noqa: ANN401 (Pydantic before validator)
+        """Populate observed tools from tool calls if not explicitly provided."""
+        if isinstance(data, dict):
+            data = dict(data)
+            calls = data.get("tool_calls")
+            if calls and not data.get("observed_tools"):
+                names = {getattr(c, "name", None) or c.get("name") for c in calls if c}
+                data["observed_tools"] = tuple(sorted(n for n in names if n))
+        return data
+
+    def to_outcome(
+        self,
+        observed_catalog: tuple[str, ...] | list[str] = (),
+        fallback_model: str = "",
+        early_exit: bool = False,
+        turns_taken: int | None = None,
+    ) -> SelectionOutcome:
+        """Convert parsed session summary into a canonical SelectionOutcome."""
+        effective_early_exit = early_exit or self.early_exit
+        turns = turns_taken if turns_taken is not None else self.turns_taken
+
+        catalog = tuple(observed_catalog) or self.observed_catalog
+        return SelectionOutcome(
+            cost_usd=self.cost_usd,
+            duration_ms=self.duration_ms,
+            error=self.error,
+            invoked_skills=self.invoked_skills,
+            early_exit=effective_early_exit,
+            turns_taken=turns,
+            tool_calls=self.tool_calls,
+            observed_tools=self.observed_tools,
+            reasoning=self.reasoning,
+            resolved_model=self.resolved_model or fallback_model,
+            status=self.status,
+            observed_catalog=catalog,
+        )
+
+
+class SelectionOutcome(SessionSummary):
+    """Represent the observable result of probing an agent runtime with a query."""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _enforce_early_exit_invariants(cls, data: Any) -> Any:  # noqa: ANN401 (Pydantic before validator)
+        """Ensure process cancellation artifacts are never reported as probe errors."""
+        if isinstance(data, dict) and data.get("early_exit"):
+            data = dict(data)
+            err = str(data.get("error") or "")
+            if err and not err.startswith(("tool leak", "residency leak")):
+                data["error"] = None
+        return data
+
+
+class TrajectoryTracker:
+    """Track multi-turn skill invocations and evaluate early exit conditions."""
+
+    def __init__(
+        self,
+        target_skill: str | None = None,
+        max_turns: int = 3,
+        early_exit: bool = True,
+    ) -> None:
+        """Initialize tracker with optional target skill and turn boundaries."""
+        self.target_skill = target_skill
+        self.max_turns = max(max_turns, 1)
+        self.early_exit = early_exit
+        self.invoked_skills: list[str] = []
+        self.early_exit_hit: bool = False
+
+    def observe(self, skill: str | Sequence[str] | None) -> bool:
+        """Record skill invocation(s) and return True if early-exit stop condition is met."""
+        if not skill:
+            return False
+        items = (skill,) if isinstance(skill, str) else tuple(skill)
+        for s in items:
+            if not s:
+                continue
+            if not self.invoked_skills or self.invoked_skills[-1] != s:
+                self.invoked_skills.append(s)
+                if self.early_exit:
+                    if self.target_skill is not None and s == self.target_skill:
+                        self.early_exit_hit = True
+                        return True
+                    if len(self.invoked_skills) >= self.max_turns:
+                        self.early_exit_hit = True
+                        return True
+        return False
+
+    @property
+    def turns_taken(self) -> int:
+        """Return count of turns taken based on distinct recorded invocations."""
+        return len(self.invoked_skills) if self.invoked_skills else 1
+
+
+class SkillRoot(BaseModel):
+    """Represent a skill discovery directory location and its resolution precedence."""
+
+    model_config = ConfigDict(frozen=True)
+
+    path: Path
+    scope: str
+    precedence: int = Field(default=0, ge=0)
+
+
+class CatalogFit(BaseModel):
+    """Report catalog residency limits and potential description truncation metrics."""
+
+    model_config = ConfigDict(frozen=True)
+
+    allowed: int = Field(default=0, ge=0)
+    asked: int = Field(default=0, ge=0)
+    unit: str = ""
+    truncated: int = Field(default=0, ge=0)
+    remedy: str = ""
+    elided_skills: tuple[str, ...] = ()
+
+    @property
+    def rations(self) -> bool:
+        """Return True if the runtime enforces space limitations on catalog listings."""
+        return self.allowed > 0
+
+    @property
+    def whole(self) -> bool:
+        """Return True if all skills are presented without description truncation."""
+        return not self.truncated
+
+
+_AGENT_FACTORIES: dict[
+    str,
+    tuple[Callable[[RuntimeSettings], AgentRuntime], type[BaseModel] | None],
+] = {}
+
+
+def register_agent(
+    name: str,
+    factory: Callable[[RuntimeSettings], AgentRuntime],
+    options: type[BaseModel] | None = None,
+) -> None:
+    """Register a runtime factory and optional options schema for an agent name."""
+    _AGENT_FACTORIES[name] = (factory, options)
+
+
+_BUILTIN_AGENTS: dict[str, tuple[str, str, str]] = {
+    "antigravity-cli": (
+        "reach.runtime.antigravity_cli",
+        "AntigravityCliOptions",
+        "AntigravityCliRuntime",
+    ),
+    "antigravity-sdk": (
+        "reach.runtime.antigravity_sdk",
+        "AntigravitySdkOptions",
+        "AntigravitySdkRuntime",
+    ),
+    "claude-code": (
+        "reach.runtime.claude_code",
+        "ClaudeCodeOptions",
+        "ClaudeCodeRuntime",
+    ),
+    "goose": (
+        "reach.runtime.goose",
+        "GooseOptions",
+        "GooseRuntime",
+    ),
+    "keyword": (
+        "reach.runtime.keyword",
+        "KeywordOptions",
+        "KeywordRuntime",
+    ),
+    "pi": (
+        "reach.runtime.pi",
+        "PiOptions",
+        "PiRuntime",
+    ),
+}
+
+
+def _load_builtin_entry(
+    agent: str,
+) -> tuple[Callable[[RuntimeSettings], AgentRuntime], type[BaseModel] | None] | None:
+    """Dynamically import and return factory and options model for a builtin agent."""
+    spec = _BUILTIN_AGENTS.get(agent)
+    if spec is None:
+        return None
+    mod_name, opt_name, rt_name = spec
+    try:
+        mod = importlib.import_module(mod_name)
+    except ImportError as err:
+        raise_missing_agent_dependency(agent, err, role="runtime")
+    opt_cls = getattr(mod, opt_name, None)
+    rt_cls = getattr(mod, rt_name)
+    return (rt_cls), opt_cls
+
+
+def known_agents(config_path: Path | str | None = None) -> tuple[str, ...]:
+    """Return tuple of supported agent runtime names from configuration."""
+    profiles = agent_profiles(config_path)
+    builtins = set(_BUILTIN_AGENTS.keys())
+    if profiles:
+        return tuple(sorted(set(profiles.keys()) | builtins | set(_AGENT_FACTORIES.keys())))
+    return tuple(sorted(builtins | set(_AGENT_FACTORIES.keys())))
+
+
+def cli_agents(config_path: Path | str | None = None) -> tuple[str, ...]:
+    """Return tuple of supported agent runtime names that execute via CLI subprocesses."""
+    return tuple(
+        agent
+        for agent in known_agents(config_path)
+        if (opt := options_model(agent)) is not None and issubclass(opt, CliOptions)
+    )
+
+
+def _agent_supported_models(
+    agents: dict[object, object],
+) -> list[tuple[str, list[str]]]:
+    """Extract list of (agent_name, supported_models) pairs with lowered model names."""
+    pairs: list[tuple[str, list[str]]] = []
+    for agent_name, agent_info in agents.items():
+        if isinstance(agent_info, dict):
+            models = [str(m).lower() for m in agent_info.get("models", [])]
+            pairs.append((str(agent_name), models))
+    return pairs
+
+
+def _match_agent_model(
+    agent_models: list[tuple[str, list[str]]],
+    model_lower: str,
+) -> str | None:
+    """Find agent matching exact model name, falling back to substring match."""
+    for agent_name, supported in agent_models:
+        if model_lower in supported:
+            return agent_name
+    for agent_name, supported in agent_models:
+        for candidate in supported:
+            if candidate in model_lower or model_lower in candidate:
+                return agent_name
+    return None
+
+
+def find_agent_for_model(model: str, config_path: Path | str | None = None) -> str | None:
+    """Dynamically determine which agent runtime supports the given model."""
+    if not model or not model.strip():
+        return None
+    profiles = agent_profiles(config_path)
+    if not profiles:
+        return None
+    pairs = [(name, [m.lower() for m in prof.models]) for name, prof in profiles.items()]
+    return _match_agent_model(pairs, model.strip().lower())
+
+
+class AgentRuntime[OptionsT: AgentOptions](ABC):
+    """Define standard abstract base class for agent runtime implementations."""
+
+    name: str
+    settings: RuntimeSettings | None = None
+    options: OptionsT = cast("Any", AgentOptions())
+    _resident: tuple[str, ...] = ()
+    is_dynamic: bool = False
+
+    @property
+    def timeout_s(self) -> int | None:
+        """Return per-probe execution timeout in seconds from settings."""
+        return self.settings.timeout_s if self.settings is not None else None
+
+    @property
+    def skills_subpath(self) -> str:
+        """Return relative skill directory subpath from profile or runtime default."""
+        profile = agent_profiles().get(self.name)
+
+        if profile is not None and profile.skills_dir:
+            return profile.skills_dir
+        if subpath := getattr(self, "_skills_subpath", None):
+            return str(subpath)
+        return ""
+
+    @property
+    def model(self) -> str:
+        """Return the identifier of the model being evaluated."""
+        return self.options.model
+
+    @property
+    def effort(self) -> str | None:
+        """Return the reasoning effort tier being evaluated."""
+        return self.options.effort
+
+    @property
+    def provider(self) -> str | None:
+        """Return the model provider identifier being evaluated."""
+        return self.options.provider or getattr(self.options, "model_provider", None)
+
+    @property
+    def max_turns(self) -> int:
+        """Return the maximum turns configured on the runtime options."""
+        return self.options.max_turns
+
+    @property
+    def early_exit(self) -> bool:
+        """Return whether early exit is enabled on the runtime options."""
+        return self.options.early_exit
+
+    @property
+    def api_key(self) -> str | None:
+        """Return the API key string configured on the runtime options."""
+        return self.options.api_key
+
+    @property
+    def allowed_tools(self) -> tuple[str, ...] | None:
+        """Return explicit allowed tools override from options or settings."""
+        return (
+            self.options.allowed_tools
+            if self.options.allowed_tools is not None
+            else getattr(self.settings, "allowed_tools", None)
+        )
+
+    @property
+    def use_symlinks(self) -> bool:
+        """Return whether symlink installation is enabled on the runtime options."""
+        return self.options.use_symlinks
+
+    @property
+    def isolate_config_dir(self) -> bool:
+        """Return whether isolated runtime config is enabled on the runtime options."""
+        return self.options.isolate_config_dir
+
+    @property
+    def auto_clean(self) -> bool:
+        """Return whether automatic post-probe cleanup is enabled on the runtime options."""
+        return self.options.auto_clean
+
+    @property
+    def rations_catalog(self) -> bool:
+        """Return True if this runtime actively rations skill listing budgets."""
+        return False
+
+    @property
+    def is_cli(self) -> bool:
+        """Return True if this runtime executes via a CLI subprocess."""
+        return False
+
+    def skills_dir(self, workdir: Path) -> Path:
+        """Return standard skill directory path in the workspace."""
+        return Path(workdir) / self.skills_subpath
+
+    def skill_roots(self, workdir: Path) -> tuple[SkillRoot, ...]:
+        """Return discovery directories where runtime searches for skills."""
+        here = self.skills_dir(resolve_path(workdir))
+        return (SkillRoot(path=here, scope="project", precedence=0),) if here.is_dir() else ()
+
+    def fit(self, catalog: Catalog, skills: Iterable[Skill]) -> CatalogFit:  # noqa: ARG002
+        """Evaluate whether a catalog fits listing budgets without materializing."""
+        return CatalogFit()
+
+    def install(self, catalog: Catalog, skills: Iterable[Skill], workdir: Path) -> Path:
+        """Materialize resident skills in workspace and return workspace path."""
+        target = resolve_path(workdir)
+        self._validate_install(target)
+        by_name = resolve_catalog_skills(catalog, skills)
+        self._resident = install_skills(
+            catalog,
+            by_name,
+            self.skills_dir(target),
+            use_symlinks=self.use_symlinks,
+        )
+        self._post_install(target)
+        return target
+
+    def _validate_install(self, workdir: Path) -> None:
+        """Validate workspace preconditions before installation."""
+        del workdir
+
+    def _post_install(self, workdir: Path) -> None:
+        """Configure permissions or settings after installation."""
+        del workdir
+
+    def post_probe(self, workdir: Path) -> None:
+        """Execute post-probe cleanup actions."""
+        del workdir
+
+    def build_env(self, workdir: Path | None = None) -> dict[str, str]:
+        """Assemble process environment for agent execution."""
+        del workdir
+        return dict(os.environ)
+
+    @abstractmethod
+    def select(
+        self,
+        query_text: str,
+        workdir: Path,
+        target_skill: str | None = None,
+    ) -> SelectionOutcome:
+        """Execute a single query probe and return the observed skill selection."""
+        ...
+
+    @property
+    def effective_effort(self) -> str | None:
+        """Return configured reasoning effort or default from model profile."""
+        options = getattr(self, "options", None)
+        if options is not None and (effort := getattr(options, "effort", None)):
+            return None if effort.lower() in ("none", "off") else effort
+        try:
+            return model_profile(self.model).effort
+        except (KeyError, ValueError):
+            return None
+
+    def resident_skill_paths(self, workdir: Path) -> frozenset[Path]:
+        """Return set of valid filesystem directory paths for resident skills."""
+        skills_dir = self.skills_dir(resolve_path(workdir))
+        return frozenset(resolve_path(skills_dir / name) for name in self._resident)
+
+    def parse_stream(
+        self,
+        lines: Iterable[str],
+        resident: Sequence[str] = (),
+        early_exit: bool = False,
+    ) -> SessionSummary:
+        """Parse transcript or log lines into a standardized SessionSummary.
+
+        Default implementation records early_exit and assigns SUCCESS status
+        if lines were produced. Subclasses override this to extract tool
+        invocations, reasoning, and telemetry.
+        """
+        del resident
+        line_list = list(lines)
+        return SessionSummary(
+            early_exit=early_exit,
+            status=SessionStatus.SUCCESS if line_list else None,
+        )
+
+
+class CliAgentRuntime[CliOptionsT: CliOptions](AgentRuntime, ABC):
+    """Abstract base runtime for command-line interface agent drivers."""
+
+    options: CliOptionsT
+    api_key_env_var: str | None = None
+
+    def __init__(
+        self,
+        settings: RuntimeSettings | None = None,
+        options: CliOptionsT | None = None,
+    ) -> None:
+        """Initialize CLI agent runtime settings and options."""
+        agent_name = getattr(self, "name", "cli")
+        if options is not None:
+            self.options = options
+            dump = options.model_dump()
+            self.settings = settings or RuntimeSettings(agent=agent_name, options=dump)
+        else:
+            self.settings = settings or RuntimeSettings(agent=agent_name)
+            validated = CliOptions.model_validate(dict(self.settings.options))
+            self.options = cast("CliOptionsT", validated)
+        self._resident = ()
+        self.completion_cost_usd = 0.0
+        self.completions = 0
+
+    @property
+    @override
+    def is_cli(self) -> bool:
+        """Return True if this runtime executes via a CLI subprocess."""
+        return True
+
+    @abstractmethod
+    def build_command(self, query_text: str) -> list[str]:
+        """Assemble command-line arguments for executing a probe."""
+        ...
+
+    @abstractmethod
+    @override
+    def parse_stream(
+        self,
+        lines: Iterable[str],
+        resident: Sequence[str] = (),
+        early_exit: bool = False,
+    ) -> SessionSummary:
+        """Parse CLI stdout lines into a standardized session summary."""
+        ...
+
+    def extract_skills_from_line(self, line: str) -> Sequence[str]:
+        """Extract invoked skill names from an event line for early-exit detection."""
+        single = self.extract_skill_from_line(line)
+        return (single,) if single else ()
+
+    def extract_skill_from_line(self, line: str) -> str | None:
+        """Extract invoked skill name from an event line for early-exit detection."""
+        del line
+        return None
+
+    @override
+    def build_env(self, workdir: Path | None = None) -> dict[str, str]:
+        """Assemble process environment with API keys and workspace overrides."""
+        del workdir
+        env = dict(os.environ)
+        if (home_dir := getattr(self.options, "home_dir", None)) is not None:
+            env["HOME"] = str(home_dir)
+        if (api_key := getattr(self.options, "api_key", None)) is not None and self.api_key_env_var:
+            env[self.api_key_env_var] = str(api_key)
+        return env
+
+    def validate_outcome(
+        self,
+        summary: SessionSummary,
+        workdir: Path,
+    ) -> str | None:
+        """Validate status and security isolation boundaries for a parsed session."""
+        del workdir
+        if summary.status is not None and summary.status != SessionStatus.SUCCESS:
+            return summary.error or f"runtime error: {summary.status}"
+        return check_tool_leak(summary.observed_tools, self.allowed_tools)
+
+    @override
+    def post_probe(self, workdir: Path) -> None:
+        """Execute post-probe cleanup actions."""
+        del workdir
+
+    @override
+    def select(
+        self,
+        query_text: str,
+        workdir: Path,
+        target_skill: str | None = None,
+    ) -> SelectionOutcome:
+        """Execute a query probe via the unified CLI subprocess template pipeline."""
+        tracker = TrajectoryTracker(
+            target_skill=target_skill,
+            max_turns=self.options.max_turns,
+            early_exit=self.options.early_exit,
+        )
+
+        def _on_line(line: str) -> bool:
+            skills = self.extract_skills_from_line(line)
+            return tracker.observe(skills)
+
+        start_time = time.monotonic()
+        try:
+            completed, err = run_subprocess_probe(
+                self.build_command(query_text),
+                workdir,
+                self.timeout_s,
+                env=self.build_env(workdir),
+                on_line=_on_line,
+            )
+            elapsed_ms = int((time.monotonic() - start_time) * 1000)
+            if err is not None or completed is None:
+                return SelectionOutcome(
+                    error=err or "subprocess failed",
+                    observed_catalog=self._resident,
+                )
+
+            summary = self.parse_stream(
+                completed.stdout.splitlines(),
+                resident=self._resident,
+                early_exit=tracker.early_exit_hit,
+            )
+            if not summary.saw_result:
+                reason = process_failure_reason(completed)
+                if getattr(summary, "retries", 0) > 0:
+                    reason = f"rate limit (429): {summary.retries} retries exceeded"
+                return SelectionOutcome(
+                    error=f"no result event: {reason}",
+                    observed_catalog=self._resident,
+                )
+
+            catalog = getattr(summary, "observed_catalog", ()) or self._resident
+            outcome = summary.to_outcome(
+                observed_catalog=catalog,
+                fallback_model=self.model,
+                early_exit=tracker.early_exit_hit,
+            )
+            if tracker.early_exit_hit and tracker.invoked_skills:
+                outcome = outcome.model_copy(
+                    update={
+                        "invoked_skills": tuple(tracker.invoked_skills),
+                        "early_exit": True,
+                    },
+                )
+
+            # Security tool leak and outcome validation
+            if validation_error := self.validate_outcome(summary, workdir):
+                return outcome.model_copy(update={"error": validation_error})
+
+            duration_ms = outcome.duration_ms or elapsed_ms
+            return outcome.model_copy(update={"duration_ms": duration_ms})
+        except Exception as exc:  # noqa: BLE001
+            return SelectionOutcome(
+                error=f"unexpected runtime error: {exc}",
+                observed_catalog=self._resident,
+            )
+        finally:
+            self.post_probe(workdir)
+
+
+class SkillSelectionBase(BaseModel):
+    """Base model declaring structured skill selection response interface."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    selected_skill: str | None = Field(
+        default=None,
+        description="The skill to invoke, or null if no skill applies",
+    )
+    reasoning: str = Field(
+        default="",
+        description="Brief explanation of why this skill was selected or why null was returned",
+    )
+
+
+class AntigravityRuntime(AgentRuntime):
+    """Shared base runtime for Antigravity-ecosystem drivers (CLI and SDK)."""
+
+    ANTIGRAVITY_SELECTION_TOOLS: frozenset[str] = frozenset(
+        {
+            "view_file",
+            "list_dir",
+            "grep_search",
+            "find_by_name",
+        }
+    )
+
+    @property
+    def selection_tools(self) -> frozenset[str]:
+        """Return standard inspection tool identifiers permitted during skill selection."""
+        return self.ANTIGRAVITY_SELECTION_TOOLS
+
+    @property
+    def effective_api_key(self) -> str | None:
+        """Return configured API key or fallback to environment variables."""
+        return (
+            self.options.api_key
+            or os.environ.get("GEMINI_API_KEY")
+            or os.environ.get("GOOGLE_API_KEY")
+        )
+
+    @property
+    def effective_model_provider(self) -> str | None:
+        """Return configured model_provider or auto-detect 'gemini' when API keys are present."""
+        if (provider := getattr(self.options, "model_provider", None)) is not None:
+            return provider  # type: ignore[no-any-return]
+        has_key = bool(
+            self.options.api_key or "GEMINI_API_KEY" in os.environ or "GOOGLE_API_KEY" in os.environ
+        )
+        if self.model.lower().startswith("gemini") and has_key:
+            return "gemini"
+        return None
+
+    @classmethod
+    def selection_schema(cls, resident: Sequence[str]) -> type[SkillSelectionBase]:
+        """Generate dynamic Pydantic model constraining selection to resident skills."""
+        import typing
+
+        from pydantic import create_model
+
+        literal_type: Any = typing.cast("Any", typing.Literal)[tuple(resident)] if resident else str
+
+        return create_model(
+            "SkillSelection",
+            __base__=SkillSelectionBase,
+            selected_skill=(
+                literal_type | None,
+                Field(default=None, description="The skill to invoke, or null if no skill applies"),
+            ),
+            reasoning=(
+                str,
+                Field(
+                    default="",
+                    description=(
+                        "Brief explanation of why this skill was selected or why null was returned"
+                    ),
+                ),
+            ),
+        )
+
+    @classmethod
+    def selection_json_schema(cls, resident: Sequence[str]) -> str:
+        """Derive JSON Schema string directly from the canonical Pydantic model."""
+        schema_dict = cls.selection_schema(resident).model_json_schema()
+        schema_dict["required"] = ["selected_skill", "reasoning"]
+        return json.dumps(schema_dict)
+
+
+def options_model(agent: str) -> type[BaseModel] | None:
+    """Return the options schema class corresponding to the named agent."""
+    if agent in _AGENT_FACTORIES:
+        return _AGENT_FACTORIES[agent][1]
+    builtin = _load_builtin_entry(agent)
+    if builtin is not None:
+        return builtin[1]
+    return None
+
+
+def resolve_options(settings: RuntimeSettings) -> BaseModel | None:
+    """Parse and validate agent-specific options dictionary against its schema."""
+    model = options_model(settings.agent)
+    raw = dict(settings.options or {})
+    if model is not None:
+        if "max_turns" not in raw and getattr(settings, "max_turns", None) is not None:
+            raw["max_turns"] = settings.max_turns
+        if "early_exit" not in raw and getattr(settings, "early_exit", None) is not None:
+            raw["early_exit"] = settings.early_exit
+        return model.model_validate(raw)
+    if raw:
+        msg = f"{_no_options_reason(settings.agent)}; got {sorted(raw)}"
+        raise ValueError(
+            msg,
+        )
+    return None
+
+
+def _no_options_reason(agent: str) -> str:
+    """Generate error message when options are passed to an invalid agent."""
+    if agent in known_agents():
+        return f"runtime agent {agent!r} takes no options"
+    return f"unknown runtime agent {agent!r}; expected one of {', '.join(known_agents())}"
+
+
+def build_runtime(settings: RuntimeSettings) -> AgentRuntime:
+    """Instantiate and configure an AgentRuntime from settings."""
+    if settings.agent in _AGENT_FACTORIES:
+        rt = _AGENT_FACTORIES[settings.agent][0](settings)
+    else:
+        builtin = _load_builtin_entry(settings.agent)
+        if builtin is not None:
+            rt = builtin[0](settings)
+        else:
+            agents = ", ".join(known_agents())
+            msg = f"unknown runtime agent {settings.agent!r}; expected one of {agents}"
+            raise ValueError(msg)
+    if getattr(rt, "settings", None) is None:
+        rt.settings = settings
+    return rt
+
+
+def __getattr__(name: str) -> object:
+    """Provide lazy dynamic exports for reach.runtime members."""
+    if name == "TwoStageRetrieverRuntime":
+        from .retriever import TwoStageRetrieverRuntime
+
+        return TwoStageRetrieverRuntime
+    msg = f"module {__name__!r} has no attribute {name!r}"
+    raise AttributeError(msg)

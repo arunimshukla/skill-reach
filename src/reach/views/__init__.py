@@ -1,0 +1,208 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Terminal, console, and report presentation views using Rich.
+
+For standalone HTML artifact reports, see `reach.view`.
+"""
+
+from reach.views.base import (
+    ERROR,
+    ETA,
+    HIT,
+    MISROUTE,
+    NAME_COLUMN_SHARE,
+    NON_SELECTION,
+    REACH_THEME,
+    TALLIED,
+    TOOK,
+    Console,
+    Recorder,
+    badge,
+    build_console,
+    error_panel,
+    help_console,
+    help_formatter,
+    is_live,
+    middle_truncate,
+    print_discovery,
+    print_draft_preview,
+    print_drafted,
+    print_generation,
+    print_generation_spend,
+    print_plan,
+    print_query_set,
+    print_query_view,
+    print_quick_scope,
+    print_resuming,
+    print_wrote,
+    probe_progress,
+)
+from reach.views.cluster import (
+    CLUSTER_RENDERERS,
+    print_cluster,
+    render_cluster,
+    render_cluster_csv,
+    render_cluster_json,
+)
+from reach.views.diff import (
+    DIFF_RENDERERS,
+    render_diff,
+    render_diff_csv,
+    render_diff_json,
+    render_diff_jsonl,
+    render_diff_text,
+    render_survey,
+)
+from reach.views.doctor import render_doctor_table
+from reach.views.lint import (
+    print_lint,
+    print_rule_explanation,
+    render_lint_concise,
+    render_lint_github,
+)
+from reach.views.optimize import (
+    print_optimization,
+    render_optimization_diff,
+)
+from reach.views.overlap import (
+    OVERLAP_RENDERERS,
+    REWRITE_RENDERERS,
+    OverlapView,
+    RewriteView,
+    SkillOverlapView,
+    SuggestView,
+    format_annotated_query,
+    overlap_view,
+    print_attribution,
+    print_overlap,
+    print_rewrite,
+    print_skill_overlap,
+    render_attribution_table,
+    render_overlap,
+    render_overlap_csv,
+    render_overlap_json,
+    render_overlap_jsonl,
+    render_rewrite,
+    render_rewrite_csv,
+    render_rewrite_json,
+    render_rewrite_jsonl,
+    suggest_view,
+)
+from reach.views.quality_gate import (
+    emit_check_github_annotations,
+    is_github_actions,
+    print_check,
+    print_registry_audit,
+    render_check_github_summary,
+    write_github_step_summary,
+)
+from reach.views.scorecard import (
+    print_query_records,
+    print_scorecard,
+)
+from reach.views.sweep import (
+    SWEEP_RENDERERS,
+    print_sweep,
+    render_sweep,
+    render_sweep_csv,
+    render_sweep_json,
+)
+
+__all__ = [
+    "CLUSTER_RENDERERS",
+    "DIFF_RENDERERS",
+    "ERROR",
+    "ETA",
+    "HIT",
+    "MISROUTE",
+    "NAME_COLUMN_SHARE",
+    "NON_SELECTION",
+    "OVERLAP_RENDERERS",
+    "REACH_THEME",
+    "REWRITE_RENDERERS",
+    "SWEEP_RENDERERS",
+    "TALLIED",
+    "TOOK",
+    "Console",
+    "OverlapView",
+    "Recorder",
+    "RewriteView",
+    "SkillOverlapView",
+    "SuggestView",
+    "badge",
+    "build_console",
+    "emit_check_github_annotations",
+    "error_panel",
+    "format_annotated_query",
+    "help_console",
+    "help_formatter",
+    "is_github_actions",
+    "is_live",
+    "middle_truncate",
+    "overlap_view",
+    "print_attribution",
+    "print_check",
+    "print_cluster",
+    "print_discovery",
+    "print_draft_preview",
+    "print_drafted",
+    "print_generation",
+    "print_generation_spend",
+    "print_lint",
+    "print_optimization",
+    "print_overlap",
+    "print_plan",
+    "print_query_records",
+    "print_query_set",
+    "print_query_view",
+    "print_quick_scope",
+    "print_registry_audit",
+    "print_resuming",
+    "print_rewrite",
+    "print_rule_explanation",
+    "print_scorecard",
+    "print_skill_overlap",
+    "print_sweep",
+    "print_wrote",
+    "probe_progress",
+    "render_attribution_table",
+    "render_check_github_summary",
+    "render_cluster",
+    "render_cluster_csv",
+    "render_cluster_json",
+    "render_diff",
+    "render_diff_csv",
+    "render_diff_json",
+    "render_diff_jsonl",
+    "render_diff_text",
+    "render_doctor_table",
+    "render_lint_concise",
+    "render_lint_github",
+    "render_optimization_diff",
+    "render_overlap",
+    "render_overlap_csv",
+    "render_overlap_json",
+    "render_overlap_jsonl",
+    "render_rewrite",
+    "render_rewrite_csv",
+    "render_rewrite_json",
+    "render_rewrite_jsonl",
+    "render_survey",
+    "render_sweep",
+    "render_sweep_csv",
+    "render_sweep_json",
+    "suggest_view",
+    "write_github_step_summary",
+]

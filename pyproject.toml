@@ -1,0 +1,276 @@
+[project]
+name = "skill-reach"
+version = "0.1.0"
+description = "An evaluation suite for AI agent skill routing, collision detection, and description optimization."
+readme = "README.md"
+authors = [{ name = "Google LLC" }]
+requires-python = ">=3.12"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+dependencies = [
+    "cyclopts>=4.25.2",
+    "pydantic>=2.13.5",
+    "pyyaml>=6.0.3",
+    "rich>=15.0.0",
+]
+keywords = [
+    "agent",
+    "agents",
+    "ai",
+    "collision-detection",
+    "evaluation",
+    "llm",
+    "mcp",
+    "routing",
+    "skills",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Testing",
+    "Typing :: Typed",
+]
+
+[project.urls]
+Homepage = "https://github.com/google/skill-reach"
+Documentation = "https://google.github.io/skill-reach/"
+Repository = "https://github.com/google/skill-reach"
+Issues = "https://github.com/google/skill-reach/issues"
+Changelog = "https://github.com/google/skill-reach/releases"
+
+[project.optional-dependencies]
+antigravity-sdk = ["google-antigravity>=0.1.16"]
+semantic = [
+    "huggingface-hub>=1.30.0",
+    "model2vec>=0.9.0",
+]
+
+[project.scripts]
+reach = "reach.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+default-groups = ["dev", "docs"]
+
+[[tool.uv.index]]
+url = "https://pypi.org/simple"
+default = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/reach"]
+
+[dependency-groups]
+dev = [
+    "bm25s>=0.3.11",
+    "google-antigravity>=0.1.16",
+    "hypothesis>=6.168.0",
+    "mutmut>=3.7.0",
+    "mypy>=2.3.1",
+    "pytest>=9.1.1",
+    "pytest-cov>=7.1.0",
+    "pytest-xdist>=3.8.0",
+    "ruff>=0.16.6",
+    "scikit-learn>=1.9.0",
+    "scipy>=1.18.1",
+    "syrupy>=6.0.0",
+    "types-pyyaml>=6.0.12.20260906",
+]
+docs = [
+    "mkdocs-material>=9.7.7",
+    "mkdocstrings[python]>=1.0.6",
+]
+
+[tool.ruff]
+line-length = 100
+extend-exclude = ["studies/*/work"]
+
+[tool.ruff.lint]
+select = [
+    "A",        # flake8-builtins
+    "ANN",      # flake8-annotations (type annotations in src/)
+    "ARG",      # flake8-unused-arguments
+    "ASYNC",    # flake8-async
+    "B",        # flake8-bugbear
+    "BLE",      # flake8-blind-except
+    "C",        # flake8-comprehensions (C4), mccabe (C90), copyright (CPY)
+    "D",        # pydocstyle
+    "DTZ",      # flake8-datetimez
+    "E",        # pycodestyle Error (full suite: E1-E9, E501)
+    "EM",       # flake8-errmsg
+    "ERA",      # eradicate (commented-out code)
+    "EXE",      # flake8-executable
+    "F",        # Pyflakes
+    "FA",       # flake8-future-annotations
+    "FIX",      # flake8-fixme
+    "FLY",      # flynt (f-strings)
+    "FURB",     # refurb
+    "G",        # flake8-logging-format
+    "I",        # isort
+    "ICN",      # flake8-import-conventions
+    "INP",      # flake8-no-pep420
+    "ISC",      # flake8-implicit-str-concat
+    "LOG",      # flake8-logging
+    "N",        # pep8-naming
+    "NPY",      # numpy
+    "PD",       # pandas-vet
+    "PERF",     # Perflint
+    "PGH",      # pygrep-hooks (explicit type: ignore)
+    "PIE",      # flake8-pie
+    "PL",       # Pylint (PLC, PLE, PLR, PLW)
+    "PT",       # flake8-pytest-style
+    "PTH",      # flake8-use-pathlib
+    "PYI",      # flake8-pyi
+    "Q",        # flake8-quotes
+    "RET",      # flake8-return
+    "RSE",      # flake8-raise
+    "RUF",      # Ruff-specific rules
+    "S",        # flake8-bandit (security)
+    "SIM",      # flake8-simplify
+    "SLF",      # flake8-self
+    "SLOT",     # flake8-slots
+    "T",        # flake8-debugger (T10), print (T20), type-checking (TC), todos (TD), tidy-imports (TID), tryceratops (TRY)
+    "UP",       # pyupgrade
+    "W",        # pycodestyle Warnings
+    "YTT",      # flake8-2020
+]
+ignore = []
+
+[tool.ruff.lint.per-file-ignores]
+"src/reach/check.py" = [
+    "S603",     # git diff subprocess execution
+    "S607",     # git executable resolution
+]
+"src/reach/runtime/*" = [
+    "S603",     # agent CLI subprocess execution
+    "S607",     # agent CLI executable resolution
+]
+"src/reach/cli/*" = [
+    "A002",     # --format CLI parameter name
+    "A004",     # reach.cli.eval submodule name
+    "PLC0415",  # lazy CLI execution imports
+    "PLR0913",  # multi-flag CLI parameter signatures
+    "PLR0917",  # multi-positional CLI parameter signatures
+    "T201",     # print() allowed in CLI formatters
+    "TC001",    # Cyclopts reflection on CLI models
+    "TC003",    # Cyclopts reflection on stdlib types
+]
+"src/reach/*" = [
+    "PLC0415",  # optional / deferred imports (model2vec, exchange, etc.)
+]
+"tests/*" = [
+    "ANN",      # type annotations optional in tests
+    "ARG001",   # pytest fixtures as unused parameters
+    "ARG002",   # fixture methods as unused arguments
+    "INP",      # test directory package hierarchy
+    "PLC0415",  # in-function fixture/mock imports in test functions
+    "PLR0913",  # multi-argument test helper functions
+    "PLR0917",  # multi-argument test helper functions
+    "PLR2004",  # literal comparisons in test assertions
+    "S101",     # assert allowed in tests
+    "S311",     # pseudo-random benchmark seeds allowed in tests
+    "S603",     # subprocess in tests
+    "S607",     # partial executable paths in tests
+    "SLF001",   # private member access for unit testing internals
+    "TC001",    # test fixture types
+    "TC003",    # test fixture types
+]
+
+[tool.ruff.lint.pylint]
+max-args = 20
+max-positional-args = 15
+
+[tool.ruff.lint.isort]
+known-first-party = ["reach"]
+
+[tool.ruff.lint.flake8-pytest-style]
+fixture-parentheses = false
+mark-parentheses = false
+
+[tool.ruff.lint.mccabe]
+max-complexity = 25
+
+[tool.ruff.lint.pydocstyle]
+convention = "pep257"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers --strict-config --durations=5 -n auto --dist=worksteal"
+markers = [
+    "integration: mark test as integration test (skipped by default unless --integration or -m integration is passed)",
+]
+filterwarnings = [
+    "error",
+    "ignore::ResourceWarning:model2vec.*",
+    "ignore:.*_UnionGenericAlias.*:DeprecationWarning",
+    "ignore:The docstring of App contains raw markdown.*:DeprecationWarning",
+]
+
+
+[tool.mutmut]
+source_paths = ["src"]
+only_mutate = [
+    "src/reach/diff.py",
+    "src/reach/metrics.py",
+    "src/reach/uncertainty.py",
+]
+also_copy = ["tests"]
+pytest_add_cli_args = [
+    "-o",
+    "pythonpath=src",
+    "-W",
+    "ignore::pytest.PytestUnraisableExceptionWarning",
+    "-W",
+    "ignore::ResourceWarning",
+    "tests/test_diff.py",
+    "tests/test_metrics.py",
+    "tests/test_uncertainty.py",
+]
+
+[tool.coverage.run]
+source = ["reach"]
+branch = true
+
+[tool.coverage.paths]
+reach = ["src/reach", "*/site-packages/reach"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+precision = 2
+
+[tool.pyrefly]
+search-path = ["src", "tests"]
+project-includes = ["src", "tests"]
+disable-project-excludes-heuristics = true
+use-ignore-files = false
+project-excludes = ["studies/*/work/**"]
+min-severity = "warn"
+
+[tool.mypy]
+python_version = "3.12"
+python_executable = ".venv/bin/python"
+mypy_path = ["src", "tests"]
+files = ["src", "tests"]
+plugins = ["pydantic.mypy"]
+disable_error_code = ["prop-decorator"]
+check_untyped_defs = true
+warn_unused_configs = true
+warn_no_return = true
+
+[[tool.mypy.overrides]]
+module = [
+    "google.antigravity.*",
+    "scipy.*",
+    "sklearn.*",
+]
+ignore_missing_imports = true

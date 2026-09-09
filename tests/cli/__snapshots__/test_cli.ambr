@@ -1,0 +1,63 @@
+# serializer version: 1
+# name: test_a_runtime_that_probes_nothing_is_not_offered_as_though_it_did
+  '--agent                       Which agent runtime to drive (antigravity-cli, antigravity-sdk, claude-code, goose, keyword, pi)'
+# ---
+# name: test_every_format_flag_says_what_it_renders[diff]
+  '--format               How to render the comparison [choices: csv, json, jsonl, text] [default: text]'
+# ---
+# name: test_every_format_flag_says_what_it_renders[eval]
+  '--format              How to render the finished evaluation [choices: csv, json, jsonl, text] [default: text]'
+# ---
+# name: test_every_format_flag_says_what_it_renders[overlap]
+  '--format         How to render the ranking [choices: csv, json, jsonl, text] [default: text]'
+# ---
+# name: test_every_verb_is_filed_under_what_it_is_for
+  '''
+   ──────────────────────────────────────────────────────────────────────╮
+  │ --help -h  Display this message and exit.                                    │
+  │ --version  Display application version.                                      │
+  ╰──────────────────────────────────────────────────────────────────────────────╯
+  
+  '''
+# ---
+# name: test_the_verbs_are_listed_under_one_heading
+  '''
+  Usage: reach COMMAND
+  
+  Measure whether a skill is reachable when its rivals are resident.
+  
+  ╭─ The loop ───────────────────────────────────────────────────────────────────╮
+  │ check     Execute two-stage CI/CD quality gate combining linting and         │
+  │           empirical assertions.                                              │
+  │ cluster   Partition skill catalogs into cohesive subagent scopes to prevent  │
+  │           routing decay.                                                     │
+  │ diff      Change one factor, hold the queries fixed, and report the delta.   │
+  │ eval      Measure whether a catalog's skills are reachable, writing a set if │
+  │           none exists.                                                       │
+  │ lint      Validate skill manifests, frontmatter schemas, naming, and runtime │
+  │           limits.                                                            │
+  │ optimize  Optimize a skill's description using candidate synthesis and       │
+  │           empirical probes.                                                  │
+  │ overlap   Find which of your installed skills compete to answer the same     │
+  │           requests.                                                          │
+  │ query     Synthesize, convert, and inspect evaluation query sets.            │
+  │ sweep     Execute multi-scale catalog evaluation sweeps to measure           │
+  │           reachability decay.                                                │
+  │ view      Read back a recorded run and render what it measured.              │
+  ╰──────────────────────────────────────────────────────────────────────────────╯
+  ╭─ Setup & Diagnostics ────────────────────────────────────────────────────────╮
+  │ clean       Clean cached Agent Registry payloads, sandboxes, and evaluation  │
+  │             artifacts.                                                       │
+  │ completion  Generate or install shell tab-completion scripts for Reach.      │
+  │ doctor      Inspect local development environment, runtime agent binaries,   │
+  │             keys, and skill catalogs.                                        │
+  │ init        Scaffold reach.toml configuration and initialize skill           │
+  │             directories.                                                     │
+  ╰──────────────────────────────────────────────────────────────────────────────╯
+  ╭─ About ──────────────────────────────────────────────────────────────────────╮
+  │ --help -h  Display this message and exit.                                    │
+  │ --version  Display application version.                                      │
+  ╰──────────────────────────────────────────────────────────────────────────────╯
+  
+  '''
+# ---

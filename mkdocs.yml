@@ -1,0 +1,126 @@
+---
+site_name: skill-reach
+site_description: >-
+  An evaluation suite for AI agent skill routing, collision detection, and
+  description optimization.
+site_author: Google LLC
+site_url: https://google.github.io/skill-reach/
+repo_name: google/skill-reach
+repo_url: https://github.com/google/skill-reach
+edit_uri: blob/main/docs/
+
+theme:
+  name: material
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.instant
+    - navigation.tracking
+    - navigation.tabs
+    - navigation.sections
+    - navigation.expand
+    - navigation.top
+    - content.code.copy
+    - content.code.annotate
+    - search.suggest
+    - search.highlight
+    - search.share
+
+plugins:
+  - search
+  - mkdocstrings:
+      handlers:
+        python:
+          paths: [src]
+          options:
+            docstring_style: google
+            show_root_heading: true
+            show_source: true
+            separate_signature: true
+            show_signature_annotations: true
+            signature_crossrefs: true
+
+markdown_extensions:
+  - pymdownx.blocks.admonition
+  - pymdownx.blocks.details
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.blocks.tab:
+      alternate_style: true
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.keys
+  - tables
+  - attr_list
+  - pymdownx.arithmatex:
+      generic: true
+  - toc:
+      permalink: true
+
+extra_javascript:
+  - javascripts/mathjax.js
+  - https://unpkg.com/mathjax@3/es5/tex-mml-chtml.js
+
+nav:
+  - Overview: index.md
+  - Getting Started: getting-started.md
+  - Concepts:
+      - How Reachability Works: concepts/how-it-works.md
+      - Progressive Disclosure: concepts/progressive-disclosure.md
+  - CLI Reference:
+      - Overview: cli/index.md
+      - reach init: cli/init.md
+      - reach doctor: cli/doctor.md
+      - reach clean: cli/clean.md
+      - reach lint: cli/lint.md
+      - reach overlap: cli/overlap.md
+      - reach query: cli/query.md
+      - reach eval: cli/eval.md
+      - reach check: cli/check.md
+      - reach cluster: cli/cluster.md
+      - reach optimize: cli/optimize.md
+      - reach diff: cli/diff.md
+      - reach sweep: cli/sweep.md
+      - reach view: cli/view.md
+      - reach completion: cli/completion.md
+  - Configuration: configuration.md
+  - Python API:
+      - Overview: api/index.md
+      - reach.artifact: api/artifact.md
+      - reach.catalog: api/catalog.md
+      - reach.check: api/check.md
+      - reach.cluster: api/cluster.md
+      - reach.config: api/config.md
+      - reach.diff: api/diff.md
+      - reach.lint: api/lint.md
+      - reach.metrics: api/metrics.md
+      - reach.models: api/models.md
+      - reach.optimize: api/optimize.md
+      - reach.overlap: api/overlap.md
+      - reach.queries: api/queries.md
+      - reach.registry: api/registry.md
+      - reach.retrieval: api/retrieval.md
+      - reach.run: api/run.md
+      - reach.runtime: api/runtime.md
+      - reach.sweep: api/sweep.md
+      - reach.uncertainty: api/uncertainty.md

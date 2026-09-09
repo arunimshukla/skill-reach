@@ -1,0 +1,681 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Verify classification, routing, and trajectory scoring over probe results."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+from scipy import stats
+
+from reach.metrics import (
+    classification_report,
+    collisions,
+    compute_f1,
+    compute_precursor_graph,
+    confusion,
+    consistency,
+    score_trajectory,
+    trajectory_scores,
+)
+from reach.models import (
+    NO_SKILL,
+    CatalogMode,
+    ProbeResult,
+    Query,
+    QueryKind,
+    Skill,
+)
+
+
+def _result(query_id: str, invoked: str | None, error: str | None = None) -> ProbeResult:
+    """Build a probe result with fixed catalog metadata for scoring tests."""
+    return ProbeResult(
+        query_id=query_id,
+        catalog_id="test-cat",
+        catalog_mode=CatalogMode.ALL,
+        catalog_size=2,
+        model="opus",
+        runtime="fake",
+        invoked_skills=(invoked,) if invoked else (),
+        error=error,
+    )
+
+
+def test_compute_f1_is_the_harmonic_mean_of_precision_and_recall() -> None:
+    """Verify compute_f1 calculates harmonic mean of precision and recall."""
+    assert compute_f1(0.5, 0.5) == pytest.approx(0.5)
+    assert compute_f1(1.0, 1.0) == pytest.approx(1.0)
+    assert compute_f1(1.0, 0.0) == 0.0
+
+
+def test_compute_f1_is_zero_rather_than_a_division_by_zero() -> None:
+    """Verify compute_f1 returns 0.0 when precision and recall are both zero."""
+    assert compute_f1(0.0, 0.0) == 0.0
+
+
+def test_exact_match_counts_top1(queries) -> None:
+    """Verify exact match increments top1 accuracy."""
+    report = classification_report([_result("q-lifecycle", "gcs-lifecycle-rules")], queries)
+    assert report.top1_accuracy == 1.0
+
+
+def test_misroute_counts_as_zero_accuracy(queries) -> None:
+    """Verify misrouted invocation earns zero accuracy."""
+    report = classification_report([_result("q-lifecycle", "gke-basics")], queries)
+    assert report.top1_accuracy == 0.0
+
+
+def test_non_selection_is_tracked_separately(queries) -> None:
+    """Verify non-selection is tracked in non_selections count rather than errors."""
+    report = classification_report([_result("q-lifecycle", None)], queries)
+    assert report.abstentions == 1
+    assert report.abstention_rate == 1.0
+    assert report.top1_accuracy == 0.0
+
+
+def test_errored_probes_leave_the_denominator(queries) -> None:
+    """Verify errored probes are excluded from scored denominator."""
+    results = [
+        _result("q-lifecycle", "gcs-lifecycle-rules"),
+        _result("q-retention", None, error="timeout"),
+    ]
+    report = classification_report(results, queries)
+    assert report.probes == 2
+    assert report.errors == 1
+    assert report.scored == 1
+    assert report.top1_accuracy == 1.0
+
+
+def test_all_errors_do_not_divide_by_zero(queries) -> None:
+    """Verify score returns 0.0 accuracy metrics when all probes encounter errors."""
+    report = classification_report([_result("q-lifecycle", None, error="timeout")], queries)
+    assert report.scored == 0
+    assert report.top1_accuracy == 0.0
+
+
+def test_unlabeled_result_raises(queries) -> None:
+    """Verify score raises KeyError when encountering unknown query_id."""
+    with pytest.raises(KeyError, match="q-unknown"):
+        classification_report([_result("q-unknown", "gke-basics")], queries)
+
+
+def test_confusion_records_non_selection_as_none(queries) -> None:
+    """Verify confusion matrix tallies uninvoked queries under None key."""
+    matrix = confusion([_result("q-lifecycle", None)], queries)
+    assert matrix[("gcs-lifecycle-rules", None)] == 1
+
+
+def test_collisions_count_all_misroutes(queries) -> None:
+    """Verify collisions counts all misroutes between distinct skills."""
+    results = [
+        _result("q-retention", "gcs-lifecycle-rules"),
+        _result("q-lifecycle", "gke-basics"),
+    ]
+    pairs = collisions(results, queries)
+    assert pairs == {
+        ("gcs-retention-policy", "gcs-lifecycle-rules"): 1,
+        ("gcs-lifecycle-rules", "gke-basics"): 1,
+    }
+
+
+def test_precision_is_bounded_only_when_the_skill_was_ever_selected(queries) -> None:
+    """Verify precision interval is calculated only for skills selected at least once."""
+    report = classification_report(
+        [
+            _result("q-lifecycle", "gcs-lifecycle-rules"),
+            _result("q-retention", "gcs-lifecycle-rules"),
+        ],
+        queries,
+    )
+    selected = report.by_label("gcs-lifecycle-rules").precision_interval
+    assert selected is not None
+    assert selected.low <= 0.5 <= selected.high
+    assert report.by_label("gcs-retention-policy").precision_interval is None
+
+
+def test_asking_for_a_label_the_run_never_saw_names_the_label(queries) -> None:
+    """Verify by_label raises KeyError for labels not present in the run."""
+    report = classification_report([_result("q-lifecycle", None)], queries)
+    with pytest.raises(KeyError, match="gke-basics"):
+        report.by_label("gke-basics")
+
+
+@pytest.mark.parametrize(
+    ("tally", "expected"),
+    [(confusion, {}), (collisions, {})],
+    ids=["confusion", "collisions"],
+)
+def test_a_tally_over_a_narrowed_query_set_skips_what_it_cannot_label(
+    queries,
+    tally,
+    expected,
+) -> None:
+    """Verify confusion and collisions filter out unindexed queries without error."""
+    subset = [q for q in queries if q.id == "q-lifecycle"]
+    results = [_result("q-retention", "gke-basics")]
+    assert tally(results, subset) == expected
+    with pytest.raises(KeyError, match="q-retention"):
+        classification_report(results, subset)
+
+
+#: label -> (support, predicted, tp, fp, fn) expected counts for worked example.
+WORKED_COUNTS = {
+    NO_SKILL: (2, 2, 1, 1, 1),
+    "waf-cost": (2, 3, 2, 1, 0),
+    "waf-reliability": (2, 1, 1, 0, 1),
+    "waf-security": (2, 4, 1, 3, 1),
+    "waf-sustainability": (2, 0, 0, 0, 2),
+}
+
+#: metric -> (expected value, description).
+WORKED_HEADLINE = {
+    "top1_accuracy": (0.5, "5 of 10 predictions match"),
+    "macro_precision": ((2 / 3 + 0.25 + 1.0 + 0.0 + 0.5) / 5, "mean of 5 precisions"),
+    "macro_recall": ((1.0 + 0.5 + 0.5 + 0.0 + 0.5) / 5, "mean of 5 recalls"),
+    "macro_f1": ((0.8 + 1 / 3 + 2 / 3 + 0.0 + 0.5) / 5, "mean of 5 F1s"),
+    "abstention_rate": (0.2, "2 of 10 predictions abstained"),
+    "false_abstention_rate": (1 / 8, "1 of the 8 in-scope probes abstained"),
+    "out_of_scope_detection": (0.5, "1 of the 2 out-of-scope probes abstained"),
+}
+
+
+@pytest.mark.parametrize(
+    ("metric", "expected", "reason"),
+    [(k, v[0], v[1]) for k, v in WORKED_HEADLINE.items()],
+)
+def test_headline_metric_matches_hand_arithmetic(
+    worked_results,
+    worked_queries,
+    metric,
+    expected,
+    reason,
+) -> None:
+    """Verify headline metrics match hand-calculated expectations on worked dataset."""
+    report = classification_report(worked_results, worked_queries)
+    assert getattr(report, metric) == pytest.approx(expected), reason
+
+
+@pytest.mark.parametrize(("label", "counts"), sorted(WORKED_COUNTS.items()))
+def test_per_class_counts_match_hand_arithmetic(
+    worked_results,
+    worked_queries,
+    label,
+    counts,
+) -> None:
+    """Verify support and confusion counts for each label match hand calculations."""
+    entry = classification_report(worked_results, worked_queries).by_label(label)
+    support, predicted, tp, fp, fn = counts
+    actual = (
+        entry.support,
+        entry.predicted,
+        entry.true_positives,
+        entry.false_positives,
+        entry.false_negatives,
+    )
+    assert actual == (support, predicted, tp, fp, fn)
+
+
+def test_per_class_rates_derive_from_the_counts(worked_results, worked_queries) -> None:
+    """Verify per-class precision, recall, and F1 correctly compute from raw counts."""
+    report = classification_report(worked_results, worked_queries)
+    security = report.by_label("waf-security")
+    assert security.precision == pytest.approx(0.25)
+    assert security.recall == pytest.approx(0.5)
+    assert security.f1 == pytest.approx(1 / 3)
+
+    unreachable = report.by_label("waf-sustainability")
+    assert (unreachable.precision, unreachable.recall, unreachable.f1) == (
+        0.0,
+        0.0,
+        0.0,
+    )
+
+
+def test_abstention_is_scored_as_a_class_not_a_missing_prediction(
+    worked_results,
+    worked_queries,
+) -> None:
+    """Verify NO_SKILL abstention is treated as a first-class evaluated label."""
+    report = classification_report(worked_results, worked_queries)
+    abstain = report.by_label(NO_SKILL)
+    assert (abstain.true_positives, abstain.false_positives) == (1, 1)
+    assert len(report.per_class) == 5
+
+
+def test_classification_report_tracks_top1_and_abstention(
+    worked_results,
+    worked_queries,
+) -> None:
+    """Verify classification report distinguishes top-1 hits and abstentions."""
+    report = classification_report(worked_results, worked_queries)
+    assert (report.probes, report.scored, report.top1_hits) == (10, 10, 5)
+    assert report.abstentions == 2
+    assert report.false_abstentions == 1
+    assert report.top1_accuracy == pytest.approx(0.5)
+
+
+def test_consistency_counts_queries_whose_attempts_agreed(
+    worked_results,
+    worked_queries,
+) -> None:
+    """Verify consistency calculates fraction of queries with identical selections."""
+    assert consistency(worked_results, worked_queries) == pytest.approx(0.4)
+
+
+def test_collisions_count_a_fire_on_an_out_of_scope_query(
+    worked_results,
+    worked_queries,
+) -> None:
+    """Verify collisions records unauthorized skill invocations on out-of-scope queries."""
+    pairs = collisions(worked_results, worked_queries)
+    assert pairs[(NO_SKILL, "waf-security")] == 1
+    assert pairs[("waf-sustainability", "waf-security")] == 2
+    assert pairs[("waf-security", "waf-cost")] == 1
+
+
+def test_worst_recall_and_top_attractors_rank_the_actionable_labels(
+    worked_results,
+    worked_queries,
+) -> None:
+    """Verify worst_recall and top_attractors sort and rank problem labels."""
+    report = classification_report(worked_results, worked_queries)
+    assert report.worst_recall(1)[0].label == "waf-sustainability"
+    assert report.top_attractors(1)[0].label == "waf-security"
+
+
+def test_worked_example_agrees_with_sklearn(
+    worked_results,
+    worked_queries,
+    matches_sklearn,
+) -> None:
+    """Verify reach metrics match scikit-learn reference implementation."""
+    matches_sklearn(worked_results, worked_queries)
+
+
+def test_errored_probes_are_excluded_from_every_metric(
+    worked_results,
+    worked_queries,
+    make_result,
+) -> None:
+    """Verify errored probes are excluded from classification report calculations."""
+    broken = [
+        *worked_results,
+        make_result("wq-cost", None, attempt=3, error="tool leak"),
+    ]
+    clean = classification_report(worked_results, worked_queries)
+    with_error = classification_report(broken, worked_queries)
+    assert with_error.errors == 1
+    assert with_error.scored == clean.scored == 10
+    assert with_error.top1_accuracy == pytest.approx(clean.top1_accuracy)
+    assert with_error.abstention_rate == pytest.approx(clean.abstention_rate)
+
+
+def test_results_referencing_an_unlabeled_query_are_rejected(
+    worked_results,
+    worked_queries,
+    make_result,
+) -> None:
+    """Verify classification_report raises KeyError for unindexed query IDs."""
+    stray = [*worked_results, make_result("wq-ghost", "waf-cost")]
+    with pytest.raises(KeyError, match="wq-ghost"):
+        classification_report(stray, worked_queries)
+
+
+def test_empty_input_scores_zero_rather_than_dividing_by_zero(worked_queries) -> None:
+    """Verify metrics return 0.0 or None without ZeroDivisionError on empty datasets."""
+    report = classification_report([], worked_queries)
+    assert (report.scored, report.top1_accuracy, report.macro_f1) == (0, 0.0, 0.0)
+    assert report.out_of_scope_detection is None
+    assert consistency([], worked_queries) == 0.0
+
+
+def test_out_of_scope_detection_reaches_both_extremes(worked_queries, make_result) -> None:
+    """Verify out_of_scope_detection correctly evaluates 1.0 and 0.0 boundary conditions."""
+    always = [make_result("wq-oos", None, attempt=i) for i in (1, 2)]
+    never = [make_result("wq-oos", "waf-cost", attempt=i) for i in (1, 2)]
+    oos = [q for q in worked_queries if q.is_out_of_scope]
+
+    assert classification_report(always, oos).out_of_scope_detection == 1.0
+    assert classification_report(never, oos).out_of_scope_detection == 0.0
+    assert classification_report(always, oos).false_abstention_rate == 0.0
+
+
+def test_both_label_surfaces_use_the_same_abstain_token(worked_queries, make_result) -> None:
+    """Verify query and result models use identical NO_SKILL constant for abstentions."""
+    assert make_result("wq-oos", None).predicted_label == NO_SKILL
+    assert next(q for q in worked_queries if q.is_out_of_scope).truth_label == NO_SKILL
+    assert make_result("wq-cost", "waf-cost").predicted_label == "waf-cost"
+
+
+@pytest.mark.parametrize(
+    (
+        "query",
+        "invoked",
+        "expected_entry",
+        "expected_reach",
+        "expected_mrr",
+        "expected_f1",
+        "expected_redundancy",
+    ),
+    [
+        # Direct Primary Hit: [{deploy}], invoked: [deploy]
+        (
+            Query(id="q1", text="deploy", expected_skill="deploy"),
+            ("deploy",),
+            True,
+            True,
+            1.0,
+            1.0,
+            0,
+        ),
+        # Precursor Setup: [{deploy}], invoked: [gcloud, deploy]
+        (
+            Query(id="q3", text="deploy", expected_skill="deploy"),
+            ("gcloud", "deploy"),
+            False,
+            True,
+            0.5,
+            0.6667,
+            1,
+        ),
+        # Skill Stuffing (Spam): [{deploy}], invoked: [deploy, s2, s3, s4, s5]
+        (
+            Query(id="q5", text="deploy", expected_skill="deploy"),
+            ("deploy", "s2", "s3", "s4", "s5"),
+            True,
+            True,
+            1.0,
+            0.3333,
+            4,
+        ),
+        # Looping Retry Bloat: [{deploy}], invoked: [deploy, deploy, deploy]
+        (
+            Query(id="q6", text="deploy", expected_skill="deploy"),
+            ("deploy", "deploy", "deploy"),
+            True,
+            True,
+            1.0,
+            1.0,
+            2,
+        ),
+        # Out-of-Scope (Abstain): [], invoked: []
+        (
+            Query(id="q7", text="hello", kind=QueryKind.OUT_OF_SCOPE),
+            (),
+            True,
+            True,
+            1.0,
+            1.0,
+            0,
+        ),
+        # Out-of-Scope (Misroute): [], invoked: [deploy]
+        (
+            Query(id="q8", text="hello", kind=QueryKind.OUT_OF_SCOPE),
+            ("deploy",),
+            False,
+            False,
+            0.0,
+            0.0,
+            1,
+        ),
+        # Fatal Misroute: [{deploy}], invoked: [wrong]
+        (
+            Query(id="q9", text="deploy", expected_skill="deploy"),
+            ("wrong",),
+            False,
+            False,
+            0.0,
+            0.0,
+            0,
+        ),
+    ],
+)
+def test_score_trajectory_behavior_matrix(
+    query: Query,
+    invoked: tuple[str, ...],
+    expected_entry: bool,
+    expected_reach: bool,
+    expected_mrr: float,
+    expected_f1: float,
+    expected_redundancy: int,
+) -> None:
+    """Verify score_trajectory conforms to the comprehensive behavior matrix."""
+    score = score_trajectory(query, invoked)
+    assert score.entrypoint_hit is expected_entry
+    assert score.trajectory_hit is expected_reach
+    assert score.step_efficiency == pytest.approx(expected_mrr, abs=1e-3)
+    assert score.skill_f1 == pytest.approx(expected_f1, abs=1e-3)
+    assert score.redundancy == expected_redundancy
+
+
+def test_classification_report_trajectory_aggregates_and_scipy_cross_check() -> None:
+    """Verify aggregated trajectory metrics and validate Wilson intervals against scipy."""
+    queries = (
+        Query(id="q1", text="deploy", expected_skill="deploy"),
+        Query(id="q2", text="scale", expected_skill="scale"),
+        Query(id="q3", text="auth", expected_skill="auth"),
+        Query(id="q4", text="oos", kind=QueryKind.OUT_OF_SCOPE),
+    )
+    # q1: precursor setup (entrypoint False, trajectory True, mrr 0.5, f1 0.6667, red 1)
+    # q2: direct primary hit (entrypoint True, trajectory True, mrr 1.0, f1 1.0, red 0)
+    # q3: fatal misroute (entrypoint False, trajectory False, mrr 0.0, f1 0.0, red 0)
+    # q4: clean abstention (entrypoint True, trajectory True, mrr 1.0, f1 1.0, red 0)
+    results = [
+        ProbeResult(
+            query_id="q1",
+            catalog_id="cat",
+            catalog_mode=CatalogMode.ALL,
+            catalog_size=3,
+            model="m",
+            runtime="fake",
+            invoked_skills=("auth", "deploy"),
+        ),
+        ProbeResult(
+            query_id="q2",
+            catalog_id="cat",
+            catalog_mode=CatalogMode.ALL,
+            catalog_size=3,
+            model="m",
+            runtime="fake",
+            invoked_skills=("scale",),
+        ),
+        ProbeResult(
+            query_id="q3",
+            catalog_id="cat",
+            catalog_mode=CatalogMode.ALL,
+            catalog_size=3,
+            model="m",
+            runtime="fake",
+            invoked_skills=("wrong",),
+        ),
+        ProbeResult(
+            query_id="q4",
+            catalog_id="cat",
+            catalog_mode=CatalogMode.ALL,
+            catalog_size=3,
+            model="m",
+            runtime="fake",
+            invoked_skills=(),
+        ),
+    ]
+
+    report = classification_report(results, queries)
+    assert report.scored == 4
+    assert report.entrypoint_hits == 2  # q2 and q4
+    assert report.entrypoint_accuracy == pytest.approx(2 / 4)
+    assert report.trajectory_hits == 3  # q1, q2, q4
+    assert report.trajectory_reachability == pytest.approx(3 / 4)
+    assert report.step_efficiency == pytest.approx((0.5 + 1.0 + 0.0 + 1.0) / 4)
+    assert report.skill_f1 == pytest.approx((0.6667 + 1.0 + 0.0 + 1.0) / 4, abs=1e-3)
+    assert report.redundancy == pytest.approx((1 + 0 + 0 + 0) / 4)
+
+    # Cross-check Wilson intervals directly against scipy.stats.binomtest
+    scipy_entry = stats.binomtest(2, 4).proportion_ci(confidence_level=0.95, method="wilson")
+    assert report.entrypoint_interval is not None
+    assert report.entrypoint_interval.low == pytest.approx(scipy_entry.low, abs=1e-5)
+    assert report.entrypoint_interval.high == pytest.approx(scipy_entry.high, abs=1e-5)
+
+    scipy_traj = stats.binomtest(3, 4).proportion_ci(confidence_level=0.95, method="wilson")
+    assert report.trajectory_interval is not None
+    assert report.trajectory_interval.low == pytest.approx(scipy_traj.low, abs=1e-5)
+    assert report.trajectory_interval.high == pytest.approx(scipy_traj.high, abs=1e-5)
+
+
+def test_trajectory_scores_mapping() -> None:
+    """Verify trajectory_scores returns per-query mapping."""
+    queries = (
+        Query(id="q1", text="deploy", expected_skill="deploy"),
+        Query(id="q2", text="oos", kind=QueryKind.OUT_OF_SCOPE),
+    )
+    results = [
+        ProbeResult(
+            query_id="q1",
+            catalog_id="c",
+            catalog_mode=CatalogMode.ALL,
+            catalog_size=1,
+            model="m",
+            runtime="fake",
+            invoked_skills=("deploy",),
+        ),
+        ProbeResult(
+            query_id="q2",
+            catalog_id="c",
+            catalog_mode=CatalogMode.ALL,
+            catalog_size=1,
+            model="m",
+            runtime="fake",
+            invoked_skills=(),
+        ),
+    ]
+    mapping = trajectory_scores(results, queries)
+    assert len(mapping) == 2
+    assert mapping["q1"].trajectory_hit is True
+    assert mapping["q1"].entrypoint_hit is True
+    assert mapping["q2"].trajectory_hit is True
+
+
+def test_compute_precursor_graph() -> None:
+    """Verify empirical precursor graph transitions and declared dependencies."""
+    queries = (
+        Query(id="q-deploy", text="deploy", expected_skill="cloud-deploy"),
+        Query(id="q-single", text="single", expected_skill="other"),
+    )
+    skills = (
+        Skill(
+            name="cloud-deploy",
+            description="deploy app",
+            path=Path("/skills/cloud-deploy"),
+            declared_dependencies=("gcloud-auth",),
+        ),
+    )
+    results = [
+        # Successful transition with gap=1
+        ProbeResult(
+            query_id="q-deploy",
+            catalog_id="c",
+            catalog_mode=CatalogMode.ALL,
+            catalog_size=2,
+            model="m",
+            runtime="fake",
+            invoked_skills=("gcloud-auth", "cloud-deploy"),
+        ),
+        # Successful transition with gap=2
+        ProbeResult(
+            query_id="q-deploy",
+            catalog_id="c",
+            catalog_mode=CatalogMode.ALL,
+            catalog_size=2,
+            model="m",
+            runtime="fake",
+            invoked_skills=("gcloud-auth", "logger", "cloud-deploy"),
+        ),
+        # Single-call probe (no transition possible)
+        ProbeResult(
+            query_id="q-single",
+            catalog_id="c",
+            catalog_mode=CatalogMode.ALL,
+            catalog_size=2,
+            model="m",
+            runtime="fake",
+            invoked_skills=("other",),
+        ),
+        # Failed probe
+        ProbeResult(
+            query_id="q-deploy",
+            catalog_id="c",
+            catalog_mode=CatalogMode.ALL,
+            catalog_size=2,
+            model="m",
+            runtime="fake",
+            error="timed out",
+        ),
+    ]
+
+    edges = compute_precursor_graph(results, queries, skills, min_observations=1)
+    # Looking for edge gcloud-auth -> cloud-deploy
+    matching = [e for e in edges if e.precursor == "gcloud-auth" and e.target == "cloud-deploy"]
+    assert len(matching) == 1
+    edge = matching[0]
+    assert edge.attempts == 2
+    assert edge.handoffs == 2
+    assert edge.handoff_rate == 1.0
+    # gaps were 1 and 2, avg = 1.5
+    assert edge.avg_step_latency == pytest.approx(1.5)
+    assert edge.is_declared_dependency is True
+
+
+def test_compute_precursor_graph_edge_cases() -> None:
+    """Verify precursor graph handles non-linear and missing target trajectories."""
+    queries = (
+        Query(
+            id="q-multi",
+            text="multi",
+            expected_skill="target-a",
+        ),
+    )
+    results = [
+        # Target appears first, then precursor: target-a is reached at step 0 so target-a ->
+        # gcloud-auth is not a precursor
+        ProbeResult(
+            query_id="q-multi",
+            catalog_id="c",
+            catalog_mode=CatalogMode.ALL,
+            catalog_size=3,
+            model="m",
+            runtime="fake",
+            invoked_skills=("target-a", "logger", "gcloud-auth"),
+        ),
+        # Target never invoked in trajectory
+        ProbeResult(
+            query_id="q-multi",
+            catalog_id="c",
+            catalog_mode=CatalogMode.ALL,
+            catalog_size=3,
+            model="m",
+            runtime="fake",
+            invoked_skills=("step-1", "step-2"),
+        ),
+    ]
+    edges = compute_precursor_graph(results, queries, min_observations=1)
+    step1_edges = [e for e in edges if e.precursor == "step-1"]
+    assert len(step1_edges) == 1
+    edge = step1_edges[0]
+    assert edge.target == "target-a"
+    assert edge.attempts == 1
+    assert edge.handoffs == 0
+    assert edge.handoff_rate == 0.0
+    assert edge.avg_step_latency == 0.0

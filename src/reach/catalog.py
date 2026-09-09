@@ -1,0 +1,894 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Load skills from a repository root and compose them into catalogs for evaluation."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+import re
+from random import Random
+from typing import TYPE_CHECKING, Any, Final
+
+import yaml
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
+
+from reach.config import resolve_path
+from reach.models import Catalog, CatalogMode, Skill
+from reach.queries import QuerySet
+from reach.retrieval import Bm25Scorer, Scorer, skill_text, tokenize
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping, Sequence
+    from pathlib import Path
+
+__all__ = [
+    "DEFAULT_SWEEP_SCALES",
+    "CorpusScalingPlan",
+    "build_catalogs",
+    "build_corpus_scaling_catalogs",
+    "build_corpus_scaling_queries",
+    "build_corpus_scaling_sequence",
+    "build_neighborhood_catalogs",
+    "build_scaling_catalogs",
+    "corpus_digest",
+    "determine_min_scale",
+    "find_cluster_medoids",
+    "find_skill_manifest",
+    "generate_log_scales",
+    "load_registry_skills",
+    "load_skills",
+    "parse_frontmatter",
+    "resident_skills",
+    "resolve_catalog",
+    "resolve_sweep_scales",
+    "split_frontmatter",
+]
+
+FRONTMATTER_DELIMITER = "---"
+FRONTMATTER_SPLIT_PARTS: Final = 3
+MIN_NEIGHBORHOOD_SIZE: Final = 2
+
+#: Key in SKILL.md frontmatter indicating exclusion from model tool selection.
+HIDE_FROM_MODEL_KEY: Final = "disable-model-invocation"
+
+#: Truthy string representations accepted for boolean frontmatter values.
+TRUTHY = frozenset({"true", "yes", "on", "1"})
+
+#: Marker appended to corpus digest when a skill is hidden from model invocation.
+HIDDEN_MARKER = "\ndisclosure: hidden"
+
+
+def _is_set(value: object) -> bool:
+    """Check if a frontmatter value represents a truthy boolean or string value."""
+    if isinstance(value, str):
+        return value.strip().lower() in TRUTHY
+    return bool(value)
+
+
+_SKILL_TOOL_PATTERN = re.compile(r"Skill\(\s*([a-z0-9_-]+)\s*\)", re.IGNORECASE)
+
+
+def find_skill_manifest(skill_path: Path) -> Path | None:
+    """Traverse upward from SKILL.md or directory to locate nearest skills.json or lockfile."""
+    resolved = resolve_path(skill_path)
+    current = resolved if resolved.is_dir() else resolved.parent
+
+    while current != current.parent:
+        for candidate in ("skills.json", "skills-lock.json"):
+            manifest = current / candidate
+            if manifest.is_file():
+                return manifest
+        if (current / ".git").exists():
+            break
+        current = current.parent
+    return None
+
+
+def _extract_allowed_skills(raw_allowed: object) -> tuple[str, ...]:
+    """Extract scoped skill names from allowed-tools string or sequence."""
+    if isinstance(raw_allowed, str):
+        return tuple(sorted(set(_SKILL_TOOL_PATTERN.findall(raw_allowed))))
+    if isinstance(raw_allowed, (list, tuple)):
+        found: set[str] = set()
+        for item in raw_allowed:
+            found.update(_SKILL_TOOL_PATTERN.findall(str(item)))
+        return tuple(sorted(found))
+    return ()
+
+
+def _extract_declared_dependencies(
+    raw_frontmatter: dict[str, Any],
+    allowed_skills: tuple[str, ...],
+) -> tuple[str, ...]:
+    """Extract and union declared dependencies from allowed-tools and metadata."""
+    deps: set[str] = set(allowed_skills)
+    meta = raw_frontmatter.get("metadata", {})
+
+    if isinstance(meta, dict):
+        for key in ("requires_skill", "depends_on", "depends-on", "requires_skills", "helpers"):
+            val = meta.get(key)
+            if isinstance(val, str):
+                deps.update(s.strip() for s in val.split(",") if s.strip())
+            elif isinstance(val, (list, tuple)):
+                deps.update(str(s).strip() for s in val if s)
+
+        req = meta.get("requires")
+        if isinstance(req, dict):
+            skill_list = req.get("skills", [])
+            if isinstance(skill_list, (list, tuple)):
+                deps.update(str(s).strip() for s in skill_list if s)
+
+    return tuple(sorted(deps))
+
+
+def _resolve_manifest_source(skill_name: str, manifest_path: Path | None) -> str | None:
+    """Extract package source or identifier from a resolved manifest or lockfile."""
+    if manifest_path is None or not manifest_path.is_file():
+        return None
+    try:
+        data = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return None
+        if manifest_path.name == "skills-lock.json":
+            skills = data.get("skills")
+            if isinstance(skills, dict):
+                info = skills.get(skill_name)
+                if isinstance(info, dict):
+                    src = info.get("source")
+                    if isinstance(src, str) and src:
+                        return src
+        elif manifest_path.name == "skills.json":
+            name = data.get("name")
+            if isinstance(name, str) and name:
+                return name
+    except (OSError, json.JSONDecodeError):
+        return None
+    return None
+
+
+class _SkillFrontmatter(BaseModel):
+    """Represent the parsed YAML frontmatter metadata block from a SKILL.md file."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    name: str | None = None
+    description: str = ""
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    allowed_tools: Any = Field(
+        default=None,
+        validation_alias=AliasChoices("allowed-tools", "allowed_tools"),
+    )
+    disable_model_invocation: Any = Field(
+        default=None,
+        validation_alias=AliasChoices(HIDE_FROM_MODEL_KEY, "disable_model_invocation"),
+    )
+
+    def is_model_invocable(self) -> bool:
+        """Check whether the skill allows model invocation based on frontmatter flags."""
+        return not _is_set(self.disable_model_invocation)
+
+    def stringified_metadata(self) -> dict[str, str]:
+        """Return metadata dictionary with all non-None values cast to strings."""
+        return {k: str(v) for k, v in self.metadata.items() if v is not None}
+
+
+def split_frontmatter(text: str) -> tuple[str, str] | None:
+    """Split raw markdown text into frontmatter YAML and markdown body content.
+
+    Args:
+        text: Raw content of a markdown skill file.
+
+    Returns:
+        A tuple of (frontmatter_yaml, markdown_body) if valid delimiter lines are found,
+        or None if the file lacks valid frontmatter delimiters.
+    """
+    if not text.startswith(FRONTMATTER_DELIMITER):
+        return None
+    parts = text.split(FRONTMATTER_DELIMITER, 2)
+    if len(parts) < FRONTMATTER_SPLIT_PARTS:
+        return None
+    return parts[1], parts[2]
+
+
+def parse_frontmatter(text: str, path: Path) -> Skill | None:
+    """Parse a SKILL.md file's YAML frontmatter into a validated Skill model.
+
+    Args:
+        text: Raw markdown file contents including frontmatter block.
+        path: Filesystem path to the SKILL.md file (used for fallback naming).
+
+    Returns:
+        A validated Skill model instance, or None if frontmatter cannot be parsed.
+    """
+    split = split_frontmatter(text)
+    if split is None:
+        return None
+    frontmatter, _body = split
+    loaded = yaml.safe_load(frontmatter)
+    if not isinstance(loaded, dict):
+        return None
+    parsed = _SkillFrontmatter.model_validate(loaded)
+    name = parsed.name or path.parent.name
+    raw_allowed = parsed.allowed_tools
+    allowed = _extract_allowed_skills(raw_allowed)
+    deps = _extract_declared_dependencies(loaded, allowed)
+    manifest = find_skill_manifest(path)
+    manifest_src = _resolve_manifest_source(name, manifest)
+
+    return Skill(
+        name=name,
+        description=parsed.description,
+        metadata=parsed.stringified_metadata(),
+        path=path.parent,
+        allowed_tools=allowed,
+        declared_dependencies=deps,
+        manifest_source=manifest_src,
+        model_invocable=parsed.is_model_invocable(),
+    )
+
+
+def _skill_files(root: Path) -> list[Path]:
+    """Find SKILL.md files under a root, following symlinks without cycles."""
+    resolved_root = resolve_path(root)
+    seen: set[Path] = set()
+    found: list[Path] = []
+    for dirpath, dirnames, filenames in resolved_root.walk(follow_symlinks=True):
+        real = dirpath.resolve()
+        if real in seen:
+            dirnames.clear()
+            continue
+        seen.add(real)
+        dirnames.sort()
+        if "SKILL.md" in filenames:
+            found.append(dirpath / "SKILL.md")
+    return found
+
+
+def load_skills(root: Path | str) -> list[Skill]:
+    """Load and parse all skills under a directory root, sorted by skill name.
+
+    Deduplicates skills sharing the same name by selecting the shortest path.
+
+    Args:
+        root: Directory path containing skill subdirectories or SKILL.md files.
+
+    Returns:
+        Sorted list of resident Skill objects found under the directory.
+
+    Raises:
+        NotADirectoryError: If the resolved path does not exist or is not a directory.
+    """
+    resolved = resolve_path(root)
+    if not resolved.is_dir():
+        msg = f"skill root does not exist: {resolved}"
+        raise NotADirectoryError(msg)
+    by_name: dict[str, Skill] = {}
+    candidate_files = sorted(
+        _skill_files(resolved),
+        key=lambda p: (len(p.parts), str(p)),
+    )
+    for skill_file in candidate_files:
+        skill = parse_frontmatter(skill_file.read_text(encoding="utf-8"), skill_file)
+        if skill is not None and skill.name not in by_name:
+            by_name[skill.name] = skill
+    return sorted(by_name.values(), key=lambda s: s.name)
+
+
+def load_registry_skills(
+    project: str,
+    location: str = "global",
+    publisher: str | None = None,
+    fresh: bool = False,
+    no_cache: bool = False,
+    cache_ttl_seconds: int = 300,
+    cache_root: Path | str | None = None,
+) -> list[Skill]:
+    """Fetch and load skills from Google Cloud Agent Registry via local cache mirror.
+
+    Args:
+        project: Google Cloud project ID.
+        location: Registry location (default: 'global').
+        publisher: Optional publisher filter.
+        fresh: If True, bypass metadata TTL and query live.
+        no_cache: If True, run in ephemeral memory/tempdir.
+        cache_ttl_seconds: TTL in seconds for metadata cache validity.
+        cache_root: Optional custom cache directory.
+
+    Returns:
+        Sorted list of resident Skill objects.
+    """
+    from reach.registry import RegistryCacheManager
+
+    manager = RegistryCacheManager(cache_root=cache_root)
+    return manager.resolve_skills(
+        project=project,
+        location=location,
+        publisher=publisher,
+        fresh=fresh,
+        no_cache=no_cache,
+        cache_ttl_seconds=cache_ttl_seconds,
+    )
+
+
+def corpus_digest(skills: Sequence[Skill]) -> str:
+    """Compute deterministic 12-char SHA-256 digest of corpus names/descriptions.
+
+    Args:
+        skills: Sequence of resident Skill objects.
+
+    Returns:
+        A 12-character hexadecimal SHA-256 digest identifying the corpus selection surface.
+    """
+    material = "\n".join(
+        f"{skill.name}\n{skill.description}" + ("" if skill.model_invocable else HIDDEN_MARKER)
+        for skill in sorted(skills, key=lambda s: s.name)
+    )
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:12]
+
+
+def build_catalogs(
+    skills: Sequence[Skill],
+    mode: CatalogMode,
+    size: int = 20,
+    rivals: int = 10,
+    seed: int = 0,
+    scorer: Scorer | None = None,
+    target_skill: str | None = None,
+) -> list[Catalog]:
+    """Assemble skill catalogs from a corpus using the specified cataloging mode."""
+    if not skills:
+        return []
+    match mode:
+        case CatalogMode.ALL:
+            return [
+                Catalog(
+                    id="all",
+                    mode=mode,
+                    skills=tuple(s.name for s in skills),
+                ),
+            ]
+        case CatalogMode.SINGLETON:
+            return [Catalog(id=f"singleton:{s.name}", mode=mode, skills=(s.name,)) for s in skills]
+        case CatalogMode.NEIGHBORHOOD:
+            return build_neighborhood_catalogs(
+                skills,
+                size=size,
+                rivals=rivals,
+                seed=seed,
+                scorer=scorer,
+            )
+        case CatalogMode.SWEEP:
+            scales = resolve_sweep_scales(len(skills))
+            if target_skill is not None:
+                return build_scaling_catalogs(
+                    skills,
+                    target_skill=target_skill,
+                    scales=scales,
+                    seed=seed,
+                    scorer=scorer,
+                )
+            return build_corpus_scaling_catalogs(
+                skills,
+                scales=scales,
+                scorer=scorer,
+            )
+
+        case _:
+            msg = f"unsupported catalog mode: {mode}"
+            raise ValueError(msg)
+
+
+_CANONICAL_LOG_STEPS: tuple[int, ...] = (
+    1,
+    2,
+    5,
+    10,
+    25,
+    50,
+    100,
+    200,
+    400,
+    800,
+    1600,
+    3200,
+    6400,
+    12800,
+)
+
+DEFAULT_SWEEP_SCALES: tuple[int, ...] = _CANONICAL_LOG_STEPS[3:10]
+
+LARGE_CORPUS_THRESHOLD: Final = 50
+MEDIUM_CORPUS_THRESHOLD: Final = 12
+SMALL_CORPUS_THRESHOLD: Final = 2
+
+
+def determine_min_scale(total_skills: int) -> int:
+    """Determine optimal baseline starting scale based on corpus size."""
+    if total_skills > LARGE_CORPUS_THRESHOLD:
+        return 10
+    if total_skills > MEDIUM_CORPUS_THRESHOLD:
+        return 5
+    if total_skills > SMALL_CORPUS_THRESHOLD:
+        return 2
+    return 1
+
+
+def generate_log_scales(
+    total_skills: int,
+    min_scale: int | None = None,
+) -> tuple[int, ...]:
+    """Generate human-friendly logarithmic sweep scales up to total_skills."""
+    if total_skills <= 0:
+        msg = f"total_skills must be positive, got {total_skills}"
+        raise ValueError(msg)
+    if total_skills == 1:
+        return (1,)
+
+    start = min_scale if min_scale is not None else determine_min_scale(total_skills)
+    scales = [s for s in _CANONICAL_LOG_STEPS if start <= s < total_skills]
+    if (not scales or scales[0] != start) and (start < total_skills and start not in scales):
+        scales.insert(0, start)
+    if total_skills not in scales:
+        scales.append(total_skills)
+    return tuple(sorted(set(scales)))
+
+
+def resolve_sweep_scales(
+    total_skills: int,
+    requested: Sequence[int] | None = None,
+) -> tuple[int, ...]:
+    """Resolve and clamp catalog sweep scales against available corpus size."""
+    if total_skills <= 0:
+        msg = f"total_skills must be positive, got {total_skills}"
+        raise ValueError(msg)
+
+    if not requested:
+        return generate_log_scales(total_skills)
+
+    scales = sorted({s for s in requested if 1 <= s < total_skills})
+    if total_skills not in scales:
+        scales.append(total_skills)
+    return tuple(scales)
+
+
+def build_scaling_catalogs(
+    skills: Sequence[Skill],
+    target_skill: str,
+    scales: Sequence[int],
+    rivals_share: float = 0.5,
+    seed: int = 0,
+    scorer: Scorer | None = None,
+) -> list[Catalog]:
+    """Generate multi-scale catalogs for a target skill across requested scales."""
+    if not skills:
+        return []
+    by_name = {s.name: s for s in skills}
+    if target_skill not in by_name:
+        msg = f"target skill {target_skill!r} not in skills"
+        raise KeyError(msg)
+
+    unique_skills = list(by_name.values())
+    target_obj = by_name[target_skill]
+    ranker = scorer or Bm25Scorer.from_skills(unique_skills)
+    ranked: list[str] = []
+    seen: set[str] = {target_skill}
+    for name, _ in ranker.rank(target_obj, unique_skills):
+        if name not in seen:
+            seen.add(name)
+            ranked.append(name)
+
+    catalogs = []
+    for k in scales:
+        if k <= 1:
+            catalogs.append(
+                Catalog(
+                    id=f"sweep:{target_skill}:1",
+                    mode=CatalogMode.SWEEP,
+                    skills=(target_skill,),
+                    target=target_skill,
+                )
+            )
+            continue
+
+        r = max(1, round((k - 1) * rivals_share))
+        chosen = [target_skill, *ranked[:r]]
+
+        rng = Random(f"{seed}:{target_skill}:{k}")  # noqa: S311 (deterministic benchmark sampling)
+        chosen_set = set(chosen)
+        pool = [s for s in ranked[r:] if s not in chosen_set]
+        rng.shuffle(pool)
+        chosen.extend(pool[: max(0, k - len(chosen))])
+
+        catalogs.append(
+            Catalog(
+                id=f"sweep:{target_skill}:{k}",
+                mode=CatalogMode.SWEEP,
+                skills=tuple(sorted(chosen)),
+                target=target_skill,
+            )
+        )
+    return catalogs
+
+
+def _deduplicate_skills(skills: Sequence[Skill]) -> list[Skill]:
+    """Filter duplicate skills by name, preserving first insertion order."""
+    unique_skills: list[Skill] = []
+    seen: set[str] = set()
+    for s in skills:
+        if s.name not in seen:
+            seen.add(s.name)
+            unique_skills.append(s)
+    return unique_skills
+
+
+def _compute_cosine_bm25_distance_matrix(
+    skills: Sequence[Skill],
+    scorer: Scorer | None = None,
+) -> tuple[tuple[str, ...], list[list[float]], list[list[float]]]:
+    """Compute symmetric Cosine-BM25 distance and similarity matrices for a skills corpus."""
+    unique_skills = _deduplicate_skills(skills)
+    names = tuple(s.name for s in unique_skills)
+    n = len(names)
+    if n == 0:
+        return (), [], []
+    if n == 1:
+        return names, [[0.0]], [[1.0]]
+
+    bm25 = scorer if isinstance(scorer, Bm25Scorer) else Bm25Scorer.from_skills(unique_skills)
+    tokens = [tuple(tokenize(skill_text(s))) for s in unique_skills]
+    self_scores = [bm25.score(tokens[i], names[i]) for i in range(n)]
+
+    dist: list[list[float]] = [[0.0] * n for _ in range(n)]
+    sim: list[list[float]] = [[0.0] * n for _ in range(n)]
+    for i in range(n):
+        sim[i][i] = 1.0 if self_scores[i] > 0 else 0.0
+        dist[i][i] = 0.0
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            s_ij = bm25.score(tokens[i], names[j])
+            s_ji = bm25.score(tokens[j], names[i])
+            denom = 2.0 * math.sqrt(max(0.0, self_scores[i] * self_scores[j]))
+            s_norm = 0.0 if denom <= 0.0 else max(0.0, min(1.0, (s_ij + s_ji) / denom))
+            d = max(0.0, min(1.0, 1.0 - s_norm))
+            dist[i][j] = d
+            dist[j][i] = d
+            sim[i][j] = s_norm
+            sim[j][i] = s_norm
+
+    return names, dist, sim
+
+
+def _farthest_first_traversal(
+    dist: Sequence[Sequence[float]],
+    initial_indices: Sequence[int],
+    target_count: int,
+) -> list[int]:
+    """Expand an initial index cohort to target_count via greedy farthest-first selection."""
+    n = len(dist)
+    target = min(target_count, n)
+    if not initial_indices:
+        return []
+    order = list(dict.fromkeys(initial_indices))
+    if len(order) >= target:
+        return order[:target]
+
+    chosen_set = set(order)
+    min_dist = [min(dist[i][c] for c in order) for i in range(n)]
+    while len(order) < target:
+        next_idx = max(
+            (i for i in range(n) if i not in chosen_set),
+            key=lambda i: (min_dist[i], -i),
+        )
+        chosen_set.add(next_idx)
+        order.append(next_idx)
+        for i in range(n):
+            min_dist[i] = min(min_dist[i], dist[i][next_idx])
+    return order
+
+
+def _extract_cluster_medoid_indices(
+    partition_clusters: Sequence[Any],
+    name_to_idx: Mapping[str, int],
+    sim: Sequence[Sequence[float]],
+) -> list[int]:
+    """Select the central medoid skill index from each partition cluster."""
+    chosen_indices: list[int] = []
+    chosen_set: set[int] = set()
+    for c in partition_clusters:
+        c_indices = [name_to_idx[name] for name in c.skills if name in name_to_idx]
+        if not c_indices:
+            continue
+        best_idx = max(c_indices, key=lambda i: (sum(sim[i][j] for j in c_indices), -i))
+        if best_idx not in chosen_set:
+            chosen_set.add(best_idx)
+            chosen_indices.append(best_idx)
+    return chosen_indices
+
+
+def find_cluster_medoids(
+    skills: Sequence[Skill],
+    k: int,
+    scorer: Scorer | None = None,
+) -> tuple[str, ...]:
+    """Find k representative skill medoids across modularity clusters.
+
+    Partition skills into communities via modularity optimization, then select
+    the central medoid skill from each cluster (maximizing intra-cluster BM25 similarity).
+    If fewer than k clusters exist, iteratively select the farthest remaining
+    skills from the chosen cohort to ensure maximal vocabulary diversity.
+
+    Args:
+        skills: The corpus of skills to partition and select from.
+        k: The desired number of anchor medoid skills.
+        scorer: Optional BM25 scorer for computing skill distances.
+
+    Returns:
+        Tuple of up to k representative skill names.
+    """
+    if k <= 0 or not skills:
+        return ()
+
+    unique_skills = _deduplicate_skills(skills)
+    names, dist, sim = _compute_cosine_bm25_distance_matrix(unique_skills, scorer=scorer)
+    n = len(names)
+    if n <= k:
+        return names
+
+    from reach.cluster import cluster_skills
+
+    partition = cluster_skills(unique_skills, resolution=1.5, max_clusters=k)
+    name_to_idx = {name: i for i, name in enumerate(names)}
+    chosen_indices = _extract_cluster_medoid_indices(partition.clusters, name_to_idx, sim)
+
+    order = _farthest_first_traversal(dist, chosen_indices, min(k, n))
+    return tuple(names[i] for i in order)
+
+
+def _build_scaling_sequence(
+    names: tuple[str, ...],
+    dist: list[list[float]],
+    sim: list[list[float]],
+    name_to_idx: Mapping[str, int],
+    resolved_anchors: tuple[str, ...] | None,
+) -> tuple[str, ...]:
+    """Determine complete k-Center scaling order across unique skills."""
+    n = len(names)
+    if n <= 1:
+        return names
+    if resolved_anchors:
+        initial = [name_to_idx[a] for a in resolved_anchors]
+        order = _farthest_first_traversal(dist, initial, n)
+        return tuple(names[i] for i in order)
+
+    medoid_idx = max(range(n), key=lambda i: (sum(sim[i]), -i))
+    order = _farthest_first_traversal(dist, [medoid_idx], n)
+    return tuple(names[i] for i in order)
+
+
+def _build_nested_catalogs(seq: tuple[str, ...], scales: Sequence[int]) -> list[Catalog]:
+    """Construct nested Catalog instances corresponding to requested sweep scale counts."""
+    catalogs: list[Catalog] = []
+    for k in scales:
+        count = max(1, min(k, len(seq)))
+        chosen = seq[:count]
+        catalogs.append(
+            Catalog(
+                id=f"sweep:corpus:{count}",
+                mode=CatalogMode.SWEEP,
+                skills=tuple(sorted(chosen)),
+                target=None,
+            )
+        )
+    return catalogs
+
+
+class CorpusScalingPlan(BaseModel):
+    """Encapsulate precomputed distance geometry and nested catalogs for a scaling sweep."""
+
+    model_config = ConfigDict(frozen=True)
+
+    skills: tuple[Skill, ...]
+    skill_names: tuple[str, ...]
+    distance_matrix: list[list[float]]
+    similarity_matrix: list[list[float]]
+    sequence: tuple[str, ...]
+    catalogs: list[Catalog]
+    anchor_skills: tuple[str, ...] | None = None
+
+    @classmethod
+    def create(
+        cls,
+        skills: Sequence[Skill],
+        scales: Sequence[int],
+        anchor_skills: Sequence[str] | None = None,
+        scorer: Scorer | None = None,
+    ) -> CorpusScalingPlan:
+        """Construct a scaling plan by computing distance geometry and k-Center ordering once."""
+        unique_skills = _deduplicate_skills(skills)
+        names, dist, sim = _compute_cosine_bm25_distance_matrix(unique_skills, scorer=scorer)
+        name_to_idx = {name: i for i, name in enumerate(names)}
+
+        resolved_anchors: tuple[str, ...] | None = None
+        if anchor_skills is not None:
+            valid_anchors = tuple(dict.fromkeys(a for a in anchor_skills if a in name_to_idx))
+            if valid_anchors:
+                resolved_anchors = valid_anchors
+
+        seq = _build_scaling_sequence(names, dist, sim, name_to_idx, resolved_anchors)
+        catalogs = _build_nested_catalogs(seq, scales)
+
+        return cls(
+            skills=tuple(unique_skills),
+            skill_names=names,
+            distance_matrix=dist,
+            similarity_matrix=sim,
+            sequence=seq,
+            catalogs=catalogs,
+            anchor_skills=resolved_anchors,
+        )
+
+    def queries_for_scale(
+        self,
+        catalog: Catalog,
+        raw_query_set: QuerySet,
+        anchor_skills: Sequence[str] | None = None,
+    ) -> QuerySet:
+        """Slice query set into in-scope reachability probes for catalog."""
+        effective_anchors = anchor_skills if anchor_skills is not None else self.anchor_skills
+        return build_corpus_scaling_queries(
+            scale_skills=catalog.skills,
+            raw_query_set=raw_query_set,
+            anchor_skills=effective_anchors,
+        )
+
+
+def build_corpus_scaling_sequence(
+    skills: Sequence[Skill],
+    anchor_skills: Sequence[str] | None = None,
+    scorer: Scorer | None = None,
+) -> tuple[str, ...]:
+    """Order skills using Farthest-First Traversal (k-Center) on Cosine-BM25 distance."""
+    plan = CorpusScalingPlan.create(
+        skills=skills,
+        scales=(),
+        anchor_skills=anchor_skills,
+        scorer=scorer,
+    )
+    return plan.sequence
+
+
+def build_corpus_scaling_catalogs(
+    skills: Sequence[Skill],
+    scales: Sequence[int],
+    ordered_names: Sequence[str] | None = None,
+    anchor_skills: Sequence[str] | None = None,
+    scorer: Scorer | None = None,
+) -> list[Catalog]:
+    """Generate deterministic nested catalogs for whole-corpus capacity evaluation."""
+    if not skills:
+        return []
+
+    if ordered_names is not None:
+        catalogs: list[Catalog] = []
+        for k in scales:
+            count = max(1, min(k, len(ordered_names)))
+            chosen = ordered_names[:count]
+            catalogs.append(
+                Catalog(
+                    id=f"sweep:corpus:{count}",
+                    mode=CatalogMode.SWEEP,
+                    skills=tuple(sorted(chosen)),
+                    target=None,
+                )
+            )
+        return catalogs
+
+    plan = CorpusScalingPlan.create(
+        skills=skills,
+        scales=scales,
+        anchor_skills=anchor_skills,
+        scorer=scorer,
+    )
+    return plan.catalogs
+
+
+def build_corpus_scaling_queries(
+    scale_skills: Sequence[str],
+    raw_query_set: QuerySet,
+    anchor_skills: Sequence[str] | None = None,
+) -> QuerySet:
+    """Slice query set into in-scope reachability probes for installed skills."""
+    scale_set = set(scale_skills)
+    target_skills = scale_set & set(anchor_skills) if anchor_skills is not None else scale_set
+    in_scope_queries = [q for q in raw_query_set.queries if q.expected_skill in target_skills]
+    return QuerySet(
+        catalog_id=f"sweep:corpus:{len(scale_skills)}",
+        queries=tuple(in_scope_queries),
+        provenance=raw_query_set.provenance,
+    )
+
+
+def build_neighborhood_catalogs(
+    skills: Sequence[Skill],
+    size: int = 20,
+    rivals: int = 10,
+    seed: int = 0,
+    scorer: Scorer | None = None,
+) -> list[Catalog]:
+    """Generate fixed-size catalogs per skill containing target, rivals, and filler."""
+    if not skills:
+        return []
+    if size < MIN_NEIGHBORHOOD_SIZE:
+        msg = f"a neighborhood needs at least 2 skills, got {size}"
+        raise ValueError(msg)
+    if rivals < 1:
+        msg = f"a neighborhood needs at least 1 rival, got {rivals}"
+        raise ValueError(msg)
+
+    by_name = {s.name: s for s in skills}
+    unique_skills = sorted(by_name.values(), key=lambda s: s.name)
+    ranker = scorer or Bm25Scorer.from_skills(unique_skills)
+    catalogs = []
+    for skill in unique_skills:
+        ranked: list[str] = []
+        seen: set[str] = {skill.name}
+        for name, _ in ranker.rank(skill, unique_skills):
+            if name not in seen:
+                seen.add(name)
+                ranked.append(name)
+
+        chosen = [skill.name, *ranked[:rivals]]
+
+        rng = Random(f"{seed}:{skill.name}")  # noqa: S311 (deterministic benchmark sampling)
+        chosen_set = set(chosen)
+        pool = [s for s in ranked[rivals:] if s not in chosen_set]
+        rng.shuffle(pool)
+        chosen.extend(pool[: max(0, size - len(chosen))])
+
+        catalogs.append(
+            Catalog(
+                id=f"neighborhood:{skill.name}",
+                mode=CatalogMode.NEIGHBORHOOD,
+                skills=tuple(sorted(chosen)),
+                target=skill.name,
+            ),
+        )
+    return catalogs
+
+
+def resolve_catalog(catalogs: Sequence[Catalog], catalog_id: str) -> Catalog:
+    """Retrieve a catalog by identifier from a sequence of catalogs."""
+    for catalog in catalogs:
+        if catalog.id == catalog_id:
+            return catalog
+    available = ", ".join(sorted(c.id for c in catalogs)[:8]) or "(none)"
+    hint = ""
+    if any(c.id.startswith("neighborhood:") for c in catalogs):
+        hint = "; pass --catalog <name> --rescope to evaluate against an available catalog"
+    msg = f"no catalog named {catalog_id!r}; available: {available}{hint}"
+    raise KeyError(msg)
+
+
+def resident_skills(catalog: Catalog, skills: Sequence[Skill]) -> list[Skill]:
+    """Retrieve ordered Skill objects resident in the specified catalog."""
+    by_name = {s.name: s for s in skills}
+    missing = [name for name in catalog.skills if name not in by_name]
+    if missing:
+        msg = f"catalog {catalog.id!r} names skills not loaded: {missing}"
+        raise KeyError(msg)
+    return [by_name[name] for name in catalog.skills]
