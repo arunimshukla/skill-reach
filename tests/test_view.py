@@ -169,8 +169,9 @@ def test_a_file_that_is_not_an_artifact_is_named_back_rather_than_dumped(
     assert main(["view", str(rows)]) == 2
 
     complaint = capsys.readouterr().err
-    assert "results.jsonl" in complaint
-    assert ".artifact.json" in complaint
+    unwrapped = re.sub(r"\s*│\s*\n\s*│\s*", "", complaint)
+    assert "results.jsonl" in unwrapped
+    assert ".artifact.json" in unwrapped
 
 
 def test_an_artifact_that_is_not_there_is_refused_rather_than_traced(

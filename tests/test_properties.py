@@ -129,7 +129,7 @@ _TEXT_CHAR = st.one_of(
     st.characters(
         min_codepoint=0x20,
         max_codepoint=0x10FFFF,
-        blacklist_categories=("Cs", "Co"),
+        exclude_categories=("Cs", "Co"),
     ),
     st.sampled_from(_AWKWARD),
 )

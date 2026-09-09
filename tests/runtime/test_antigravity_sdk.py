@@ -552,8 +552,12 @@ def test_antigravity_sdk_build_env_synchronizes_keys(monkeypatch: pytest.MonkeyP
     assert env_google["GOOGLE_API_KEY"] == "google-only"
 
 
-def test_select_config_sets_isolated_app_data_dir(tmp_path: Path) -> None:
+def test_select_config_sets_isolated_app_data_dir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Verify _select_config sets app_data_dir and creates directory when isolation is enabled."""
+    monkeypatch.setenv("GEMINI_API_KEY", "test-api-key")
     workdir = tmp_path / "work"
     workdir.mkdir()
 
