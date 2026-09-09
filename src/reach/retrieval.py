@@ -335,7 +335,7 @@ def _load_model2vec_model(model_name: str) -> Any:  # noqa: ANN401 (optional dyn
     import warnings
 
     try:
-        from model2vec import (  # type: ignore[import-not-found,import-untyped,unresolved-import,ty:unresolved-import]
+        from model2vec import (  # type: ignore[import-not-found,import-untyped,unresolved-import]
             StaticModel,
         )
     except ImportError as err:
@@ -346,7 +346,7 @@ def _load_model2vec_model(model_name: str) -> Any:  # noqa: ANN401 (optional dyn
         raise RuntimeError(msg) from err
 
     try:
-        from huggingface_hub.utils import (  # type: ignore[import-not-found,import-untyped,unresolved-import,ty:unresolved-import]
+        from huggingface_hub.utils import (  # type: ignore[import-not-found,import-untyped,unresolved-import]
             disable_progress_bars,
         )
 
