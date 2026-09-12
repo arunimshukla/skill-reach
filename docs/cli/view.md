@@ -44,12 +44,19 @@ macro-F1 100.0%  over 7 observed labels  [5 replicates, 7 repeated queries]
 ///
 
 /// tab | Interactive HTML report
-Generate a self-contained, standalone HTML report with an interactive confusion matrix, search filtering, and query expansion:
+Generate a self-contained, standalone HTML diagnostic workbench report with an interactive confusion matrix, skill-level scores, search filtering, and expandable queries:
 
 ```bash
 reach view --format html > report.html
 open report.html
 ```
+
+The interactive workbench includes:
+
+- **Confusion matrix cross-filtering**: Click any hit or miss cell in the confusion matrix to instantly filter queries down to the matching expected/invoked skill pair, with an active filter banner and one-click reset.
+- **Dynamic table and query search**: Filter skills and query cards in real time by ID, skill name, or query prompt text.
+- **Expand/collapse controls**: Expand all query cards at once to inspect full prompt text and difficulty ranks, or collapse them for a high-level overview.
+- **Air-gapped and self-contained**: Zero external script or CDN dependencies; safe to open offline or in air-gapped environments.
 
 ///
 

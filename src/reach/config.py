@@ -571,6 +571,14 @@ class OptimizeSettings(BaseModel):
 
     budget: int = Field(default=30, ge=1)
     temperature: float = Field(default=0.7, ge=0.0, le=2.0)
+    iterations: int = Field(default=1, ge=1, le=10)
+    holdout: float = Field(default=0.2, ge=0.0, le=0.9)
+    review: bool = Field(default=False)
+    auto_queries: bool = Field(default=True)
+    adversarial_count: int = Field(default=5, ge=0)
+    positive_count: int = Field(default=5, ge=1)
+    seed: int = Field(default=42)
+    review_timeout: float = Field(default=600.0, gt=0.0)
 
 
 class RegistrySettings(BaseModel):

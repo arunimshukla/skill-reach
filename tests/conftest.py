@@ -64,7 +64,7 @@ from reach.models import (
 from reach.queries import Origin, QuerySet, QuerySetProvenance, save_query_set
 from reach.retrieval import K1, B, skill_text, tokenize
 from reach.run import Composition, append_result, compose, write_sidecar
-from reach.runtime.fake import FakeRuntime, register_fake_agent
+from reach.runtime.fake import FakeGenerator, FakeRuntime, register_fake_agent
 from reach.views import build_console
 
 if TYPE_CHECKING:
@@ -73,6 +73,12 @@ if TYPE_CHECKING:
 register_fake_agent()
 
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
+
+
+@pytest.fixture
+def clean_browser_env() -> dict[str, str]:
+    """Provide an environment mapping stripped of CI and browser bypass flags."""
+    return {k: v for k, v in os.environ.items() if k not in ("CI", "REACH_NO_BROWSER")}
 
 
 @pytest.fixture(scope="session")
@@ -171,6 +177,16 @@ retrieval._load_model2vec_model = lambda _name: _DummyModel2Vec()  # type: ignor
 
 #: Regular expression matching terminal escape sequences.
 ESCAPES = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]")
+
+#: Regular expression matching un-sandboxed external URLs or remote assets.
+EXTERNAL_REFERENCE_PATTERN = re.compile(r"https?://|<link[ >]|<script[^>]+src=")
+
+
+@pytest.fixture(scope="session")
+def external_reference_re() -> re.Pattern[str]:
+    """Provide regex pattern matching external network references and scripts."""
+    return EXTERNAL_REFERENCE_PATTERN
+
 
 SKILL_TEMPLATE = """\
 ---
@@ -275,6 +291,39 @@ def write_skill(tmp_path: Path) -> Callable[..., Path]:
                 encoding="utf-8",
             )
         return skill_dir
+
+    return _create
+
+
+@pytest.fixture
+def write_skill_model(write_skill: Callable[..., Path]) -> Callable[..., Skill]:
+    """Write a minimal SKILL.md file to disk and return an initialized Skill model."""
+
+    def _create(
+        name: str,
+        description: str = "Test description",
+        body: str = "# Body",
+        root: Path | None = None,
+        raw_yaml: str | None = None,
+        dir_name: str | None = None,
+        path: Path | None = None,
+        model_invocable: bool = True,
+    ) -> Skill:
+        skill_dir = write_skill(
+            name=name,
+            description=description,
+            body=body,
+            root=root,
+            raw_yaml=raw_yaml,
+            dir_name=dir_name,
+            path=path,
+        )
+        return Skill(
+            name=name,
+            description=description,
+            path=skill_dir,
+            model_invocable=model_invocable,
+        )
 
     return _create
 
@@ -1020,6 +1069,24 @@ def fake_registry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 def fake_runtime() -> FakeRuntime:
     """Provide a fresh FakeRuntime test fixture."""
     return FakeRuntime()
+
+
+@pytest.fixture
+def fake_generator() -> FakeGenerator:
+    """Provide a fresh FakeGenerator test fixture."""
+    return FakeGenerator()
+
+
+@pytest.fixture
+def write_reach_toml(tmp_path: Path) -> Callable[[str], Path]:
+    """Write a custom reach.toml configuration file in tmp_path."""
+
+    def _write(content: str, filename: str = "reach.toml") -> Path:
+        path = tmp_path / filename
+        path.write_text(content, encoding="utf-8")
+        return path
+
+    return _write
 
 
 @pytest.fixture

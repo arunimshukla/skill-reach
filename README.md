@@ -316,9 +316,17 @@ uv run reach check path/to/skills --format github
 
 Automates closed-loop skill description optimization. It consumes lexical competition findings (ceded terms and unclaimed distinctive body terms), synthesizes targeted candidate descriptions, runs sandboxed fast-path empirical probes against real-world agent runtimes, and ranks candidates by recall improvement ($\Delta \text{recall}$) and misroute reduction.
 
+Supports iterative hill climbing across multiple refinement rounds (`--iterations`), holdout validation splits to prevent lexical overfitting (`--holdout`), and interactive browser-based query boundary review (`--review`).
+
 ```sh
 # Analyze and synthesize candidate descriptions for a skill
 uv run reach optimize my-skill
+
+# Run multi-round hill climbing with holdout validation
+uv run reach optimize my-skill --iterations 3 --holdout 0.2
+
+# Review and curate synthetic queries in browser before probing
+uv run reach optimize my-skill --review
 
 # Evaluate candidates with fast-path probes against a query set
 uv run reach optimize my-skill \

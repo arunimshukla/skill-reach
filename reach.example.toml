@@ -116,6 +116,14 @@ unbounded-attractor = "warn"
 # Automated prompt optimization budget and exploration temperature.
 budget = 30
 temperature = 0.7
+iterations = 1
+holdout = 0.2
+review = false
+auto_queries = true
+adversarial_count = 5
+positive_count = 5
+seed = 42
+review_timeout = 600.0
 
 [overlap]
 # Claim extraction and overlap analysis thresholds.

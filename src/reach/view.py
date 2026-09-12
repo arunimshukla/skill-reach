@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Render a recorded run artifact as a self-contained HTML report.
+"""Render a recorded run artifact as an interactive self-contained HTML diagnostic workbench.
 
 For Rich-based terminal and console formatting views, see `reach.views`.
 """
@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING
 
 from reach.artifact import NO_SKILL
 from reach.rendering import dispatch_render
+from reach.static import get_view_css, get_view_js, get_view_template
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -58,25 +59,43 @@ def _header_html(artifact: Artifact) -> str:
     scores = artifact.scores
     spread = artifact.spread
     error = f" ± {spread.standard_error * 100:.1f}pp" if spread.standard_error else ""
+    ci = _bounds(scores.consistency_interval)
+    ci_html = f' <span class="dim">({ci})</span>' if ci else ""
+    mode_str = f"mode: {_esc(artifact.catalog_mode.value)}"
     return f"""
-<h1>{_esc(artifact.catalog_id)}</h1>
-<p class="subject">
-  {_esc(artifact.catalog_mode.value)} &middot; {artifact.catalog_size} skills
-  &middot; {_esc(provenance.runtime)}/{_esc(provenance.model)} x{provenance.attempts}
-  &middot; {artifact.probes} probes
-</p>
-<dl class="figures">
-  <dt>consistency</dt>
-  <dd>{_pct(scores.consistency)}{_bounds(scores.consistency_interval)}</dd>
-  <dt>top-1</dt><dd>{scores.top1_accuracy * 100:.1f}%{error}</dd>
-  <dt>abstention</dt>
-  <dd>{_pct(scores.abstention.rate)} ({_pct(scores.abstention.false_rate)} false)</dd>
-  <dt>macro-F1</dt><dd>{scores.not_headline.macro_f1 * 100:.1f}%</dd>
-</dl>
-<p class="digests">
-  arm {_esc(provenance.arm)} &middot; corpus {_esc(digests.corpus_digest)}
-  &middot; truth {_esc(digests.queries_digest)}
-</p>
+<div class="workbench-header">
+  <div class="header-main">
+    <div class="title-row">
+      <h1>{_esc(artifact.catalog_id)}</h1>
+      <div class="header-badge">Diagnostic Workbench</div>
+    </div>
+    <p class="subject">
+      {mode_str} &middot; {artifact.catalog_size} skills
+      &middot; {_esc(provenance.runtime)}/{_esc(provenance.model)} x{provenance.attempts}
+      &middot; {artifact.probes} probes
+    </p>
+  </div>
+  <dl class="figures">
+    <div class="figure-cell">
+      <dt>consistency</dt>
+      <dd>{_pct(scores.consistency)}{ci_html}</dd>
+    </div>
+    <div class="figure-cell">
+      <dt>top-1</dt><dd>{scores.top1_accuracy * 100:.1f}%{error}</dd>
+    </div>
+    <div class="figure-cell">
+      <dt>abstention</dt>
+      <dd>{_pct(scores.abstention.rate)} ({_pct(scores.abstention.false_rate)} false)</dd>
+    </div>
+    <div class="figure-cell">
+      <dt>macro-F1</dt><dd>{scores.not_headline.macro_f1 * 100:.1f}%</dd>
+    </div>
+  </dl>
+  <p class="digests">
+    arm {_esc(provenance.arm)} &middot; corpus {_esc(digests.corpus_digest)}
+    &middot; truth {_esc(digests.queries_digest)}
+  </p>
+</div>
 """
 
 
@@ -125,10 +144,12 @@ def _confusion_html(artifact: Artifact) -> str:
         for row in rows
     ]
     return (
+        '<div class="matrix-container">'
         '<table class="confusion" id="confusion-table">'
         f"<thead><tr><th>expected \\ invoked</th>{head}</tr></thead>"
         f"<tbody>{''.join(body_rows)}</tbody>"
         "</table>"
+        "</div>"
     )
 
 
@@ -176,16 +197,27 @@ def _skills_table_html(skills: Sequence[SkillScore]) -> str:
     )
     body_rows = []
     for skill in ordered:
-        reached = f"{skill.reached}/{skill.probes}" if skill.probes else ""
+        reached = (
+            f"{skill.reached}/{skill.probes}" if skill.probes else '<span class="dim">—</span>'
+        )
+        recall_str = (
+            _pct(skill.recall) if skill.recall is not None else '<span class="dim">—</span>'
+        )
+        ci = _bounds(skill.recall_interval)
+        ci_str = _esc(ci) if ci else '<span class="dim">—</span>'
+        prec_str = (
+            _pct(skill.precision) if skill.precision is not None else '<span class="dim">—</span>'
+        )
+        f1_str = _pct(skill.f1) if skill.f1 is not None else '<span class="dim">—</span>'
         body_rows.append(
             "<tr>"
             f"<td>{_esc(skill.skill)}</td>"
-            f"<td>{_pct(skill.recall)}</td>"
-            f"<td>{_esc(_bounds(skill.recall_interval))}</td>"
+            f"<td>{recall_str}</td>"
+            f"<td>{ci_str}</td>"
             f"<td>{reached}</td>"
-            f"<td>{skill.absorbed or ''}</td>"
-            f"<td>{_pct(skill.precision)}</td>"
-            f"<td>{_pct(skill.f1)}</td>"
+            f"<td>{skill.absorbed}</td>"
+            f"<td>{prec_str}</td>"
+            f"<td>{f1_str}</td>"
             "</tr>",
         )
     return f"""
@@ -255,107 +287,54 @@ def _queries_html(artifact: Artifact) -> str:
             "<summary>"
             f'<span class="query-id">{_esc(record.query_id)}</span>'
             f'<span class="expected">{_esc(record.expected)}</span>'
+            f'<span class="query-text">{_esc(record.text)}</span>'
             f'<span class="rate">{_esc(rate)}</span>'
             "</summary>"
             f"{_query_detail_html(record, artifact.catalog_size)}"
             "</details>",
         )
     return f"""
-<input
-  type="text"
-  class="filter"
-  placeholder="Filter queries by ID, expected skill, or text..."
-  oninput="reachFilterQueries(this, 'queries-container')"
-  aria-controls="queries-container"
-/>
+<div class="filter-row">
+  <input
+    type="text"
+    class="filter"
+    placeholder="Filter queries by ID, expected skill, or text..."
+    oninput="reachFilterQueries(this, 'queries-container')"
+    aria-controls="queries-container"
+  />
+  <div class="expand-controls">
+    <button type="button" class="btn-link" onclick="reachToggleAllQueries(true)">
+      Expand all
+    </button>
+    &middot;
+    <button type="button" class="btn-link" onclick="reachToggleAllQueries(false)">
+      Collapse all
+    </button>
+  </div>
+</div>
 <div id="queries-container">{"".join(entries)}</div>
 """
 
 
-#: Inlined CSS styling for the self-contained HTML report.
-_STYLE = """
-body { font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-       margin: 2rem; color: #1a1a1a; }
-h1 { margin-bottom: 0.2rem; }
-.subject, .digests { color: #555; font-size: 0.9rem; }
-.digests { font-family: ui-monospace, Menlo, monospace; }
-dl.figures { display: flex; gap: 1.5rem; flex-wrap: wrap; margin: 1rem 0; }
-dl.figures dt { font-size: 0.8rem; color: #666; }
-dl.figures dd { margin: 0; font-size: 1.2rem; font-weight: 600; }
-h2 { margin-top: 2.5rem; border-bottom: 2px solid #ddd; padding-bottom: 0.3rem; }
-table { border-collapse: collapse; width: 100%; margin-top: 0.5rem; }
-th, td { border: 1px solid #ddd; padding: 0.3rem 0.6rem; text-align: right; }
-th:first-child, td:first-child { text-align: left; }
-thead th { background: #f5f5f5; position: sticky; top: 0; }
-table.confusion td.hit { background: #e3f6e3; font-weight: 600; }
-table.confusion td.miss { background: #fbe3e3; }
-table.collisions td { text-align: left; }
-table.collisions td:nth-child(3) { text-align: right; }
-.thought { font-style: italic; color: #666; font-size: 0.85rem; margin-top: 0.3rem; }
-input.filter { width: 100%; max-width: 24rem; padding: 0.4rem 0.6rem;
-               margin-top: 0.5rem; box-sizing: border-box; }
-details.query { border: 1px solid #ddd; border-radius: 4px;
-                margin-top: 0.4rem; padding: 0.3rem 0.6rem; }
-details.query summary { cursor: pointer; display: flex; gap: 1rem; }
-details.query summary .query-id { flex: 2; font-weight: 600; }
-details.query summary .expected { flex: 2; color: #555; }
-details.query summary .rate { flex: 1; text-align: right; }
-details.query.hit { border-left: 4px solid #3a3; }
-details.query.miss { border-left: 4px solid #c33; }
-details.query.error { border-left: 4px solid #a00; }
-details.query.unprobed { border-left: 4px solid #999; opacity: 0.7; }
-details.query dl { display: grid; grid-template-columns: 8rem 1fr; gap: 0.2rem 1rem;
-                    margin: 0.5rem 0 0; }
-details.query dt { color: #666; }
-details.query dd { margin: 0; }
-p.empty { color: #666; font-style: italic; }
-"""
+#: Inlined CSS styling for the self-contained HTML diagnostic workbench report.
+_STYLE = get_view_css()
 
-#: Inlined client-side JavaScript for dynamic table row and query filtering.
-_SCRIPT = """
-function reachFilterRows(input, tableId) {
-  var needle = input.value.trim().toLowerCase();
-  var table = document.getElementById(tableId);
-  var rows = table.querySelectorAll('tbody tr');
-  for (var i = 0; i < rows.length; i++) {
-    var text = rows[i].textContent.toLowerCase();
-    rows[i].style.display = text.indexOf(needle) === -1 ? 'none' : '';
-  }
-}
-function reachFilterQueries(input, containerId) {
-  var needle = input.value.trim().toLowerCase();
-  var container = document.getElementById(containerId);
-  var items = container.querySelectorAll('details.query');
-  for (var i = 0; i < items.length; i++) {
-    var text = items[i].textContent.toLowerCase();
-    items[i].style.display = text.indexOf(needle) === -1 ? 'none' : '';
-  }
-}
-"""
+#: Inlined client-side JavaScript for dynamic table row, matrix cross-filtering, and queries.
+_SCRIPT = get_view_js()
 
 
 def render_view_html(artifact: Artifact) -> str:
-    """Render a complete Artifact model as a standalone HTML document."""
-    return f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<title>{_esc(artifact.catalog_id)} — reach view</title>
-<style>{_STYLE}</style>
-</head>
-<body>
-{_header_html(artifact)}
-<h2>Confusion matrix</h2>
-{_confusion_html(artifact)}
-{_collisions_html(artifact)}
-<h2>Skills</h2>
-{_skills_table_html(artifact.skills)}
-<h2>Queries</h2>
-{_queries_html(artifact)}
-<script>{_SCRIPT}</script>
-</body>
-</html>
-"""
+    """Render a complete Artifact model as an interactive diagnostic workbench HTML document."""
+    return get_view_template().format(
+        title=_esc(artifact.catalog_id),
+        style=_STYLE,
+        header=_header_html(artifact),
+        confusion_matrix=_confusion_html(artifact),
+        collisions=_collisions_html(artifact),
+        skills_table=_skills_table_html(artifact.skills),
+        queries=_queries_html(artifact),
+        script=_SCRIPT,
+    )
 
 
 #: Supported format handlers for artifact visualization.

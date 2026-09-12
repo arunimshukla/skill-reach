@@ -1,0 +1,499 @@
+/* Copyright 2026 Google LLC
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+/* Header Context Card */
+.skill-context-card {
+  padding: 1.5rem 1.75rem;
+  margin-bottom: 1.25rem;
+}
+
+.description {
+  color: var(--reach-on-surface-variant);
+  margin-top: 0.5rem;
+  font-size: 0.95rem;
+  line-height: 1.55;
+  max-width: 960px;
+}
+
+.rivals-bar {
+  margin-top: 1rem;
+  padding-top: 0.85rem;
+  border-top: 1px solid var(--reach-surface-variant);
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  font-size: 0.82rem;
+  color: var(--reach-muted);
+}
+
+.rival-chip {
+  background: var(--reach-surface-variant);
+  color: var(--reach-on-surface-variant);
+  padding: 0.2rem 0.55rem;
+  border-radius: var(--reach-radius-md);
+  font-family: var(--reach-font-mono);
+  font-size: 0.78rem;
+  border: 1px solid var(--reach-outline-variant);
+}
+
+/* Control Ribbon & Balance Meter */
+.control-ribbon {
+  padding: 1rem 1.5rem;
+  margin-bottom: 1.25rem;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 1.5rem;
+  flex-wrap: wrap;
+}
+
+.balance-section {
+  flex: 1;
+  min-width: 280px;
+}
+
+.balance-labels {
+  display: flex;
+  justify-content: space-between;
+  font-family: var(--reach-font-headline);
+  font-size: 0.82rem;
+  font-weight: 500;
+  margin-bottom: 0.4rem;
+  color: var(--reach-on-surface-variant);
+  gap: 0.75rem;
+}
+
+.balance-bar {
+  height: 8px;
+  background: var(--reach-outline-variant);
+  border-radius: var(--reach-radius-full);
+  overflow: hidden;
+  display: flex;
+}
+
+.balance-fill-triggers {
+  background: var(--reach-primary);
+  border-right: 2px solid var(--reach-surface);
+  transition: width 0.3s ease;
+}
+
+.balance-fill-guardrails {
+  background: var(--reach-guardrail-accent);
+  transition: width 0.3s ease;
+}
+
+.summary {
+  margin-top: 0.35rem;
+  font-size: 0.8rem;
+  color: var(--reach-muted);
+  font-family: var(--reach-font-text);
+}
+
+.action-buttons {
+  display: flex;
+  gap: 0.6rem;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+/* Material 3 Buttons */
+.btn {
+  font-family: var(--reach-font-headline);
+  padding: 0.55rem 1.25rem;
+  border-radius: var(--reach-radius-full);
+  cursor: pointer;
+  font-size: 0.85rem;
+  font-weight: 500;
+  transition: var(--reach-transition);
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  text-decoration: none;
+  border: none;
+}
+
+.btn-primary {
+  background: var(--reach-primary);
+  color: var(--reach-surface);
+  box-shadow: var(--reach-shadow-sm);
+}
+
+.btn-primary:hover {
+  background: var(--reach-primary-hover);
+  box-shadow: var(--reach-shadow-md);
+}
+
+.btn-tonal {
+  background: var(--reach-primary-container);
+  color: var(--reach-primary);
+  border: 1px solid var(--reach-primary-container-hover);
+}
+
+.btn-tonal:hover {
+  background: var(--reach-primary-container-hover);
+}
+
+.btn-outlined {
+  background: var(--reach-surface);
+  color: var(--reach-on-surface-variant);
+  border: 1px solid var(--reach-outline);
+}
+
+.btn-outlined:hover {
+  background: var(--reach-surface-variant);
+  border-color: var(--reach-on-surface);
+  color: var(--reach-on-surface);
+}
+
+.btn-sm {
+  padding: 0.35rem 0.85rem;
+  font-size: 0.78rem;
+}
+
+.btn-kbd {
+  background: color-mix(in srgb, var(--reach-on-primary) 25%, transparent);
+  padding: 0.15rem 0.4rem;
+  border-radius: var(--reach-radius-sm);
+  font-family: var(--reach-font-mono);
+  font-size: 0.75rem;
+}
+
+/* Hotkey Hint Bar */
+.hotkey-bar {
+  display: flex;
+  align-items: center;
+  gap: 1.25rem;
+  font-size: 0.78rem;
+  color: var(--reach-muted);
+  margin-bottom: 1rem;
+  padding: 0 0.5rem;
+}
+
+.hotkey-bar kbd {
+  background: var(--reach-surface);
+  border: 1px solid var(--reach-outline-variant);
+  border-radius: var(--reach-radius-sm);
+  padding: 0.1rem 0.35rem;
+  font-family: var(--reach-font-mono);
+  color: var(--reach-on-surface);
+  font-weight: 500;
+}
+
+/* Two-Column Split Territory Board */
+.territory-board {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1.25rem;
+  margin-bottom: 2rem;
+}
+
+@media (max-width: 860px) {
+  .territory-board {
+    grid-template-columns: 1fr;
+  }
+}
+
+.territory-column {
+  background: var(--reach-surface);
+  border: 1px solid var(--reach-outline-variant);
+  border-radius: var(--reach-radius-xl);
+  overflow: hidden;
+  box-shadow: var(--reach-shadow-md);
+  display: flex;
+  flex-direction: column;
+}
+
+.column-header {
+  padding: 1rem 1.25rem;
+  border-bottom: 1px solid var(--reach-outline-variant);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.triggers-header {
+  background: var(--reach-surface-variant);
+}
+
+.guardrails-header {
+  background: var(--reach-surface-container-alt);
+}
+
+.column-title-group {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+}
+
+.column-title {
+  font-family: var(--reach-font-headline);
+  font-size: 0.95rem;
+  font-weight: 600;
+  color: var(--reach-on-surface);
+}
+
+.count-badge {
+  font-size: 0.75rem;
+  font-weight: 500;
+  padding: 0.15rem 0.55rem;
+  border-radius: var(--reach-radius-full);
+}
+
+.triggers-count {
+  background: var(--reach-primary-container-hover);
+  color: var(--reach-on-primary-container);
+}
+
+.guardrails-count {
+  background: var(--reach-secondary-container);
+  color: var(--reach-on-secondary-container);
+}
+
+.column-subtitle {
+  font-size: 0.78rem;
+  color: var(--reach-muted);
+  padding: 0.4rem 1.25rem 0.75rem;
+  border-bottom: 1px solid var(--reach-surface-variant);
+  background: var(--reach-surface);
+}
+
+/* Query Card List */
+.card-list {
+  padding: 0.85rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.65rem;
+  flex: 1;
+  min-height: 180px;
+}
+
+.card-list.empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--reach-dim);
+  font-size: 0.85rem;
+  font-style: italic;
+  padding: 2.5rem;
+}
+
+/* Query Card */
+.query-card {
+  background: var(--reach-surface);
+  border: 1px solid var(--reach-outline-variant);
+  border-radius: var(--reach-radius-lg);
+  padding: 0.85rem 1rem;
+  transition: var(--reach-transition);
+  position: relative;
+}
+
+.query-card:hover {
+  border-color: var(--reach-outline);
+  box-shadow: var(--reach-shadow-lg);
+}
+
+.query-card.active-card {
+  border-color: var(--reach-primary);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--reach-primary) 25%, transparent);
+}
+
+.card-top {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 0.45rem;
+  gap: 0.5rem;
+}
+
+.card-badges {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+}
+
+.badge-target-wrapper {
+  display: inline-flex;
+  align-items: center;
+}
+
+.badge-kind,
+.badge-target,
+.badge-rival,
+.badge-distractor {
+  font-size: 0.72rem;
+  font-weight: 500;
+  padding: 0.1rem 0.45rem;
+  border-radius: var(--reach-radius-sm);
+}
+
+.badge-kind {
+  background: var(--reach-surface-variant);
+  color: var(--reach-on-surface-variant);
+  text-transform: lowercase;
+}
+
+/* Hide redundant target badge in Triggers column where target is implied */
+#triggers-list .badge-target {
+  display: none;
+}
+
+.badge-distractor {
+  background: var(--reach-divider);
+  color: var(--reach-muted);
+}
+
+.query-preview,
+.query-text-preview {
+  font-family: var(--reach-font-body);
+  font-size: 0.88rem;
+  line-height: 1.45;
+  color: var(--reach-on-surface);
+  cursor: pointer;
+  padding: 0.2rem 0;
+}
+
+.query-card-editor {
+  display: none;
+  margin-top: 0.5rem;
+}
+
+.query-card.editing .query-preview,
+.query-card.editing .query-text-preview {
+  display: none;
+}
+
+.query-card.editing .query-card-editor {
+  display: block;
+}
+
+.query-input {
+  width: 100%;
+  padding: 0.55rem 0.75rem;
+  line-height: 1.45;
+  resize: vertical;
+  min-height: 56px;
+}
+
+.card-actions {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-top: 0.6rem;
+  padding-top: 0.5rem;
+  border-top: 1px solid var(--reach-surface-variant);
+  gap: 0.5rem;
+}
+
+.card-left-actions,
+.card-right-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.card-btn {
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-family: var(--reach-font-headline);
+  font-size: 0.78rem;
+  font-weight: 500;
+  padding: 0.25rem 0.55rem;
+  border-radius: var(--reach-radius-md);
+  transition: var(--reach-transition);
+  color: var(--reach-on-surface-variant);
+}
+
+.card-btn:hover {
+  background: var(--reach-surface-variant);
+  color: var(--reach-on-surface);
+}
+
+.card-btn-swap {
+  color: var(--reach-primary);
+  background: var(--reach-primary-container);
+}
+
+.card-btn-swap:hover {
+  background: var(--reach-primary-container-hover);
+}
+
+.card-btn-delete {
+  color: var(--reach-error-text);
+}
+
+.card-btn-delete:hover {
+  background: var(--reach-error-bg);
+}
+
+.card-btn-done {
+  display: none;
+}
+
+.card-btn-edit {
+  color: var(--reach-muted);
+}
+
+.card-btn-edit:hover {
+  color: var(--reach-primary);
+  background: var(--reach-primary-container);
+}
+
+.query-card.editing .card-btn-edit {
+  display: none;
+}
+
+.query-card.editing .card-btn-done {
+  display: inline-flex;
+  background: var(--reach-primary);
+  color: var(--reach-surface);
+  box-shadow: var(--reach-shadow-sm);
+}
+
+.query-card.editing .card-btn-done:hover {
+  background: var(--reach-primary-hover);
+}
+
+.rival-select {
+  font-size: 0.78rem;
+  padding: 0.25rem 0.5rem;
+  border: 1px solid var(--reach-outline);
+  border-radius: var(--reach-radius-md);
+  font-family: var(--reach-font-body);
+  background: var(--reach-surface);
+  color: var(--reach-on-surface);
+  margin-top: 0.4rem;
+}
+
+/* Empty State */
+.empty-state-card {
+  background: var(--reach-surface);
+  border: 1px dashed var(--reach-outline);
+  border-radius: var(--reach-radius-xl);
+  padding: 3rem 2rem;
+  text-align: center;
+  color: var(--reach-muted);
+  margin-bottom: 2rem;
+}
+
+.status-bar {
+  margin-top: 1rem;
+  font-weight: 500;
+  font-size: 0.9rem;
+  font-family: var(--reach-font-headline);
+  padding: 0.5rem 0;
+}

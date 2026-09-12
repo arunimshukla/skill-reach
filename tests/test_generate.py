@@ -744,9 +744,16 @@ def test_a_targetless_catalog_generates_for_every_resident(target: Skill, rival:
 class _ConcurrencyProbe(FakeGenerator):
     """Record concurrent completion calls to verify parallel execution."""
 
-    def __init__(self, *args, delay: float = 0.02, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
+    def __init__(
+        self,
+        responses: str = "",
+        *,
+        delay: float = 0.02,
+        barrier: threading.Barrier | None = None,
+    ) -> None:
+        super().__init__(responses)
         self._delay = delay
+        self._barrier = barrier
         self._lock = threading.Lock()
         self.active = 0
         self.peak = 0
@@ -755,7 +762,10 @@ class _ConcurrencyProbe(FakeGenerator):
         with self._lock:
             self.active += 1
             self.peak = max(self.peak, self.active)
-        threading.Event().wait(self._delay)
+        if self._barrier is not None:
+            self._barrier.wait(timeout=5.0)
+        else:
+            threading.Event().wait(self._delay)
         with self._lock:
             self.active -= 1
         return super().complete(prompt)
@@ -798,7 +808,8 @@ def test_concurrency_drafts_every_target_exactly_once(target: Skill, rival: Skil
 
 def test_concurrency_actually_overlaps_the_drafting_calls(target: Skill, rival: Skill) -> None:
     """Verify concurrency > 1 overlaps prompt completion calls."""
-    runtime = _ConcurrencyProbe()
+    barrier = threading.Barrier(2)
+    runtime = _ConcurrencyProbe(barrier=barrier)
     runtime.completion = json.dumps(
         {"queries": [{"text": "q", "citation": "Overview", "reason": ""}]},
     )

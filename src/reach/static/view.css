@@ -1,0 +1,387 @@
+/* Copyright 2026 Google LLC
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+/* Header Context */
+.workbench-header {
+  padding: 1.5rem 1.75rem;
+  margin-bottom: 1.5rem;
+}
+
+.header-main {
+  display: block;
+}
+
+.subject,
+.digests {
+  font-size: 0.85rem;
+}
+
+.subject {
+  font-family: var(--reach-font-text);
+  color: var(--reach-muted);
+  margin-bottom: 1rem;
+}
+
+.digests {
+  font-family: var(--reach-font-mono);
+  color: var(--reach-muted);
+  font-size: 0.8rem;
+  margin-top: 0.85rem;
+  padding-top: 0.75rem;
+  border-top: 1px solid var(--reach-surface-variant);
+}
+
+/* Metric Cards */
+dl.figures {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 1rem;
+  margin: 1.25rem 0;
+  padding: 0;
+  background: none;
+  border: none;
+}
+
+.figure-cell {
+  background: var(--reach-surface-container-low);
+  border: 1px solid var(--reach-outline-variant);
+  border-radius: var(--reach-radius-lg);
+  padding: 0.85rem 1.15rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  transition: var(--reach-transition);
+}
+
+.figure-cell:hover {
+  border-color: var(--reach-outline);
+  box-shadow: var(--reach-shadow-md);
+}
+
+dl.figures dt {
+  font-family: var(--reach-font-headline);
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  font-weight: 600;
+  color: var(--reach-muted);
+}
+
+dl.figures dd {
+  font-family: var(--reach-font-headline);
+  margin: 0;
+  font-size: 1.35rem;
+  font-weight: 600;
+  color: var(--reach-on-surface);
+}
+
+/* Interactive System Map & Tables */
+.system-map-card {
+  padding: 1.25rem 1.5rem;
+  margin-bottom: 1.5rem;
+}
+
+.matrix-container {
+  overflow-x: auto;
+  margin-top: 0.5rem;
+}
+
+table {
+  border-collapse: collapse;
+  width: 100%;
+  margin-top: 0.5rem;
+  background: var(--reach-surface);
+  border: 1px solid var(--reach-outline-variant);
+  border-radius: var(--reach-radius-lg);
+  overflow: hidden;
+  box-shadow: var(--reach-shadow-sm);
+}
+
+th,
+td {
+  border: 1px solid var(--reach-divider);
+  padding: 0.65rem 0.85rem;
+  text-align: right;
+  font-size: 0.875rem;
+}
+
+th:first-child,
+td:first-child {
+  text-align: left;
+}
+
+thead th {
+  font-family: var(--reach-font-headline);
+  background: var(--reach-surface-variant);
+  color: var(--reach-on-surface-variant);
+  font-weight: 500;
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  border: 1px solid var(--reach-outline-variant);
+  position: sticky;
+  top: 0;
+}
+
+table.confusion thead th:not(:first-child),
+table.confusion td {
+  text-align: center;
+  cursor: pointer;
+  transition: var(--reach-transition);
+}
+
+table.confusion td:hover {
+  outline: 2px solid var(--reach-primary);
+  position: relative;
+  z-index: 2;
+}
+
+table.confusion td.hit {
+  font-weight: 500;
+}
+
+table.confusion td.miss {
+  font-weight: 500;
+}
+
+table.confusion td:empty {
+  background: var(--reach-surface-container-low);
+  cursor: default;
+}
+
+table.confusion td:empty:hover {
+  outline: none;
+}
+
+table.collisions th,
+table.collisions td {
+  text-align: left;
+  cursor: pointer;
+}
+
+table.collisions tr:hover td {
+  background: var(--reach-surface-container-low);
+}
+
+table.collisions th:nth-child(3),
+table.collisions td:nth-child(3) {
+  text-align: right;
+}
+
+table.skills tr:hover td {
+  background: var(--reach-surface-container-low);
+  cursor: pointer;
+}
+
+.thought {
+  font-family: var(--reach-font-body);
+  font-style: italic;
+  color: var(--reach-muted);
+  font-size: 0.82rem;
+  margin-top: 0.35rem;
+  background: var(--reach-surface-background);
+  padding: 0.35rem 0.6rem;
+  border-radius: var(--reach-radius-sm);
+  border-left: 2px solid var(--reach-outline);
+}
+
+/* Filter Bar & Controls */
+input.filter {
+  width: 100%;
+  max-width: 24rem;
+  padding: 0.55rem 0.85rem;
+  margin-top: 0.5rem;
+  margin-bottom: 0.5rem;
+  box-sizing: border-box;
+}
+
+.filter-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin: 0.75rem 0;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.expand-controls {
+  font-family: var(--reach-font-headline);
+  font-size: 0.82rem;
+  color: var(--reach-muted);
+}
+
+.btn-link {
+  background: none;
+  border: none;
+  color: var(--reach-primary);
+  cursor: pointer;
+  font-size: 0.82rem;
+  padding: 0;
+  font-weight: 500;
+  font-family: var(--reach-font-headline);
+}
+
+.btn-link:hover {
+  color: var(--reach-primary-hover);
+  text-decoration: underline;
+}
+
+/* Active Filter Banner */
+.active-filter-banner {
+  background: var(--reach-primary-container);
+  border: 1px solid var(--reach-primary-container-hover);
+  border-radius: var(--reach-radius-lg);
+  padding: 0.75rem 1.25rem;
+  margin: 1.25rem 0;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-family: var(--reach-font-headline);
+  font-size: 0.85rem;
+  color: var(--reach-on-primary-container);
+}
+
+.active-filter-banner button {
+  background: var(--reach-surface);
+  border: 1px solid var(--reach-outline);
+  border-radius: var(--reach-radius-full);
+  padding: 0.25rem 0.75rem;
+  font-size: 0.78rem;
+  cursor: pointer;
+  color: var(--reach-on-surface);
+  transition: var(--reach-transition);
+}
+
+.active-filter-banner button:hover {
+  background: var(--reach-surface-variant);
+}
+
+/* Collapsible Query Accordion */
+details.query {
+  background: var(--reach-surface);
+  border: 1px solid var(--reach-outline-variant);
+  border-radius: var(--reach-radius-lg);
+  margin-top: 0.5rem;
+  padding: 0.75rem 1rem;
+  box-shadow: var(--reach-shadow-sm);
+  transition: var(--reach-transition);
+}
+
+details.query:hover {
+  box-shadow: var(--reach-shadow-md);
+}
+
+details.query summary {
+  cursor: pointer;
+  display: flex;
+  gap: 1rem;
+  align-items: center;
+}
+
+details.query summary .query-id {
+  flex: 1.2;
+  font-family: var(--reach-font-mono);
+  font-size: 0.82rem;
+  font-weight: 500;
+  color: var(--reach-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+
+details.query summary .expected {
+  flex: 1.5;
+  color: var(--reach-muted);
+  white-space: nowrap;
+  font-family: var(--reach-font-headline);
+  font-size: 0.82rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+
+details.query summary .query-text {
+  flex: 3;
+  font-family: var(--reach-font-body);
+  font-size: 0.88rem;
+  color: var(--reach-on-surface);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+
+details.query summary .rate {
+  flex: 0 0 4.8rem;
+  text-align: center;
+  white-space: nowrap;
+  font-family: var(--reach-font-headline);
+  font-size: 0.78rem;
+  font-weight: 600;
+  padding: 0.2rem 0.55rem;
+  border-radius: var(--reach-radius-full);
+}
+
+details.query.unprobed summary .rate {
+  background: var(--reach-divider);
+  color: var(--reach-muted);
+}
+
+details.query.hit {
+  border-left: 4px solid var(--reach-success-text);
+}
+
+details.query.miss,
+details.query.error {
+  border-left: 4px solid var(--reach-error-text);
+}
+
+details.query.unprobed {
+  border-left: 4px solid var(--reach-dim);
+  opacity: 0.7;
+}
+
+details.query dl {
+  background: var(--reach-surface-background);
+  border: 1px solid var(--reach-outline-variant);
+  border-radius: var(--reach-radius-md);
+  padding: 0.75rem 1rem;
+  display: grid;
+  grid-template-columns: 8rem 1fr;
+  gap: 0.35rem 1rem;
+  margin: 0.75rem 0 0;
+}
+
+details.query dt {
+  font-family: var(--reach-font-mono);
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--reach-muted);
+}
+
+details.query dd {
+  margin: 0;
+  font-size: 0.9rem;
+  color: var(--reach-on-surface);
+  line-height: 1.45;
+}
+
+p.empty {
+  font-family: var(--reach-font-body);
+  color: var(--reach-muted);
+  font-style: italic;
+}

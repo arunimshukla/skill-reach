@@ -166,6 +166,7 @@ def _execute_draft_generation(
     keep: bool,
     same_invocation_probe: bool,
     then: str,
+    review: bool = False,
 ) -> int:
     """Execute generation, update checkpoints, persist queries, and print summary."""
     trail: list[Citation] = list(recovered.citations if recovered else ())
@@ -221,6 +222,20 @@ def _execute_draft_generation(
             ),
         },
     )
+    if review and query_set.queries:
+        from reach.review import launch_query_review
+
+        residents = resident_skills(catalog, skills)
+        target_skill = residents[0] if residents else skills[0]
+        rivals = [s for s in skills if s.name != target_skill.name]
+        reviewed_qs = launch_query_review(query_set, target_skill, rivals)
+        if reviewed_qs.provenance is not None:
+            query_set = reviewed_qs.model_copy(
+                update={"provenance": reviewed_qs.provenance.model_copy(update={"reviewed": True})},
+            )
+        else:
+            query_set = reviewed_qs
+
     save_query_set(query_set, destination)
     write_citations(CitationTrail(tuple(trail)), citations_path(destination))
     in_progress.unlink(missing_ok=True)
@@ -250,6 +265,7 @@ def _draft_query_set(
     then: str = DRAFTED_THEN,
     keep: bool = True,
     same_invocation_probe: bool = False,
+    review: bool = False,
 ) -> int:
     """Draft synthetic query sets and persist checkpoint files."""
     catalog = _sole_catalog(settings, skills)
@@ -321,6 +337,7 @@ def _draft_query_set(
         keep=keep,
         same_invocation_probe=same_invocation_probe,
         then=then,
+        review=review,
     )
 
 

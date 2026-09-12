@@ -720,7 +720,7 @@ def _setup_sweep_execution(
             scales=actual_scales,
             anchor_skills=resolved_anchors,
         )
-        return None, plan.catalogs, raw_query_set, plan, resolved_anchors
+        return None, list(plan.catalogs), raw_query_set, plan, resolved_anchors
 
     target, query_set = _resolve_sweep_target_and_queries(
         resolved_skills, raw_query_set, target_skill

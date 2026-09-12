@@ -704,10 +704,10 @@ class CorpusScalingPlan(BaseModel):
 
     skills: tuple[Skill, ...]
     skill_names: tuple[str, ...]
-    distance_matrix: list[list[float]]
-    similarity_matrix: list[list[float]]
+    distance_matrix: tuple[tuple[float, ...], ...]
+    similarity_matrix: tuple[tuple[float, ...], ...]
     sequence: tuple[str, ...]
-    catalogs: list[Catalog]
+    catalogs: tuple[Catalog, ...]
     anchor_skills: tuple[str, ...] | None = None
 
     @classmethod
@@ -735,10 +735,10 @@ class CorpusScalingPlan(BaseModel):
         return cls(
             skills=tuple(unique_skills),
             skill_names=names,
-            distance_matrix=dist,
-            similarity_matrix=sim,
+            distance_matrix=tuple(tuple(row) for row in dist),
+            similarity_matrix=tuple(tuple(row) for row in sim),
             sequence=seq,
-            catalogs=catalogs,
+            catalogs=tuple(catalogs),
             anchor_skills=resolved_anchors,
         )
 
@@ -804,7 +804,7 @@ def build_corpus_scaling_catalogs(
         anchor_skills=anchor_skills,
         scorer=scorer,
     )
-    return plan.catalogs
+    return list(plan.catalogs)
 
 
 def build_corpus_scaling_queries(

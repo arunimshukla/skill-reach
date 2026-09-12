@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 import difflib
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Final, Literal, overload
 
 from rich import box
 from rich.table import Table
@@ -28,19 +28,29 @@ if TYPE_CHECKING:
     from reach.optimize import OptimizationCandidate, OptimizationReport
 
 
-def render_optimization_diff(report: OptimizationReport) -> str:
-    """Generate a unified diff showing changes between baseline and best candidate description."""
-    if not report.best_candidate:
+def render_optimization_diff(
+    report: OptimizationReport,
+    candidate_index: int = 1,
+) -> str:
+    """Generate a unified diff showing changes between baseline and a candidate description."""
+    if not report.candidates:
         return ""
+    idx = candidate_index - 1
+    if idx < 0 or idx >= len(report.candidates):
+        return ""
+    cand = report.candidates[idx]
     baseline_lines = ["description: >-\n", f"  {report.baseline_description}\n"]
-    candidate_lines = ["description: >-\n", f"  {report.best_candidate.description}\n"]
+    candidate_lines = ["description: >-\n", f"  {cand.description}\n"]
     diff = difflib.unified_diff(
         baseline_lines,
         candidate_lines,
         fromfile=f"a/{report.skill_name}/SKILL.md",
-        tofile=f"b/{report.skill_name}/SKILL.md",
+        tofile=f"b/{report.skill_name}/SKILL.md (candidate #{candidate_index})",
     )
     return "".join(diff)
+
+
+MAX_DESCRIPTION_PREVIEW: Final[int] = 55
 
 
 def _print_optimization_baseline(console: Console, report: OptimizationReport) -> None:
@@ -54,6 +64,26 @@ def _print_optimization_baseline(console: Console, report: OptimizationReport) -
         console.print(
             f"[bold]Unclaimed Distinctive Terms:[/] [green]{', '.join(report.unclaimed_terms)}[/]",
         )
+
+    if report.rounds:
+        console.print(f"[bold]Optimization Rounds:[/] [cyan]{len(report.rounds)}[/]")
+        for round_rec in report.rounds:
+            best_cand = round_rec.best_candidate
+            if best_cand:
+                score_str = (
+                    f"Holdout Recall: {best_cand.test_recall:.1%}"
+                    if best_cand.test_recall is not None
+                    else f"Δ Recall: {best_cand.delta_recall:+.1%}, Recall: {best_cand.recall:.1%}"
+                )
+                desc_snippet = (
+                    f"{best_cand.description[:MAX_DESCRIPTION_PREVIEW]}..."
+                    if len(best_cand.description) > MAX_DESCRIPTION_PREVIEW
+                    else best_cand.description
+                )
+                console.print(
+                    f"  [cyan]Round {round_rec.iteration}:[/] {score_str} — {desc_snippet}",
+                )
+        console.print()
 
     if report.has_probes:
         console.print(
@@ -78,11 +108,43 @@ def _format_candidate_delta(delta: float) -> str:
     return "0.0%"
 
 
+@overload
 def _format_candidate_row(
     cand: OptimizationCandidate,
     has_probes: bool,
     idx: int,
-) -> tuple[str, str, str, str, str, str]:
+    *,
+    has_test: Literal[True],
+) -> tuple[str, str, str, str, str, str, str]: ...
+
+
+@overload
+def _format_candidate_row(
+    cand: OptimizationCandidate,
+    has_probes: bool,
+    idx: int,
+    *,
+    has_test: Literal[False] = False,
+) -> tuple[str, str, str, str, str, str]: ...
+
+
+@overload
+def _format_candidate_row(
+    cand: OptimizationCandidate,
+    has_probes: bool,
+    idx: int,
+    *,
+    has_test: bool,
+) -> tuple[str, str, str, str, str, str, str] | tuple[str, str, str, str, str, str]: ...
+
+
+def _format_candidate_row(
+    cand: OptimizationCandidate,
+    has_probes: bool,
+    idx: int,
+    *,
+    has_test: bool = False,
+) -> tuple[str, str, str, str, str, str, str] | tuple[str, str, str, str, str, str]:
     """Format single candidate row values for optimization comparison table."""
     if has_probes:
         delta_str = _format_candidate_delta(cand.delta_recall)
@@ -94,6 +156,10 @@ def _format_candidate_row(
         mis_str = "[dim]—[/]"
 
     lint_str = "[green]✓ CLEAN[/]" if cand.lint_clean else "[yellow]✗ WARN[/]"
+    if has_test:
+        test_str = f"{cand.test_recall:.1%}" if cand.test_recall is not None else "[dim]—[/]"
+        return f"#{idx}", cand.description, delta_str, rec_str, test_str, mis_str, lint_str
+
     return f"#{idx}", cand.description, delta_str, rec_str, mis_str, lint_str
 
 
@@ -105,10 +171,33 @@ def _print_optimization_footer(console: Console, report: OptimizationReport) -> 
             "with candidate #1![/]",
         )
     elif report.best_candidate:
-        console.print(
-            "[bold cyan]Recommendation:[/] To apply candidate #1 to disk, re-run with "
-            "[bold]--auto-apply[/].",
+        has_improvement = report.best_candidate.delta_recall > 0.0 or (
+            report.best_candidate.delta_recall == 0.0
+            and report.best_candidate.misroute_rate < report.baseline_misroute
         )
+        if report.has_probes and not has_improvement:
+            if report.baseline_recall >= 1.0 and report.baseline_misroute <= 0.0:
+                console.print(
+                    "[yellow]Notice:[/] Baseline already achieves 100.0% recall with no misroutes."
+                )
+                console.print(
+                    "[dim]No candidate improved upon baseline (all Δ Recall ≤ 0.0%). "
+                    "Current description remains optimal.[/]"
+                )
+            else:
+                console.print(
+                    "[yellow]Notice:[/] No candidate improved upon baseline recall "
+                    "(all Δ Recall ≤ 0.0%)."
+                )
+                console.print("[dim]Current description is retained.[/]")
+        else:
+            console.print(
+                "[bold cyan]Recommendation:[/] To apply candidate #1 to disk, re-run with "
+                "[bold]--auto-apply[/].",
+            )
+            console.print(
+                "[dim]Run with [bold]--format diff[/bold] to inspect the unified YAML diff.[/]",
+            )
 
 
 def print_optimization(console: Console, report: OptimizationReport) -> None:
@@ -123,16 +212,20 @@ def print_optimization(console: Console, report: OptimizationReport) -> None:
         console.print("[yellow]No candidates were generated.[/]\n")
         return
 
-    table = Table(box=box.ROUNDED, show_header=True, header_style="bold")
-    table.add_column("Rank", justify="center", style="bold")
-    table.add_column("Candidate Description", style="cyan")
-    table.add_column("Δ Recall", justify="right")
-    table.add_column("Recall", justify="right")
-    table.add_column("Misroutes", justify="right")
-    table.add_column("Linter", justify="center")
+    has_test = any(c.test_recall is not None for c in report.candidates)
+
+    table = Table(box=box.ROUNDED, show_header=True, header_style="bold", expand=True)
+    table.add_column("Rank", justify="center", style="bold", no_wrap=True)
+    table.add_column("Candidate Description", style="cyan", ratio=4)
+    table.add_column("Δ Recall", justify="right", no_wrap=True)
+    table.add_column("Recall", justify="right", no_wrap=True)
+    if has_test:
+        table.add_column("Holdout Recall", justify="right", no_wrap=True)
+    table.add_column("Misroutes", justify="right", no_wrap=True)
+    table.add_column("Linter", justify="center", no_wrap=True)
 
     for idx, cand in enumerate(report.candidates, start=1):
-        table.add_row(*_format_candidate_row(cand, report.has_probes, idx))
+        table.add_row(*_format_candidate_row(cand, report.has_probes, idx, has_test=has_test))
 
     console.print(table)
     console.print()

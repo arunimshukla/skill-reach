@@ -1452,6 +1452,23 @@ def test_reach_example_toml_documents_sample_models() -> None:
     assert claude_key in content, f"Expected {claude_key!r} in reach.example.toml"
 
 
+def test_reach_example_toml_documents_optimize_settings() -> None:
+    """Verify reach.example.toml documents all OptimizeSettings fields."""
+    import tomllib
+
+    from reach.config import OptimizeSettings
+
+    root = Path(__file__).resolve().parent.parent
+    example_path = root / "reach.example.toml"
+    config = tomllib.loads(example_path.read_text(encoding="utf-8"))
+    optimize_sec = config.get("optimize", {})
+
+    for field_name in OptimizeSettings.model_fields:
+        assert field_name in optimize_sec, (
+            f"Field {field_name!r} missing from [optimize] in reach.example.toml"
+        )
+
+
 def test_resolve_sub_settings_revalidates_overrides() -> None:
     """Verify resolve_sub_settings validates overrides and rejects out-of-range values."""
     from reach.config import CheckSettings

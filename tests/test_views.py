@@ -1435,6 +1435,36 @@ def test_print_optimization_renders_candidates_and_table(make_console, rendered)
     assert "—" in out2
 
 
+def test_print_optimization_renders_zero_improvement_notice(make_console, rendered) -> None:
+    """Verify print_optimization notes when no candidate improves on baseline."""
+    from reach.optimize import OptimizationCandidate, OptimizationReport
+    from reach.views import print_optimization
+
+    report = OptimizationReport(
+        skill_name="perfect-skill",
+        baseline_description="Already perfect description.",
+        baseline_recall=1.0,
+        baseline_accuracy=1.0,
+        baseline_misroute=0.0,
+        candidates=(
+            OptimizationCandidate(
+                description="Candidate with no improvement.",
+                recall=1.0,
+                accuracy=1.0,
+                misroute_rate=0.0,
+                delta_recall=0.0,
+            ),
+        ),
+        has_probes=True,
+    )
+    console, buffer = make_console()
+    print_optimization(console, report)
+    output = rendered(buffer)
+
+    assert "No candidate improved" in output
+    assert "--auto-apply" not in output
+
+
 def test_render_optimization_diff_produces_unified_diff() -> None:
     """Verify render_optimization_diff produces valid unified diff text."""
     from reach.optimize import OptimizationCandidate, OptimizationReport
@@ -1455,6 +1485,28 @@ def test_render_optimization_diff_produces_unified_diff() -> None:
     assert "+++ b/my-tool/SKILL.md" in diff
     assert "-  Baseline text." in diff
     assert "+  Candidate text." in diff
+
+
+def test_render_optimization_diff_supports_specific_candidate_index() -> None:
+    """Verify render_optimization_diff generates diff against requested candidate index."""
+    from reach.optimize import OptimizationCandidate, OptimizationReport
+    from reach.views import render_optimization_diff
+
+    report = OptimizationReport(
+        skill_name="multi-tool",
+        baseline_description="Baseline text.",
+        candidates=(
+            OptimizationCandidate(description="Cand 1 text.", rationale="R1."),
+            OptimizationCandidate(description="Cand 2 text.", rationale="R2."),
+        ),
+    )
+    diff1 = render_optimization_diff(report, candidate_index=1)
+    assert "+  Cand 1 text." in diff1
+    assert "candidate #1" in diff1
+
+    diff2 = render_optimization_diff(report, candidate_index=2)
+    assert "+  Cand 2 text." in diff2
+    assert "candidate #2" in diff2
 
 
 def test_overlap_and_suggest_views_renderers() -> None:
