@@ -112,25 +112,10 @@ export ANTHROPIC_API_KEY="your-anthropic-api-key"
 
 ## Quickstart
 
-### 1. Lint skill manifests
-
-Validate `SKILL.md` frontmatter, naming conventions, and schema constraints before running evaluations:
-
-```sh
-# Lint all skills in a directory or workspace
-uv run reach lint path/to/skills
-
-# Single-line format for editor linters or CI pipelines
-uv run reach lint path/to/skills --format concise
-
-# Explain a specific rule and its recommended remedy
-uv run reach lint --explain reserved-name-collision
-```
-
 > [!TIP]
-> `reach lint` runs offline without API calls. Integrate it into CI/CD pipelines to catch YAML defects, name collisions, and description length boundary errors before deploying skills or running benchmark sweeps.
+> **Pre-flight linting**: Run `uv run reach lint path/to/skills` offline to catch frontmatter schema defects, reserved name collisions, and description length boundary errors before deploying skills or running benchmark sweeps.
 
-### 2. Check vocabulary overlap
+### 1. Check vocabulary overlap
 
 Analyze lexical competition across installed skills using BM25 token analysis without making model calls:
 
@@ -145,7 +130,7 @@ uv run reach overlap path/to/skills --skill my-skill --suggest
 > [!TIP]
 > `reach overlap` uses local lexical scoring without API calls. Run it before dispatching LLM evaluation probes to detect skill name collisions and overlapping vocabulary.
 
-### 3. Run a quick evaluation
+### 2. Run a quick evaluation
 
 Evaluate a target skill against its top rivals in an isolated scratch workspace:
 
@@ -158,6 +143,21 @@ uv run reach eval my-skill --agent claude-code
 
 # Or probe a specific query directly against ground truth:
 uv run reach eval --query "Deploy service to Cloud Run" --expected deploy-cloud-run
+```
+
+### 3. Optimize skill descriptions
+
+Automatically synthesize targeted candidate descriptions, evaluate them against empirical probes, and apply winning rewrites:
+
+```sh
+# Analyze and synthesize candidate descriptions for a skill
+uv run reach optimize my-skill
+
+# Run multi-round hill climbing and auto-apply if recall improves
+uv run reach optimize my-skill --iterations 3 --auto-apply
+
+# Inspect recommended improvements as a unified diff
+uv run reach optimize my-skill --format diff
 ```
 
 ### 4. Inspect results in HTML
