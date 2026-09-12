@@ -26,8 +26,14 @@ if TYPE_CHECKING:
     from reach.optimize import OptimizationReport
     from reach.views import Console
 
+from reach.optimize import (
+    DEFAULT_BUDGET,
+    DEFAULT_HOLDOUT,
+    DEFAULT_ITERATIONS,
+)
+
 from .app import LOOP, app
-from .flags import POSITIVE_INT, SWITCH, AgentName, Global, agent_help_text
+from .flags import POSITIVE_INT, RATE, SWITCH, AgentName, Global, agent_help_text
 
 type OptimizeFormat = Literal["text", "json", "diff"]
 
@@ -35,7 +41,7 @@ type OptimizeFormat = Literal["text", "json", "diff"]
 DEFAULT_CANDIDATES: Final = 3
 
 #: Default probe budget allocated across candidate evaluations.
-DEFAULT_OPTIMIZE_BUDGET: Final = 30
+DEFAULT_OPTIMIZE_BUDGET: Final = DEFAULT_BUDGET
 
 
 @app.command(name="optimize", group=LOOP)
@@ -76,6 +82,39 @@ def _optimize(
             help="Maximum empirical probes to execute across candidate evaluations (default: 30)",
         ),
     ] = DEFAULT_OPTIMIZE_BUDGET,
+    iterations: Annotated[
+        int,
+        POSITIVE_INT,
+        Parameter(
+            name=["--iterations", "-i"],
+            help=(
+                f"Number of iterative hill-climbing refinement rounds "
+                f"(default: {DEFAULT_ITERATIONS})"
+            ),
+        ),
+    ] = DEFAULT_ITERATIONS,
+    holdout: Annotated[
+        float,
+        RATE,
+        Parameter(
+            name="--holdout",
+            help="Fraction of queries held out for evaluation (0.0 - 0.9, default: 0.2)",
+        ),
+    ] = DEFAULT_HOLDOUT,
+    review: Annotated[
+        bool,
+        SWITCH,
+        Parameter(
+            name="--review",
+            help="Launch interactive browser review for generated queries",
+        ),
+    ] = False,
+    auto_queries: Annotated[
+        bool,
+        Parameter(
+            help="Synthesize adversarial queries if none are provided (default: True)",
+        ),
+    ] = True,
     agent: Annotated[
         AgentName | None,
         Parameter(
@@ -95,6 +134,22 @@ def _optimize(
             help="Automatically write the highest-ranking candidate description to SKILL.md",
         ),
     ] = False,
+    force: Annotated[
+        bool,
+        SWITCH,
+        Parameter(
+            name=["--force", "-f"],
+            help="Force apply candidate to SKILL.md even if no empirical improvement is detected",
+        ),
+    ] = False,
+    candidate: Annotated[
+        int,
+        POSITIVE_INT,
+        Parameter(
+            name=["--candidate", "-c"],
+            help="1-based candidate rank to inspect diff or apply (default: 1)",
+        ),
+    ] = 1,
     format: Annotated[
         OptimizeFormat,
         Parameter(
@@ -132,85 +187,162 @@ def _optimize(
         OptimizeSettings,
         config=run_config,
         budget=budget if budget != DEFAULT_OPTIMIZE_BUDGET or run_config is None else None,
+        iterations=iterations if iterations != DEFAULT_ITERATIONS or run_config is None else None,
+        holdout=holdout if holdout != DEFAULT_HOLDOUT or run_config is None else None,
+        review=review if review or run_config is None else None,
+        auto_queries=auto_queries if not auto_queries or run_config is None else None,
     )
 
     if eff_settings.budget < 1:
         console.print("[red]Error:[/] Probe budget must be at least 1")
         return 2
 
-    try:
-        report = optimize_skill(
-            skill_name=skill,
-            skills_path=skills,
-            queries_path=queries,
-            agent=resolved_agent,
-            candidates_count=candidates,
-            budget=eff_settings.budget,
-            auto_apply=auto_apply,
-            config=config,
-            global_scope=global_,
-            settings=eff_settings,
+    from contextlib import nullcontext
+
+    status_ctx = (
+        console.status(
+            f"[cyan]Optimizing skill [bold]{skill}[/bold] (budget: {eff_settings.budget})...[/cyan]"
         )
+        if format == "text" and sys.stderr.isatty()
+        else nullcontext()
+    )
+
+    try:
+        with status_ctx:
+            report = optimize_skill(
+                skill_name=skill,
+                skills_path=skills,
+                queries_path=queries,
+                agent=resolved_agent,
+                candidates_count=candidates,
+                auto_apply=auto_apply,
+                force=force,
+                config=config,
+                global_scope=global_,
+                settings=eff_settings,
+                candidate_index=candidate,
+            )
     except ValueError as err:
         console.print(f"[red]Error:[/] {err}")
         return 2
     except (OSError, RuntimeError) as err:
         console.print(f"[red]Runtime Error:[/] {err}")
-
         return 3
 
     match format:
         case "json":
             print(report.model_dump_json(indent=2))
         case "diff":
-            diff_text = render_optimization_diff(report)
+            if candidate < 1 or (report.candidates and candidate > len(report.candidates)):
+                console.print(
+                    f"[red]Error:[/] Candidate index #{candidate} out of range "
+                    f"(available: 1..{len(report.candidates)})."
+                )
+                return 2
+            diff_text = render_optimization_diff(report, candidate_index=candidate)
             if diff_text:
                 print(diff_text, end="")
             else:
                 console.print("[dim]No modifications recommended or diff unavailable.[/]")
         case _:
             print_optimization(console, report)
-            if (
-                not auto_apply
-                and report.best_candidate is not None
-                and sys.stdin.isatty()
-                and sys.stdout.isatty()
-            ):
-                _prompt_interactive_apply(console, report)
+            if not auto_apply and report.candidates and sys.stdin.isatty() and sys.stdout.isatty():
+                _prompt_interactive_apply(
+                    console,
+                    report,
+                    default_candidate=candidate,
+                    force=force,
+                )
 
     return 0
 
 
-def _prompt_interactive_apply(console: Console, report: OptimizationReport) -> None:
-    """Interactively prompt user in a TTY to inspect diff or apply candidate description."""
-    if report.best_candidate is None or not report.manifest_path:
-        return
-    best = report.best_candidate
-
-    from reach.optimize import update_skill_description
+def _inspect_interactive_diff(
+    console: Console,
+    report: OptimizationReport,
+    diff_cand: int,
+    n_cands: int,
+) -> bool:
+    """Render diff for candidate and prompt user whether to apply it."""
     from reach.views import render_optimization_diff
 
-    delta_pct = best.delta_recall * 100
-    delta_str = f"+{delta_pct:.1f}%" if delta_pct > 0 else f"{delta_pct:.1f}%"
+    if not (1 <= diff_cand <= n_cands):
+        console.print(f"[red]Error:[/] Candidate index #{diff_cand} out of range (1..{n_cands})")
+        return False
+
+    diff_text = render_optimization_diff(report, candidate_index=diff_cand)
+    if diff_text:
+        console.print(diff_text)
+
+    manifest_name = report.manifest_path.name if report.manifest_path else "SKILL.md"
+    prompt = f"Apply candidate #{diff_cand} to {manifest_name}? [y/N]: "
+    return input(prompt).strip().lower() in ("y", "yes")
+
+
+def _parse_apply_choice(
+    response: str,
+    def_idx: int,
+    n_cands: int,
+    console: Console,
+    report: OptimizationReport,
+) -> tuple[bool, int] | None:
+    """Parse user interactive candidate selection input."""
+    parts = response.split()
+    if parts and parts[0].lower() in ("d", "diff"):
+        diff_cand = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else def_idx
+        if _inspect_interactive_diff(console, report, diff_cand, n_cands):
+            return True, diff_cand
+        return False, def_idx
+
+    if response.isdigit():
+        cand_num = int(response)
+        if 1 <= cand_num <= n_cands:
+            return True, cand_num
+        console.print(f"[red]Error:[/] Candidate index #{cand_num} out of range (1..{n_cands})")
+        return None
+
+    return response.lower() in ("y", "yes"), def_idx
+
+
+def _prompt_interactive_apply(
+    console: Console,
+    report: OptimizationReport,
+    default_candidate: int = 1,
+    force: bool = False,
+) -> None:
+    """Prompt the user interactively to apply one of the proposed candidate descriptions."""
+    if not report.candidates or not report.manifest_path:
+        return
+
+    from reach.optimize import update_skill_description
+
+    n_cands = len(report.candidates)
+    def_idx = default_candidate if 1 <= default_candidate <= n_cands else 1
+
+    has_improvement = report.has_improvement
+    user_chose_candidate = default_candidate != 1
+    if not has_improvement and not force and not user_chose_candidate:
+        return
+
     console.print()
     try:
+        cand_range = f"1..{n_cands}" if n_cands > 1 else "1"
+        manifest_name = report.manifest_path.name
         prompt_msg = (
-            f"Apply candidate #1 ({delta_str} recall) to "
-            f"{report.manifest_path.name}? [y/N/d(iff)]: "
+            f"Apply candidate #{def_idx} to {manifest_name}? "
+            f"[{cand_range}, y, N, d(iff), d <num>]: "
         )
-        response = input(prompt_msg).strip().lower()
-        if response in ("d", "diff"):
-            diff_text = render_optimization_diff(report)
-            if diff_text:
-                console.print(diff_text)
-            response = (
-                input(f"Apply candidate #1 to {report.manifest_path.name}? [y/N]: ").strip().lower()
-            )
+        response = input(prompt_msg).strip()
+        parsed = _parse_apply_choice(response, def_idx, n_cands, console, report)
+        if parsed is None:
+            return
 
-        if response in ("y", "yes"):
-            if update_skill_description(report.manifest_path, best.description):
+        should_apply, selected_idx = parsed
+        if should_apply:
+            target_cand = report.candidates[selected_idx - 1]
+            if update_skill_description(report.manifest_path, target_cand.description):
                 console.print(
-                    f"[green]✓[/green] Applied candidate #1 description to "
+                    f"[green]✓[/green] Applied candidate #{selected_idx} description to "
                     f"[bold]{report.manifest_path}[/bold]"
                 )
             else:

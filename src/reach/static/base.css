@@ -1,0 +1,134 @@
+/* Copyright 2026 Google LLC
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font-family: var(--reach-font-body);
+  font-size: 14px;
+  line-height: 1.5;
+  font-weight: 400;
+  background: var(--reach-surface-background);
+  padding: var(--reach-spacing-xl) var(--reach-spacing-lg) calc(var(--reach-spacing-xl) * 2);
+  color: var(--reach-on-surface);
+  max-width: 1280px;
+  margin: 0 auto;
+}
+
+/* Header & Title Row */
+.title-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 1rem;
+}
+
+.header-badge,
+.skill-tag {
+  font-family: var(--reach-font-headline);
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--reach-primary);
+  background: var(--reach-primary-container);
+  padding: 0.25rem 0.65rem;
+  border-radius: var(--reach-radius-full);
+  display: inline-block;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+h1 {
+  font-family: var(--reach-font-headline);
+  font-size: 1.75rem;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  color: var(--reach-on-surface);
+  margin-bottom: 0.35rem;
+}
+
+h1 code {
+  font-family: var(--reach-font-mono);
+  font-weight: 500;
+  color: var(--reach-primary);
+}
+
+h2 {
+  font-family: var(--reach-font-headline);
+  margin-top: 2rem;
+  margin-bottom: 0.75rem;
+  font-size: 1.25rem;
+  font-weight: 500;
+  color: var(--reach-on-surface);
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.dim {
+  color: var(--reach-dim);
+  font-weight: normal;
+}
+
+/* Surface Cards */
+.workbench-header,
+.system-map-card,
+.skill-context-card,
+.control-ribbon {
+  background: var(--reach-surface);
+  border: 1px solid var(--reach-outline-variant);
+  border-radius: var(--reach-radius-xl);
+  box-shadow: var(--reach-shadow-md);
+}
+
+/* Base Inputs & Controls */
+input.filter,
+.query-input {
+  font-family: var(--reach-font-body);
+  background: var(--reach-surface);
+  color: var(--reach-on-surface);
+  border: 1px solid var(--reach-outline);
+  border-radius: var(--reach-radius-md);
+  font-size: 0.88rem;
+  transition: var(--reach-transition);
+}
+
+input.filter:focus,
+.query-input:focus {
+  outline: none;
+  border-color: var(--reach-primary);
+  box-shadow: 0 0 0 1px var(--reach-primary);
+}
+
+/* Shared Status Pills & Badges */
+.badge-target,
+details.query.hit summary .rate,
+table.confusion td.hit {
+  background: var(--reach-success-bg);
+  color: var(--reach-success-text);
+}
+
+.badge-rival,
+details.query.miss summary .rate,
+details.query.error summary .rate,
+table.confusion td.miss {
+  background: var(--reach-error-bg);
+  color: var(--reach-error-text);
+}

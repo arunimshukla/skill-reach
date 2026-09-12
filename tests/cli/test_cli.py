@@ -22,6 +22,7 @@ from enum import Enum
 from importlib import metadata
 from pathlib import Path
 from typing import TYPE_CHECKING, Never, get_args
+from unittest.mock import patch
 
 import pytest
 from cyclopts.exceptions import CycloptsError
@@ -1503,6 +1504,58 @@ def test_a_drafted_set_records_the_terms_it_was_drafted_under(
         == 0
     )
     _assert_draft_provenance(destination)
+
+
+def test_draft_with_review_flag_invokes_review_curator(
+    skill_repo: Path,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify reach query draft with --review triggers launch_query_review before saving."""
+    from reach.queries import load_query_set
+
+    drafted = QuerySet(
+        catalog_id="all",
+        queries=(Query(id="d-1", text="Tier old objects.", expected_skill="gke-basics"),),
+        provenance=QuerySetProvenance(origin=Origin.AUTHORED),
+    )
+    monkeypatch.setattr(
+        "reach.cli.drafting.text_generator",
+        lambda **_: FakeGenerator(),
+    )
+    monkeypatch.setattr(
+        "reach.cli.drafting.generate_query_set",
+        lambda *_, **__: drafted,
+    )
+
+    destination = tmp_path / "reviewed.json"
+    with patch(
+        "reach.review.launch_query_review",
+        side_effect=lambda qs, *_: qs,
+    ) as mock_review:
+        assert (
+            main(
+                [
+                    "query",
+                    "draft",
+                    "--skills",
+                    str(skill_repo),
+                    "--queries",
+                    str(destination),
+                    "--agent",
+                    "fake",
+                    "--count",
+                    "1",
+                    "--review",
+                ],
+            )
+            == 0
+        )
+        assert mock_review.called
+        assert destination.exists()
+        loaded = load_query_set(destination)
+        assert loaded.provenance is not None
+        assert loaded.provenance.reviewed is True
 
 
 def test_draft_concurrency_flag_reaches_generate_query_set(

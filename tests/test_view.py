@@ -21,6 +21,7 @@ import re
 from typing import TYPE_CHECKING, Never
 
 import pytest
+from selectolax.parser import HTMLParser
 
 from reach.artifact import Artifact, write_artifact
 from reach.cli import main
@@ -130,7 +131,10 @@ def test_format_html_prints_a_self_contained_report_instead_of_the_scorecard(
     assert main(["view", str(recorded), "--format", "html"]) == 0
     out = capsys.readouterr().out
     assert out.lstrip().startswith("<!DOCTYPE html>")
-    assert "gcs-lifecycle-rules" in out
+    tree = HTMLParser(out)
+    assert tree.css_first("html") is not None
+    skill_cells = [td.text().strip() for td in tree.css("#skills-table tbody td:first-child")]
+    assert "gcs-lifecycle-rules" in skill_cells
 
 
 def test_view_writes_to_out_file(
@@ -214,18 +218,17 @@ def test_view_without_artifact_and_no_default_gives_clear_guidance(
     assert "reach eval" in clean
 
 
-_EXTERNAL_REFERENCE = re.compile(r"https?://|<link[ >]|<script[^>]+src=")
-
-
-def test_the_document_is_one_self_contained_file(artifact: Artifact) -> None:
+def test_the_document_is_one_self_contained_file(
+    artifact: Artifact, external_reference_re: re.Pattern[str]
+) -> None:
     """Verify render_view_html generates self-contained HTML without external assets."""
     out = render_view_html(artifact)
     assert out.lstrip().startswith("<!DOCTYPE html>")
-    assert "<html" in out
-    assert "</html>" in out
-    assert "<style>" in out
-    assert "<script>" in out
-    assert not _EXTERNAL_REFERENCE.search(out)
+    tree = HTMLParser(out)
+    assert tree.css_first("html") is not None
+    assert tree.css_first("style") is not None
+    assert tree.css_first("script") is not None
+    assert not external_reference_re.search(out)
 
 
 def test_render_view_dispatches_by_format_name(artifact: Artifact) -> None:
@@ -244,8 +247,13 @@ def test_the_confusion_matrix_shows_the_split_querys_misroute(
     artifact: Artifact,
 ) -> None:
     """Verify confusion matrix renders misrouted cell with query text hover title."""
-    out = render_view_html(artifact)
-    assert '<td class="miss" title="Keep audit logs for seven years for compliance.">1' in out
+    tree = HTMLParser(render_view_html(artifact))
+    miss_cell = tree.css_first("#confusion-table td.miss")
+    assert miss_cell is not None
+    assert miss_cell.text().strip() == "1"
+    assert "Keep audit logs for seven years for compliance." in (
+        miss_cell.attributes.get("title") or ""
+    )
 
 
 def test_confusion_matrix_and_collisions_show_reasoning_when_present(
@@ -268,15 +276,16 @@ def test_confusion_matrix_and_collisions_show_reasoning_when_present(
         },
     )
     test_artifact = artifact.model_copy(update={"confusion": (updated_pair,)})
-    out = render_view_html(test_artifact)
-    assert "thought: Thinking about bucket retention rules." in out
-    assert "<h2>Collisions</h2>" in out
+    tree = HTMLParser(render_view_html(test_artifact))
+    assert "thought: Thinking about bucket retention rules." in tree.text()
+    assert tree.css_first("#collisions-table") is not None
 
 
 def test_abstention_is_a_column_of_its_own(artifact: Artifact) -> None:
     """Verify confusion matrix includes explicit '(no skill)' column for abstentions."""
-    out = render_view_html(artifact)
-    assert "(no skill)" in out
+    tree = HTMLParser(render_view_html(artifact))
+    headers = [th.text().strip() for th in tree.css("#confusion-table thead th")]
+    assert "(no skill)" in headers
 
 
 def test_an_unprobed_artifact_says_so_rather_than_rendering_an_empty_table(
@@ -284,36 +293,40 @@ def test_an_unprobed_artifact_says_so_rather_than_rendering_an_empty_table(
 ) -> None:
     """Verify HTML rendering outputs fallback message when artifact has no recorded probes."""
     empty = artifact.model_copy(update={"confusion": (), "queries": ()})
-    out = render_view_html(empty)
-    assert "No probes were recorded." in out
-    assert "No queries were recorded." in out
+    tree = HTMLParser(render_view_html(empty))
+    text = tree.text()
+    assert "No probes were recorded." in text
+    assert "No queries were recorded." in text
 
 
 def test_the_skills_table_is_filterable(artifact: Artifact) -> None:
     """Verify HTML output includes interactive JavaScript filter function and skills table."""
-    out = render_view_html(artifact)
-    assert "oninput=\"reachFilterRows(this, 'skills-table')\"" in out
-    assert 'id="skills-table"' in out
-    assert "function reachFilterRows" in out
+    tree = HTMLParser(render_view_html(artifact))
+    assert tree.css_first("input[oninput*=\"reachFilterRows(this, 'skills-table')\"]") is not None
+    table = tree.css_first("#skills-table")
+    assert table is not None
+    rendered_skills = [td.text().strip() for td in table.css("tbody td:first-child")]
     for skill in artifact.skills:
-        assert f">{skill.skill}<" in out
+        assert skill.skill in rendered_skills
 
 
 def test_queries_are_expandable_and_carry_their_full_text(
     artifact: Artifact,
 ) -> None:
     """Verify queries are rendered as expandable HTML details elements containing full text."""
-    out = render_view_html(artifact)
-    assert out.count('<details class="query') == len(artifact.queries)
-    assert "Keep audit logs for seven years for compliance." in out
-    assert "Tier old objects to Coldline after 30 days." in out
+    tree = HTMLParser(render_view_html(artifact))
+    details = tree.css("details.query")
+    assert len(details) == len(artifact.queries)
+    preview_texts = [node.text().strip() for node in tree.css("details.query summary .query-text")]
+    assert "Keep audit logs for seven years for compliance." in preview_texts
+    assert "Tier old objects to Coldline after 30 days." in preview_texts
 
 
 def test_a_clean_query_and_a_split_one_are_styled_apart(artifact: Artifact) -> None:
     """Verify HTML styling distinguishes fully hit queries from misrouted queries."""
-    out = render_view_html(artifact)
-    assert '<details class="query hit">' in out
-    assert 'class="query miss"' in out or 'class="query error"' in out
+    tree = HTMLParser(render_view_html(artifact))
+    assert tree.css_first("details.query.hit") is not None
+    assert tree.css_first("details.query.miss, details.query.error") is not None
 
 
 def test_query_text_is_escaped_not_executed(corpus, whole_catalog, make_config) -> None:
@@ -351,18 +364,24 @@ def test_query_text_is_escaped_not_executed(corpus, whole_catalog, make_config) 
         results,
     )
     out = render_view_html(built)
+    tree = HTMLParser(out)
+    # Ensure no executable script tag was injected into DOM
+    assert all("alert(1)" not in (s.text() or "") for s in tree.css("script"))
+    # Ensure safely rendered text in DOM
+    preview = tree.css_first("details.query summary .query-text")
+    assert preview is not None
+    assert '<script>alert(1)</script> & "quoted"' in preview.text()
+    # Ensure raw output escaped dangerous characters
     assert "<script>alert(1)</script>" not in out
     assert "&lt;script&gt;alert(1)&lt;/script&gt;" in out
-    assert "&amp;" in out
-    assert "&quot;quoted&quot;" in out
 
 
 def test_the_queries_container_is_filterable(artifact: Artifact) -> None:
     """Verify HTML output includes interactive query filter function and container."""
-    out = render_view_html(artifact)
-    assert "oninput=\"reachFilterQueries(this, 'queries-container')\"" in out
-    assert 'id="queries-container"' in out
-    assert "function reachFilterQueries" in out
+    tree = HTMLParser(render_view_html(artifact))
+    filter_selector = "input[oninput*=\"reachFilterQueries(this, 'queries-container')\"]"
+    assert tree.css_first(filter_selector) is not None
+    assert tree.css_first("#queries-container") is not None
 
 
 def test_view_open_flag_launches_browser(recorded: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -374,3 +393,54 @@ def test_view_open_flag_launches_browser(recorded: Path, monkeypatch: pytest.Mon
     assert len(opened_urls) == 1
     assert opened_urls[0].startswith("file://")
     assert opened_urls[0].endswith(".html")
+
+
+def test_header_consistency_interval_formatting_includes_parentheses(
+    artifact: Artifact,
+) -> None:
+    """Verify consistency interval is rendered with spacing and dim parentheses."""
+    tree = HTMLParser(render_view_html(artifact))
+    dim_spans = [span.text().strip() for span in tree.css(".figures dd span.dim")]
+    assert any(s.startswith("(") and s.endswith(")") for s in dim_spans)
+
+
+def test_skills_table_renders_dash_for_missing_and_explicit_absorbed_zero(
+    artifact: Artifact,
+) -> None:
+    """Verify skills table formats missing metrics as dim dashes and absorbed count as 0."""
+    from reach.artifact import SkillScore
+
+    mock_skill = SkillScore(
+        skill="untested-skill",
+        recall=None,
+        precision=None,
+        probes=0,
+        reached=0,
+        absorbed=0,
+    )
+    art = artifact.model_copy(update={"skills": (mock_skill,)})
+    tree = HTMLParser(render_view_html(art))
+    row = tree.css_first("#skills-table tbody tr")
+    assert row is not None
+    dash = row.css_first("td span.dim")
+    assert dash is not None
+    assert dash.text().strip() == "—"
+    cell_texts = [td.text().strip() for td in row.css("td")]
+    assert "0" in cell_texts
+
+
+def test_query_summary_contains_query_text_preview(artifact: Artifact) -> None:
+    """Verify query summary accordion contains query text preview element."""
+    tree = HTMLParser(render_view_html(artifact))
+    query_texts = tree.css("details.query summary span.query-text")
+    assert len(query_texts) > 0
+
+
+def test_queries_support_expand_and_collapse_all(artifact: Artifact) -> None:
+    """Verify view HTML contains expand all and collapse all toggles and script function."""
+    tree = HTMLParser(render_view_html(artifact))
+    assert tree.css_first('button[onclick*="reachToggleAllQueries(true)"]') is not None
+    assert tree.css_first('button[onclick*="reachToggleAllQueries(false)"]') is not None
+    script = tree.css_first("script")
+    assert script is not None
+    assert "function reachToggleAllQueries" in script.text()

@@ -428,7 +428,9 @@ INTERNAL_MODULES: frozenset[str] = frozenset(
         "reach.leak",
         "reach.rendering",
         "reach.report",
+        "reach.review",
         "reach.rewrite",
+        "reach.static",
         "reach.view",
         "reach.views",
     }

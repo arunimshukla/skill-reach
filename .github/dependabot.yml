@@ -21,6 +21,8 @@ updates:
     labels:
       - dependencies
       - python
+    cooldown:
+      default-days: 7
 
   - package-ecosystem: github-actions
     directory: /
@@ -29,3 +31,5 @@ updates:
     labels:
       - dependencies
       - github_actions
+    cooldown:
+      default-days: 7

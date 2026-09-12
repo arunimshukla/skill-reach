@@ -363,6 +363,7 @@ def _handle_draft_query_generation(
     generate: GenerateFlags | None,
     registry: RegistryFlags | None = None,
     dry_run: bool = False,
+    review: bool = False,
 ) -> int:
     """Synthesize new synthetic benchmark queries for discovered skills."""
     if target is not None and target.is_dir():
@@ -393,6 +394,7 @@ def _handle_draft_query_generation(
         skills_found,
         generate or GenerateFlags(),
         dry_run=dry_run,
+        review=review,
     )
 
 
@@ -490,6 +492,14 @@ def _query(
         ),
     ] = None,
     global_: Global = False,
+    review: Annotated[
+        bool,
+        SWITCH,
+        Parameter(
+            name="--review",
+            help="Launch interactive browser review for drafted queries",
+        ),
+    ] = False,
     draft_only: Annotated[bool, Parameter(show=False)] = False,
 ) -> int:
     """Synthesize benchmark queries for skills, convert formats, or inspect query datasets."""
@@ -548,6 +558,7 @@ def _query(
         generate=generate,
         registry=registry,
         dry_run=dry_run,
+        review=review,
     )
 
 
@@ -606,6 +617,14 @@ def _query_draft(
             help="Preview what queries would be drafted without making model calls",
         ),
     ] = False,
+    review: Annotated[
+        bool,
+        SWITCH,
+        Parameter(
+            name="--review",
+            help="Launch interactive browser review for drafted queries",
+        ),
+    ] = False,
     quiet: Quiet = False,
 ) -> int:
     """Generate synthetic query set for target catalog from skill markdown bodies."""
@@ -622,6 +641,7 @@ def _query_draft(
         run_dir=run_dir,
         generate=generate,
         dry_run=dry_run,
+        review=review,
         quiet=quiet,
         draft_only=True,
     )

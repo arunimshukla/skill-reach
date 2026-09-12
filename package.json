@@ -4,13 +4,16 @@
   "private": true,
   "description": "An evaluation suite for AI agent skill routing, collision detection, and description optimization",
   "scripts": {
-    "format": "prettier --write \"**/*.md\"",
-    "format:check": "prettier --check \"**/*.md\""
+    "lint": "biome check",
+    "lint:fix": "biome check --write",
+    "format": "biome check --write && prettier --write \"**/*.md\"",
+    "format:check": "biome check && prettier --check \"**/*.md\""
   },
   "prettier": {
     "proseWrap": "preserve"
   },
   "devDependencies": {
+    "@biomejs/biome": "^2.5.13",
     "prettier": "^3.9.6"
   }
 }

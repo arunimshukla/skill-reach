@@ -19,6 +19,9 @@ reach query -o queries.csv
 # Synthesize for a specific skill corpus or target skill
 reach query ./my-skills --count 3 --adversarial
 
+# Synthesize queries with interactive browser review before saving
+reach query ./my-skills --review
+
 # Convert an existing query dataset between formats offline (0 LLM tokens)
 reach query .reach/queries.json -o queries.csv
 reach query queries.csv -o .reach/queries.json
@@ -43,6 +46,7 @@ reach query --queries .reach/queries.json --leaks --citations
 | `--generator-model`   | String  | `gemini-3.8-flash` | Model used to draft synthetic queries.                                                               |
 | `--adversarial`       | Flag    | `false`            | Synthesize near-miss negative queries sharing target vocabulary.                                     |
 | `--adversarial-count` | Integer | `1`                | Number of adversarial negative queries per target.                                                   |
+| `--review`            | Flag    | `false`            | Launch interactive browser review for drafted queries before saving.                                 |
 
 ### Output & Formats
 
@@ -95,6 +99,9 @@ Draft synthetic evaluation queries targeting resident skills without converting 
 
 ```bash
 reach query draft [TARGET] [OPTIONS]
+
+# Draft queries with interactive browser review before saving
+reach query draft ./my-skills --review
 ```
 
 ### `reach query view`

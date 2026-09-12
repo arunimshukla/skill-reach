@@ -201,6 +201,19 @@ def test_optimize_diff_output(
     assert "-  Initial description." in captured.out
 
 
+def _mock_eval_candidate(
+    candidate: OptimizationCandidate,
+    is_test: bool = False,
+    **_kwargs: object,
+) -> OptimizationCandidate:
+    """Mock evaluate_candidate preserving candidate recall and accuracy."""
+    if is_test:
+        return candidate.model_copy(
+            update={"test_recall": candidate.recall, "test_accuracy": candidate.accuracy}
+        )
+    return candidate
+
+
 def test_optimize_auto_apply_writes_to_disk(
     write_skill: Callable[..., Path],
     tmp_path: Path,
@@ -222,7 +235,10 @@ def test_optimize_auto_apply_writes_to_disk(
         ),
     ]
 
-    with patch("reach.optimize.synthesize_candidates", return_value=mock_candidates):
+    with (
+        patch("reach.optimize.synthesize_candidates", return_value=mock_candidates),
+        patch("reach.optimize.evaluate_candidate", side_effect=_mock_eval_candidate),
+    ):
         ret = main(
             [
                 "optimize",
@@ -231,6 +247,8 @@ def test_optimize_auto_apply_writes_to_disk(
                 "--skills",
                 str(tmp_path),
                 "--auto-apply",
+                "--agent",
+                "fake",
             ],
         )
         assert ret == 0
@@ -261,11 +279,12 @@ def test_optimize_interactive_prompt_yes_applies_candidate(
 
     with (
         patch("reach.optimize.synthesize_candidates", return_value=mock_candidates),
+        patch("reach.optimize.evaluate_candidate", side_effect=_mock_eval_candidate),
         patch("sys.stdin.isatty", return_value=True),
         patch("sys.stdout.isatty", return_value=True),
         patch("builtins.input", return_value="y"),
     ):
-        ret = main(["optimize", "prompt-tool", "--skills", str(tmp_path)])
+        ret = main(["optimize", "prompt-tool", "--skills", str(tmp_path), "--agent", "fake"])
         assert ret == 0
 
     assert "Interactively applied description." in manifest.read_text(encoding="utf-8")
@@ -292,11 +311,12 @@ def test_optimize_interactive_prompt_no_skips_candidate(
 
     with (
         patch("reach.optimize.synthesize_candidates", return_value=mock_candidates),
+        patch("reach.optimize.evaluate_candidate", side_effect=_mock_eval_candidate),
         patch("sys.stdin.isatty", return_value=True),
         patch("sys.stdout.isatty", return_value=True),
         patch("builtins.input", return_value="n"),
     ):
-        ret = main(["optimize", "prompt-tool", "--skills", str(tmp_path)])
+        ret = main(["optimize", "prompt-tool", "--skills", str(tmp_path), "--agent", "fake"])
         assert ret == 0
 
     assert "Original description." in manifest.read_text(encoding="utf-8")
@@ -324,11 +344,12 @@ def test_optimize_interactive_prompt_diff_then_yes(
     inputs = iter(["d", "y"])
     with (
         patch("reach.optimize.synthesize_candidates", return_value=mock_candidates),
+        patch("reach.optimize.evaluate_candidate", side_effect=_mock_eval_candidate),
         patch("sys.stdin.isatty", return_value=True),
         patch("sys.stdout.isatty", return_value=True),
         patch("builtins.input", side_effect=lambda _: next(inputs)),
     ):
-        ret = main(["optimize", "prompt-tool", "--skills", str(tmp_path)])
+        ret = main(["optimize", "prompt-tool", "--skills", str(tmp_path), "--agent", "fake"])
         assert ret == 0
 
     assert "Diff inspected then applied description." in manifest.read_text(encoding="utf-8")
@@ -349,3 +370,356 @@ def test_prompt_interactive_apply_noop_when_best_candidate_is_none(tmp_path: Pat
     )
     # Calling this should return immediately without raising AttributeError or prompt
     _prompt_interactive_apply(console, report)
+
+
+def test_optimize_help_shows_new_batteries_included_flags(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Verify reach optimize --help displays expected optimization flags."""
+    assert main(["optimize", "--help"]) == 0
+    captured = capsys.readouterr()
+    assert "--iterations" in captured.out
+    assert "--holdout" in captured.out
+    assert "--review" in captured.out
+    assert "--force" in captured.out
+    assert "--auto-queries" in captured.out or "--no-auto-queries" in captured.out
+
+
+def test_optimize_cli_forwards_new_parameters(
+    write_skill: Callable[..., Path],
+    tmp_path: Path,
+) -> None:
+    """Verify reach optimize passes iterations, holdout, and no-auto-queries to optimize_skill."""
+    write_skill(name="cli-tool", description="A CLI test tool.")
+
+    with patch("reach.optimize.optimize_skill") as mock_opt:
+        from reach.optimize import OptimizationReport
+
+        mock_opt.return_value = OptimizationReport(
+            skill_name="cli-tool",
+            baseline_description="A CLI test tool.",
+            manifest_path=tmp_path / "SKILL.md",
+            candidates=(),
+        )
+
+        ret = main(
+            [
+                "optimize",
+                "--skill",
+                "cli-tool",
+                "--skills",
+                str(tmp_path),
+                "--iterations",
+                "3",
+                "--holdout",
+                "0.25",
+                "--no-auto-queries",
+                "--review",
+            ],
+        )
+        assert ret == 0
+        mock_opt.assert_called_once()
+        _, kwargs = mock_opt.call_args
+        settings = kwargs["settings"]
+        assert settings.iterations == 3
+        assert settings.holdout == 0.25
+        assert settings.auto_queries is False
+        assert settings.review is True
+
+
+def test_optimize_cli_defaults_holdout_to_point_two(
+    write_skill: Callable[..., Path],
+    tmp_path: Path,
+) -> None:
+    """Verify reach optimize defaults holdout to 0.2 when unspecified."""
+    write_skill(name="def-tool", description="Default holdout tool.")
+
+    with patch("reach.optimize.optimize_skill") as mock_opt:
+        from reach.optimize import OptimizationReport
+
+        mock_opt.return_value = OptimizationReport(
+            skill_name="def-tool",
+            baseline_description="Default holdout tool.",
+            manifest_path=tmp_path / "SKILL.md",
+            candidates=(),
+        )
+
+        ret = main(["optimize", "--skill", "def-tool", "--skills", str(tmp_path)])
+        assert ret == 0
+        mock_opt.assert_called_once()
+        _, kwargs = mock_opt.call_args
+        assert kwargs["settings"].holdout == 0.2
+
+
+def test_optimize_cli_forwards_candidate_parameter(
+    write_skill: Callable[..., Path],
+    tmp_path: Path,
+) -> None:
+    """Verify reach optimize forwards --candidate to optimize_skill."""
+    write_skill(name="cand-tool", description="Candidate test tool.")
+
+    with patch("reach.optimize.optimize_skill") as mock_opt:
+        from reach.optimize import OptimizationReport
+
+        mock_opt.return_value = OptimizationReport(
+            skill_name="cand-tool",
+            baseline_description="Candidate test tool.",
+            manifest_path=tmp_path / "SKILL.md",
+            candidates=(),
+        )
+
+        ret = main(
+            [
+                "optimize",
+                "--skill",
+                "cand-tool",
+                "--skills",
+                str(tmp_path),
+                "--candidate",
+                "2",
+            ]
+        )
+        assert ret == 0
+        mock_opt.assert_called_once()
+        _, kwargs = mock_opt.call_args
+        assert kwargs["candidate_index"] == 2
+
+
+def test_optimize_diff_with_candidate_flag(
+    write_skill: Callable[..., Path],
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Verify reach optimize --format diff --candidate 2 displays candidate #2 diff."""
+    write_skill(name="diff-tool", description="Original description.")
+    mock_candidates = [
+        OptimizationCandidate(description="Candidate 1 chosen rank 1.", recall=0.95),
+        OptimizationCandidate(description="Candidate 2 chosen rank 2.", recall=0.75),
+    ]
+    with patch("reach.optimize.synthesize_candidates", return_value=mock_candidates):
+        ret = main(
+            [
+                "optimize",
+                "diff-tool",
+                "--skills",
+                str(tmp_path),
+                "--agent",
+                "fake",
+                "--format",
+                "diff",
+                "--candidate",
+                "2",
+            ]
+        )
+        assert ret == 0
+    captured = capsys.readouterr()
+    assert "candidate #2" in captured.out
+    assert "+  Candidate 2 chosen rank 2." in captured.out
+
+
+def test_optimize_diff_with_out_of_range_candidate_fails(
+    write_skill: Callable[..., Path],
+    tmp_path: Path,
+) -> None:
+    """Verify reach optimize --format diff --candidate 99 exits with error code 2."""
+    write_skill(name="range-tool", description="Original description.")
+    mock_candidates = [
+        OptimizationCandidate(description="Candidate 1.", recall=0.8),
+    ]
+    with patch("reach.optimize.synthesize_candidates", return_value=mock_candidates):
+        ret = main(
+            [
+                "optimize",
+                "range-tool",
+                "--skills",
+                str(tmp_path),
+                "--agent",
+                "fake",
+                "--format",
+                "diff",
+                "--candidate",
+                "99",
+            ]
+        )
+        assert ret == 2
+
+
+def test_prompt_interactive_apply_selects_specific_candidate(
+    write_skill: Callable[..., Path],
+    tmp_path: Path,
+) -> None:
+    """Verify user can choose candidate #2 in interactive prompt."""
+    skill_dir = write_skill(
+        name="prompt-multi",
+        description="Original description.",
+    )
+    manifest = skill_dir / "SKILL.md"
+
+    mock_candidates = [
+        OptimizationCandidate(description="Candidate 1 description.", recall=0.9, delta_recall=0.2),
+        OptimizationCandidate(description="Candidate 2 description.", recall=0.8, delta_recall=0.1),
+    ]
+
+    inputs = iter(["2"])
+    with (
+        patch("reach.optimize.synthesize_candidates", return_value=mock_candidates),
+        patch("reach.optimize.evaluate_candidate", side_effect=_mock_eval_candidate),
+        patch("sys.stdin.isatty", return_value=True),
+        patch("sys.stdout.isatty", return_value=True),
+        patch("builtins.input", side_effect=lambda _: next(inputs)),
+    ):
+        ret = main(["optimize", "prompt-multi", "--skills", str(tmp_path), "--agent", "fake"])
+        assert ret == 0
+
+    assert "Candidate 2 description." in manifest.read_text(encoding="utf-8")
+
+
+def test_optimize_interactive_prompt_skipped_when_no_improvement(
+    write_skill: Callable[..., Path],
+    tmp_path: Path,
+) -> None:
+    """Verify interactive prompt is skipped when candidates show zero improvement over baseline."""
+    skill_dir = write_skill(
+        name="no-imp-tool",
+        description="Original baseline description.",
+    )
+    manifest = skill_dir / "SKILL.md"
+
+    mock_candidates = [
+        OptimizationCandidate(
+            description="Candidate with zero improvement.",
+            recall=1.0,
+            delta_recall=0.0,
+        ),
+    ]
+
+    with (
+        patch("reach.optimize.synthesize_candidates", return_value=mock_candidates),
+        patch("reach.optimize.filter_candidates", return_value=mock_candidates),
+        patch(
+            "reach.optimize.evaluate_candidate",
+            return_value=mock_candidates[0].model_copy(update={"recall": 1.0, "delta_recall": 0.0}),
+        ),
+        patch("sys.stdin.isatty", return_value=True),
+        patch("sys.stdout.isatty", return_value=True),
+        patch("builtins.input", side_effect=AssertionError("input() should not be called")),
+    ):
+        ret = main(["optimize", "no-imp-tool", "--skills", str(tmp_path), "--agent", "fake"])
+        assert ret == 0
+
+    # Manifest should not be modified
+    assert "Original baseline description." in manifest.read_text(encoding="utf-8")
+
+
+def test_optimize_cli_auto_apply_skips_when_no_improvement_unless_forced(
+    write_skill: Callable[..., Path],
+    tmp_path: Path,
+) -> None:
+    """Verify reach optimize --auto-apply skips writing without improvement unless --force."""
+    skill_dir = write_skill(
+        name="no-imp-apply",
+        description="Original baseline description that must stay.",
+    )
+    manifest = skill_dir / "SKILL.md"
+
+    mock_candidates = [
+        OptimizationCandidate(
+            description="Candidate with zero improvement.",
+            recall=1.0,
+            delta_recall=0.0,
+        ),
+    ]
+
+    with (
+        patch("reach.optimize.synthesize_candidates", return_value=mock_candidates),
+        patch("reach.optimize.filter_candidates", return_value=mock_candidates),
+        patch(
+            "reach.optimize.evaluate_candidate",
+            return_value=mock_candidates[0].model_copy(update={"recall": 1.0, "delta_recall": 0.0}),
+        ),
+    ):
+        # 1. Without --force: file is NOT overwritten
+        ret1 = main(
+            [
+                "optimize",
+                "no-imp-apply",
+                "--skills",
+                str(tmp_path),
+                "--agent",
+                "fake",
+                "--auto-apply",
+            ]
+        )
+        assert ret1 == 0
+        content = manifest.read_text(encoding="utf-8")
+        assert "Original baseline description that must stay." in content
+
+        # 2. With --force: file IS overwritten
+        ret2 = main(
+            [
+                "optimize",
+                "no-imp-apply",
+                "--skills",
+                str(tmp_path),
+                "--agent",
+                "fake",
+                "--auto-apply",
+                "--force",
+            ]
+        )
+        assert ret2 == 0
+        assert "Candidate with zero improvement." in manifest.read_text(encoding="utf-8")
+
+
+def test_optimize_cli_explicit_candidate_prompts_even_without_improvement(
+    write_skill: Callable[..., Path],
+    tmp_path: Path,
+) -> None:
+    """Verify specifying explicit --candidate prompts even if candidate has no improvement."""
+    skill_dir = write_skill(
+        name="explicit-cand-tool",
+        description="Original baseline description.",
+    )
+    manifest = skill_dir / "SKILL.md"
+
+    mock_candidates = [
+        OptimizationCandidate(
+            description="Candidate 1 with zero improvement.",
+            recall=1.0,
+            delta_recall=0.0,
+        ),
+        OptimizationCandidate(
+            description="Candidate 2 chosen by user.",
+            recall=1.0,
+            delta_recall=0.0,
+        ),
+    ]
+
+    with (
+        patch("reach.optimize.synthesize_candidates", return_value=mock_candidates),
+        patch("reach.optimize.filter_candidates", return_value=mock_candidates),
+        patch(
+            "reach.optimize.evaluate_candidate",
+            side_effect=lambda candidate, **_kw: candidate.model_copy(
+                update={"recall": 1.0, "delta_recall": 0.0}
+            ),
+        ),
+        patch("sys.stdin.isatty", return_value=True),
+        patch("sys.stdout.isatty", return_value=True),
+        patch("builtins.input", return_value="y"),
+    ):
+        ret = main(
+            [
+                "optimize",
+                "explicit-cand-tool",
+                "--skills",
+                str(tmp_path),
+                "--agent",
+                "fake",
+                "--candidate",
+                "2",
+            ]
+        )
+        assert ret == 0
+
+    assert "Candidate 2 chosen by user." in manifest.read_text(encoding="utf-8")

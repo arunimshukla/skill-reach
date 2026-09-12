@@ -16,73 +16,101 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-from unittest.mock import patch
+from collections.abc import Callable, Sequence
+from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import pytest
 import yaml
+from pydantic import ValidationError
 
 from reach.catalog import split_frontmatter
+from reach.config import OptimizeSettings
 from reach.models import Query, QueryKind, Skill
 from reach.optimize import (
+    CandidateOrigin,
+    IterationRecord,
     OptimizationCandidate,
     OptimizationReport,
+    _evaluate_all_candidates,
+    _run_candidate_probes,
     _synthesize_via_heuristics,
     build_optimization_prompt,
     evaluate_candidate,
     filter_candidates,
     optimize_skill,
+    split_query_set,
     synthesize_candidates,
     update_skill_description,
 )
-from reach.queries import load_query_set
+from reach.queries import Origin, QuerySet, QuerySetProvenance, load_query_set
+from reach.retrieval import DenseScorer
 from reach.rewrite import synthesize_directional_disclaimer
+from reach.runtime.fake import FakeGenerator, FakeRuntime
 
-if TYPE_CHECKING:
-    from collections.abc import Callable
-    from pathlib import Path
+# ===========================================================================
+# Test Fixtures
+# ===========================================================================
 
 
-def test_build_optimization_prompt_contains_all_context(
-    write_skill: Callable[..., Path],
-) -> None:
-    """Verify build_optimization_prompt includes target, rivals, ceded, and unclaimed terms."""
-    target_dir = write_skill(
-        name="cloud-deployer",
-        description="Deploy applications and services to cloud platforms.",
-        body="# Cloud Deployer\nFeatures automated rollout and canary deployments with metrics.",
-    )
+@pytest.fixture
+def mock_optimize_driver(
+    monkeypatch: pytest.MonkeyPatch,
+    fake_generator: FakeGenerator,
+) -> FakeGenerator:
+    """Mock reach.optimize._setup_driver to return a FakeGenerator instance."""
+    monkeypatch.setattr("reach.optimize._setup_driver", lambda *_args, **_kwargs: fake_generator)
+    return fake_generator
+
+
+@pytest.fixture
+def target_and_rival(tmp_path: Path) -> tuple[Skill, Skill]:
+    """Provide a standard pair of target and rival skill models."""
     target = Skill(
         name="cloud-deployer",
-        description="Deploy applications and services to cloud platforms.",
-        path=target_dir,
-    )
-    rival_dir = write_skill(
-        name="container-builder",
-        description="Build and package container images with Dockerfiles.",
+        description="Deploy applications to cloud platforms.",
+        path=tmp_path / "cloud-deployer",
     )
     rival = Skill(
         name="container-builder",
-        description="Build and package container images with Dockerfiles.",
-        path=rival_dir,
+        description="Build container images.",
+        path=tmp_path / "container-builder",
     )
+    return target, rival
 
-    prompt = build_optimization_prompt(
-        target=target,
-        rivals=[rival],
-        ceded_terms=("container", "docker"),
-        unclaimed_terms=("canary", "rollout", "metrics"),
-        min_length=20,
-        max_length=500,
+
+@pytest.fixture
+def mock_llm_driver() -> MagicMock:
+    """Provide a mock LLM text generator driver returning pre-canned candidates."""
+    driver = MagicMock()
+    driver.name = "mock-llm"
+    driver.complete.return_value = (
+        '{"candidates": [{"description": "LLM description for cloud deployments.", '
+        '"rationale": "Optimized phrasing."}]}'
     )
+    return driver
 
-    assert "cloud-deployer" in prompt
-    assert "container-builder" in prompt
-    assert "container" in prompt
-    assert "docker" in prompt
-    assert "canary" in prompt
-    assert "rollout" in prompt
-    assert "min_length: 20" in prompt or "20" in prompt
+
+@pytest.fixture
+def make_test_queries() -> Callable[..., list[Query]]:
+    """Return a factory function generating synthetic query sequences."""
+
+    def _make(
+        count: int = 10,
+        target: str = "tool",
+        kind: QueryKind = QueryKind.IMPLICIT,
+    ) -> list[Query]:
+        return [
+            Query(id=f"q{i}", text=f"{target} query {i}", expected_skill=target, kind=kind)
+            for i in range(count)
+        ]
+
+    return _make
+
+
+# ===========================================================================
+# 1. Manifest Modification & Frontmatter (update_skill_description)
+# ===========================================================================
 
 
 def test_update_skill_description_updates_frontmatter_and_preserves_body(
@@ -111,51 +139,257 @@ def test_update_skill_description_updates_frontmatter_and_preserves_body(
     assert "- Item 1" in body
 
 
-def test_update_skill_description_non_existent_file_returns_false(tmp_path: Path) -> None:
-    """Verify update_skill_description returns False if path does not exist."""
-    assert update_skill_description(tmp_path / "non_existent.md", "New description") is False
+@pytest.mark.parametrize(
+    "file_spec",
+    ["non_existent", "corrupted"],
+)
+def test_update_skill_description_invalid_target_returns_false(
+    file_spec: str,
+    tmp_path: Path,
+) -> None:
+    """Verify update_skill_description gracefully returns False on missing or malformed files."""
+    if file_spec == "non_existent":
+        path = tmp_path / "non_existent.md"
+    else:
+        path = tmp_path / "corrupted" / "SKILL.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("---\n[invalid: yaml: :\n---\n# Body", encoding="utf-8")
+
+    assert update_skill_description(path, "New description") is False
 
 
-def test_filter_candidates_with_linter() -> None:
+# ===========================================================================
+# 2. Prompt Construction (build_optimization_prompt)
+# ===========================================================================
+
+
+def test_build_optimization_prompt_contains_all_context(
+    write_skill_model: Callable[..., Skill],
+) -> None:
+    """Verify build_optimization_prompt includes target, rivals, ceded, and unclaimed terms."""
+    target = write_skill_model(
+        name="cloud-deployer",
+        description="Deploy applications and services to cloud platforms.",
+        body="# Cloud Deployer\nFeatures automated rollout and canary deployments with metrics.",
+    )
+    rival = write_skill_model(
+        name="container-builder",
+        description="Build and package container images with Dockerfiles.",
+    )
+
+    prompt = build_optimization_prompt(
+        target=target,
+        rivals=[rival],
+        ceded_terms=("container", "docker"),
+        unclaimed_terms=("canary", "rollout", "metrics"),
+        min_length=20,
+        max_length=500,
+    )
+
+    assert "cloud-deployer" in prompt
+    assert "container-builder" in prompt
+    assert "container" in prompt
+    assert "docker" in prompt
+    assert "canary" in prompt
+    assert "rollout" in prompt
+    assert "min_length: 20" in prompt or "20" in prompt
+
+
+def test_build_optimization_prompt_resolves_limits_from_reach_toml(
+    write_skill_model: Callable[..., Skill],
+    write_reach_toml: Callable[[str], Path],
+) -> None:
+    """Verify build_optimization_prompt reads min and max length from reach.toml."""
+    target = write_skill_model(
+        name="custom-tool",
+        description="Custom description for prompt testing.",
+    )
+    custom_toml = write_reach_toml(
+        "[lint]\nmin_description_length = 42\nmax_description_length = 650\n"
+    )
+
+    prompt = build_optimization_prompt(
+        target=target,
+        rivals=[],
+        config=custom_toml,
+    )
+    assert "between 42 and 650 characters" in prompt
+
+
+def test_build_optimization_prompt_caps_failure_queries(tmp_path: Path) -> None:
+    """Verify build_optimization_prompt caps failure and misrouted queries at 8."""
+    target = Skill(name="target-tool", description="Target description", path=tmp_path / "t")
+    failed = [f"failed probe query {i}" for i in range(12)]
+    misrouted = [f"misrouted probe query {i}" for i in range(12)]
+
+    prompt = build_optimization_prompt(
+        target,
+        (),
+        failed_triggers=failed,
+        false_triggers=misrouted,
+        iteration=2,
+    )
+    # Verify first 8 are included
+    for i in range(8):
+        assert f"failed probe query {i}" in prompt
+        assert f"misrouted probe query {i}" in prompt
+    # Verify indices 8..11 are capped out
+    for i in range(8, 12):
+        assert f"failed probe query {i}" not in prompt
+        assert f"misrouted probe query {i}" not in prompt
+    assert "Optimization Round #2 Feedback:" in prompt
+
+
+# ===========================================================================
+# 3. Candidate Synthesis & Directional Disclaimers (synthesize_candidates)
+# ===========================================================================
+
+
+@pytest.mark.parametrize(
+    ("desc", "rival", "ceded_terms", "expected"),
+    [
+        (
+            "Deploy containerized apps.",
+            "container-builder",
+            ("docker", "image"),
+            "Deploy containerized apps. For docker, image, use container-builder instead.",
+        ),
+        (
+            "Deploy containerized apps",
+            "container-builder",
+            (),
+            (
+                "Deploy containerized apps. For container-builder-related tasks, "
+                "use container-builder instead."
+            ),
+        ),
+    ],
+)
+def test_synthesize_directional_disclaimer_formatting(
+    desc: str,
+    rival: str,
+    ceded_terms: tuple[str, ...],
+    expected: str,
+) -> None:
+    """Verify directional disclaimer synthesizer produces valid bounded phrasing."""
+    res = synthesize_directional_disclaimer(desc, rival, ceded_terms=ceded_terms)
+    assert res == expected
+
+
+@pytest.mark.parametrize("mode", ["heuristic", "llm"])
+@pytest.mark.parametrize(
+    ("ceded_terms", "expect_disclaimer"),
+    [
+        (("docker", "build"), True),
+        ((), False),
+    ],
+)
+def test_synthesize_candidates_directional_disclaimer_inclusion(
+    mode: str,
+    ceded_terms: tuple[str, ...],
+    expect_disclaimer: bool,
+    target_and_rival: tuple[Skill, Skill],
+    mock_llm_driver: MagicMock,
+) -> None:
+    """Verify heuristic and LLM synthesis conditionally include directional disclaimer."""
+    target, rival = target_and_rival
+    if mode == "heuristic":
+        candidates = _synthesize_via_heuristics(
+            target=target,
+            rivals=[rival],
+            ceded_terms=ceded_terms,
+        )
+    else:
+        candidates = synthesize_candidates(
+            target=target,
+            rivals=[rival],
+            driver=mock_llm_driver,
+            ceded_terms=ceded_terms,
+        )
+        assert candidates[0].description == "LLM description for cloud deployments."
+
+    has_disclaimer = any("use container-builder instead" in c.description for c in candidates)
+    assert has_disclaimer is expect_disclaimer
+
+
+def test_synthesize_candidates_returns_requested_count_even_without_rivals(
+    write_skill_model: Callable[..., Skill],
+) -> None:
+    """Verify synthesize_candidates produces requested number of candidates with 0 rivals."""
+    solo_skill = write_skill_model(
+        name="solo-tool",
+        description="A standalone tool without any rivals in catalog.",
+    )
+
+    candidates = synthesize_candidates(
+        target=solo_skill,
+        rivals=[],
+        count=3,
+    )
+    assert len(candidates) == 3
+    descriptions = {c.description for c in candidates}
+    assert len(descriptions) == 3
+
+
+# ===========================================================================
+# 4. Candidate Filtering & Linting (filter_candidates)
+# ===========================================================================
+
+
+@pytest.mark.parametrize(
+    ("candidate", "expected_clean"),
+    [
+        (
+            OptimizationCandidate(
+                description="A perfectly valid description that satisfies all static constraints.",
+                rationale="Adds distinctive terms.",
+            ),
+            True,
+        ),
+        (
+            OptimizationCandidate(
+                description="Too short",
+                rationale="Too brief description.",
+            ),
+            False,
+        ),
+        (
+            OptimizationCandidate(
+                description="A" * 1200,
+                rationale="Exceeds maximum allowable description length.",
+            ),
+            False,
+        ),
+    ],
+)
+def test_filter_candidates_lint_validation(
+    candidate: OptimizationCandidate,
+    expected_clean: bool,
+) -> None:
     """Verify filter_candidates flags candidates violating length or format rules."""
-    raw_candidates = [
-        OptimizationCandidate(
-            description="A perfectly valid description that satisfies all static constraints.",
-            rationale="Adds distinctive terms.",
-        ),
-        OptimizationCandidate(
-            description="Too short",
-            rationale="Too brief description.",
-        ),
-        OptimizationCandidate(
-            description="A" * 1200,
-            rationale="Exceeds maximum allowable description length.",
-        ),
-    ]
+    filtered = filter_candidates([candidate], skill_name="my-tool")
+    assert len(filtered) == 1
+    assert filtered[0].lint_clean is expected_clean
 
-    filtered = filter_candidates(raw_candidates, skill_name="my-tool")
-    assert len(filtered) == 3
-    # Candidate 0 is clean
-    assert filtered[0].lint_clean is True
-    # Candidate 1 is too short
-    assert filtered[1].lint_clean is False
-    # Candidate 2 is too long
-    assert filtered[2].lint_clean is False
+
+def test_filter_candidates_empty_list_returns_empty() -> None:
+    """Verify filter_candidates handles empty candidate sequences cleanly."""
+    assert filter_candidates([], skill_name="any-tool") == []
+
+
+# ===========================================================================
+# 5. Candidate Evaluation & Probing (evaluate_candidate, ranking)
+# ===========================================================================
 
 
 def test_evaluate_candidate_measures_delta_recall(
-    write_skill: Callable[..., Path],
+    write_skill_model: Callable[..., Skill],
     write_queries: Callable[..., Path],
 ) -> None:
     """Verify evaluate_candidate evaluates candidate against queries and computes deltas."""
-    target_dir = write_skill(
+    target = write_skill_model(
         name="calc-tool",
         description="Evaluate mathematical expressions.",
-    )
-    target = Skill(
-        name="calc-tool",
-        description="Evaluate mathematical expressions.",
-        path=target_dir,
     )
     query_file = write_queries(target="calc-tool", count=4)
     queries = load_query_set(query_file).queries
@@ -182,9 +416,6 @@ def test_evaluate_candidate_measures_delta_recall(
 
 def test_run_candidate_probes_scores_rival_and_out_of_scope_queries(tmp_path: Path) -> None:
     """Verify candidate probe runner rewards correct rival and abstention choices."""
-    from reach.optimize import _run_candidate_probes
-    from reach.runtime.fake import FakeRuntime
-
     queries = [
         Query(
             id="q1",
@@ -232,7 +463,14 @@ def test_run_candidate_probes_scores_rival_and_out_of_scope_queries(tmp_path: Pa
         "unrelated query 2": "target-tool",
     }
     runtime = FakeRuntime(selections)
-    triggers, positive_queries, correct_count, misroutes = _run_candidate_probes(
+    (
+        triggers,
+        positive_queries,
+        correct_count,
+        misroutes,
+        failed_queries,
+        misrouted_queries,
+    ) = _run_candidate_probes(
         runtime,
         queries,
         "target-tool",
@@ -242,16 +480,16 @@ def test_run_candidate_probes_scores_rival_and_out_of_scope_queries(tmp_path: Pa
     assert triggers == 1
     assert correct_count == 3
     assert misroutes == 3
+    assert failed_queries == ("target query 2",)
+    assert misrouted_queries == ("rival query 2", "unrelated query 2")
 
 
 def test_evaluate_candidate_with_rival_queries_computes_accuracy(
-    write_skill: Callable[..., Path],
+    write_skill_model: Callable[..., Skill],
 ) -> None:
     """Verify evaluate_candidate calculates accuracy correctly when rival queries are present."""
-    target_dir = write_skill(name="target-tool", description="Target calculation tool.")
-    rival_dir = write_skill(name="rival-tool", description="Rival regex matching tool.")
-    target = Skill(name="target-tool", description="Target calculation tool.", path=target_dir)
-    rival = Skill(name="rival-tool", description="Rival regex matching tool.", path=rival_dir)
+    target = write_skill_model(name="target-tool", description="Target calculation tool.")
+    rival = write_skill_model(name="rival-tool", description="Rival regex matching tool.")
 
     queries = [
         Query(
@@ -282,6 +520,207 @@ def test_evaluate_candidate_with_rival_queries_computes_accuracy(
     assert evaluated.accuracy == 1.0
     assert evaluated.recall == 1.0
     assert evaluated.misroute_rate == 0.0
+
+
+def test_evaluate_all_candidates_breaks_ties_by_origin() -> None:
+    """Verify _evaluate_all_candidates ranks higher priority origin candidates first on ties."""
+    target = Skill(name="tool", description="Base.", path=Path("/tool"))
+    heuristic_cand = OptimizationCandidate(
+        description="Heuristic description.",
+        origin=CandidateOrigin.HEURISTIC,
+        delta_recall=0.0,
+        recall=1.0,
+        accuracy=1.0,
+        misroute_rate=0.0,
+    )
+    llm_cand = OptimizationCandidate(
+        description="LLM description.",
+        origin=CandidateOrigin.LLM,
+        delta_recall=0.0,
+        recall=1.0,
+        accuracy=1.0,
+        misroute_rate=0.0,
+    )
+
+    ranked, spent = _evaluate_all_candidates(
+        candidates=[heuristic_cand, llm_cand],
+        target_skill=target,
+        rivals=[],
+        queries=[],
+        agent="fake",
+        baseline_recall=1.0,
+        baseline_accuracy=1.0,
+        budget=10,
+        config=None,
+    )
+    assert ranked[0].description == llm_cand.description
+    assert spent == 0
+
+
+def test_evaluate_all_candidates_returns_exact_probe_spend_and_avoids_budget_drift(
+    write_skill_model: Callable[..., Skill],
+) -> None:
+    """Verify _evaluate_all_candidates returns exact probes spent and does not over-deduct."""
+    target = write_skill_model(name="probe-tool", description="Tool for testing probe spend.")
+    queries = [
+        Query(id="q1", text="query 1", expected_skill="probe-tool", kind=QueryKind.IMPLICIT),
+        Query(id="q2", text="query 2", expected_skill="probe-tool", kind=QueryKind.IMPLICIT),
+    ]
+
+    cands = [
+        OptimizationCandidate(description="Valid clean candidate 1.", lint_clean=True),
+        OptimizationCandidate(description="Valid clean candidate 2.", lint_clean=True),
+        OptimizationCandidate(description="Short", lint_clean=False),  # Dirty: skipped
+    ]
+
+    # Budget is 12, 2 clean candidates -> eval_budget_per_candidate = 6
+    # But only 2 queries exist, so each clean candidate only runs 2 probes
+    # Total probes spent must be exactly 2 * 2 = 4, NOT 12!
+    _ranked, spent = _evaluate_all_candidates(
+        candidates=cands,
+        target_skill=target,
+        rivals=[],
+        queries=queries,
+        agent="keyword",
+        baseline_recall=0.0,
+        baseline_accuracy=0.0,
+        budget=12,
+        config=None,
+    )
+    assert spent == 4
+
+
+def test_evaluate_all_candidates_clamps_spend_when_budget_less_than_candidate_count(
+    write_skill_model: Callable[..., Skill],
+) -> None:
+    """Verify _evaluate_all_candidates clamps probe spend when budget < candidate count."""
+    target = write_skill_model(name="probe-tool-clamp", description="Tool for testing clamp.")
+    queries = [
+        Query(id="q1", text="query 1", expected_skill="probe-tool-clamp", kind=QueryKind.IMPLICIT),
+        Query(id="q2", text="query 2", expected_skill="probe-tool-clamp", kind=QueryKind.IMPLICIT),
+    ]
+
+    cands = [
+        OptimizationCandidate(description="Valid clean candidate 1.", lint_clean=True),
+        OptimizationCandidate(description="Valid clean candidate 2.", lint_clean=True),
+        OptimizationCandidate(description="Valid clean candidate 3.", lint_clean=True),
+    ]
+
+    # Budget is 1 with 3 candidates. Running clamp must ensure total probes spent <= 1
+    _ranked, spent = _evaluate_all_candidates(
+        candidates=cands,
+        target_skill=target,
+        rivals=[],
+        queries=queries,
+        agent="keyword",
+        baseline_recall=0.0,
+        baseline_accuracy=0.0,
+        budget=1,
+        config=None,
+    )
+    assert spent == 1
+
+
+@pytest.mark.parametrize(
+    ("has_probes", "delta_recall", "misroute_rate", "baseline_misroute", "expected"),
+    [
+        (False, -0.5, 0.5, 0.2, True),  # Heuristic mode always reports improvement
+        (True, 0.1, 0.2, 0.2, True),  # Positive delta recall
+        (True, 0.0, 0.1, 0.2, True),  # Tie-breaker on lower misroute rate
+        (True, 0.0, 0.2, 0.2, False),  # Equal recall and equal misroute
+        (True, 0.0, 0.3, 0.2, False),  # Equal recall and higher misroute
+        (True, -0.1, 0.0, 0.2, False),  # Negative delta recall
+    ],
+)
+def test_optimization_report_has_improvement(
+    has_probes: bool,
+    delta_recall: float,
+    misroute_rate: float,
+    baseline_misroute: float,
+    expected: bool,
+) -> None:
+    """Verify OptimizationReport.has_improvement logic under various probe outcomes."""
+    cand = OptimizationCandidate(
+        description="Candidate rewrite description.",
+        delta_recall=delta_recall,
+        misroute_rate=misroute_rate,
+    )
+    report = OptimizationReport(
+        skill_name="test-skill",
+        baseline_description="Baseline description.",
+        baseline_recall=0.5,
+        baseline_accuracy=0.5,
+        baseline_misroute=baseline_misroute,
+        candidates=(cand,),
+        has_probes=has_probes,
+    )
+    assert report.has_improvement is expected
+    assert report.candidate_has_improvement(cand) is expected
+    assert report.candidate_has_improvement(None) is (not has_probes)
+
+
+# ===========================================================================
+# 6. Holdout & Dataset Partitioning (split_query_set, OptimizeSettings)
+# ===========================================================================
+
+
+@pytest.mark.parametrize(
+    ("holdout", "expected_train_count", "expected_test_count"),
+    [
+        (0.0, 6, 0),
+        (1.0, 2, 4),
+    ],
+)
+def test_split_query_set_boundary_clamping(
+    holdout: float,
+    expected_train_count: int,
+    expected_test_count: int,
+) -> None:
+    """Verify split_query_set respects holdout clamping and stratification."""
+    queries = (
+        Query(id="p1", text="run target 1", expected_skill="target-tool", kind=QueryKind.IMPLICIT),
+        Query(id="p2", text="run target 2", expected_skill="target-tool", kind=QueryKind.IMPLICIT),
+        Query(id="r1", text="run rival 1", expected_skill="rival-tool", kind=QueryKind.IMPLICIT),
+        Query(id="r2", text="run rival 2", expected_skill="rival-tool", kind=QueryKind.IMPLICIT),
+        Query(id="o1", text="other 1", expected_skill=None, kind=QueryKind.OUT_OF_SCOPE),
+        Query(id="o2", text="other 2", expected_skill=None, kind=QueryKind.OUT_OF_SCOPE),
+    )
+
+    train, test = split_query_set(queries, "target-tool", holdout=holdout)
+    assert len(train) >= expected_train_count
+    if holdout == 0.0:
+        assert test == []
+    else:
+        # Clamped so train retains at least 1 positive and 1 negative
+        assert any(q.expected_skill == "target-tool" for q in train)
+        assert any(q.expected_skill != "target-tool" for q in train)
+        assert len(test) >= 1
+
+
+@pytest.mark.parametrize(
+    ("holdout", "valid"),
+    [
+        (None, True),
+        (0.2, True),
+        (0.9, True),
+        (0.95, False),
+    ],
+)
+def test_optimize_settings_holdout_validation(holdout: float | None, valid: bool) -> None:
+    """Verify OptimizeSettings validates holdout between 0.0 and 0.9 and defaults to 0.2."""
+    if valid:
+        settings = OptimizeSettings() if holdout is None else OptimizeSettings(holdout=holdout)
+        expected = 0.2 if holdout is None else holdout
+        assert settings.holdout == expected
+    else:
+        assert holdout is not None
+        with pytest.raises(ValidationError):
+            OptimizeSettings(holdout=holdout)
+
+
+# ===========================================================================
+# 7. Closed-Loop Optimizer Engine (optimize_skill)
+# ===========================================================================
 
 
 def test_optimize_skill_end_to_end_with_fake_agent(
@@ -340,7 +779,6 @@ def test_optimize_skill_auto_apply_writes_to_disk(
         description="Initial description.",
         body="# Disk Tool\nFeatures mount operations and partition formatting.",
     )
-
     query_file = write_queries(target="disk-tool", count=4)
 
     mock_candidates = [
@@ -352,7 +790,10 @@ def test_optimize_skill_auto_apply_writes_to_disk(
         ),
     ]
 
-    with patch("reach.optimize.synthesize_candidates", return_value=mock_candidates):
+    with (
+        patch("reach.optimize.synthesize_candidates", return_value=mock_candidates),
+        patch("reach.optimize.evaluate_candidate", side_effect=lambda candidate, **_kw: candidate),
+    ):
         report = optimize_skill(
             skill_name="disk-tool",
             skills_path=tmp_path,
@@ -367,17 +808,23 @@ def test_optimize_skill_auto_apply_writes_to_disk(
         assert "Perform partition formatting and disk mount operations." in manifest_text
 
 
-def test_optimize_skill_unknown_skill_raises_value_error(
+@pytest.mark.parametrize(
+    ("target_name", "error_match"),
+    [
+        ("non-existent", r"Skill 'non-existent' not found"),
+        ("python-design", r"Did you mean: python-designer\?"),
+    ],
+)
+def test_optimize_skill_name_resolution_errors(
+    target_name: str,
+    error_match: str,
     write_skill: Callable[..., Path],
     tmp_path: Path,
 ) -> None:
-    """Verify optimize_skill raises ValueError when requested skill is not in catalog."""
-    write_skill(name="known-tool", description="A known utility.")
-    with pytest.raises(ValueError, match="Skill 'non-existent' not found"):
-        optimize_skill(
-            skill_name="non-existent",
-            skills_path=tmp_path,
-        )
+    """Verify optimize_skill raises ValueError on unknown skills and suggests close matches."""
+    write_skill(name="python-designer", description="A tool for Python design.")
+    with pytest.raises(ValueError, match=error_match):
+        optimize_skill(skill_name=target_name, skills_path=tmp_path)
 
 
 def test_optimize_skill_without_queries_generates_and_ranks_candidates(
@@ -401,68 +848,11 @@ def test_optimize_skill_without_queries_generates_and_ranks_candidates(
     assert report.best_candidate is not None
 
 
-def test_update_skill_description_corrupted_yaml_returns_false(tmp_path: Path) -> None:
-    """Verify update_skill_description gracefully returns False on corrupted YAML."""
-    corrupted_file = tmp_path / "corrupted" / "SKILL.md"
-    corrupted_file.parent.mkdir(parents=True, exist_ok=True)
-    corrupted_file.write_text("---\n[invalid: yaml: :\n---\n# Body", encoding="utf-8")
-
-    success = update_skill_description(corrupted_file, "New description")
-    assert success is False
-
-
-def test_filter_candidates_empty_list_returns_empty() -> None:
-    """Verify filter_candidates handles empty candidate sequences cleanly."""
-    assert filter_candidates([], skill_name="any-tool") == []
-
-
-def test_optimize_skill_misspelled_name_suggests_close_matches(
-    write_skill: Callable[..., Path],
-    tmp_path: Path,
-) -> None:
-    """Verify optimize_skill suggests closest matching skill name on typos."""
-    write_skill(name="python-designer", description="A tool for Python design.")
-    with pytest.raises(ValueError, match=r"Did you mean: python-designer\?"):
-        optimize_skill(
-            skill_name="python-design",
-            skills_path=tmp_path,
-        )
-
-
-def test_synthesize_candidates_returns_requested_count_even_without_rivals(
-    write_skill: Callable[..., Path],
-) -> None:
-    """Verify synthesize_candidates produces requested number of candidates with 0 rivals."""
-    solo_dir = write_skill(
-        name="solo-tool",
-        description="A standalone tool without any rivals in catalog.",
-    )
-    solo_skill = Skill(
-        name="solo-tool",
-        description="A standalone tool without any rivals in catalog.",
-        path=solo_dir,
-    )
-
-    candidates = synthesize_candidates(
-        target=solo_skill,
-        rivals=[],
-        count=3,
-    )
-    assert len(candidates) == 3
-    # Verify all 3 descriptions are distinct
-    descriptions = {c.description for c in candidates}
-    assert len(descriptions) == 3
-
-
 def test_optimize_skill_includes_semantic_rival_when_available(
     write_skill: Callable[..., Path],
     tmp_path: Path,
 ) -> None:
     """Verify optimize_skill identifies both lexical and semantic rivals."""
-    from unittest.mock import patch
-
-    from reach.retrieval import DenseScorer
-
     write_skill(
         name="target-tool",
         description="Target tool for managing relational databases.",
@@ -492,161 +882,582 @@ def test_optimize_skill_includes_semantic_rival_when_available(
 
 def test_optimize_skill_resolves_default_agent_from_config(
     write_skill: Callable[..., Path],
+    write_reach_toml: Callable[[str], Path],
     tmp_path: Path,
 ) -> None:
     """Verify optimize_skill resolves default agent from reach.toml configuration."""
-    from unittest.mock import patch
-
     write_skill(
         name="cfg-tool",
         description="A tool for testing default agent resolution.",
     )
-    custom_toml = tmp_path / "reach.toml"
-    custom_toml.write_text("[general]\ndefault_agent = 'fake'\n", encoding="utf-8")
+    custom_toml = write_reach_toml("[general]\ndefault_agent = 'fake'\n")
 
     with patch("reach.optimize._setup_driver") as mock_setup:
-        from reach.runtime.fake import FakeGenerator
-
         mock_setup.return_value = FakeGenerator()
 
         optimize_skill(
             skill_name="cfg-tool",
             skills_path=tmp_path,
             config=custom_toml,
+            settings=OptimizeSettings(auto_queries=False),
         )
         mock_setup.assert_called_once_with(None, None, config=custom_toml)
 
 
-def test_build_optimization_prompt_resolves_limits_from_reach_toml(
-    write_skill: Callable[..., Path],
-    tmp_path: Path,
-) -> None:
-    """Verify build_optimization_prompt reads min and max length from reach.toml."""
-    target_dir = write_skill(
-        name="custom-tool",
-        description="Custom description for prompt testing.",
-    )
-    target = Skill(
-        name="custom-tool",
-        description="Custom description for prompt testing.",
-        path=target_dir,
-    )
-    custom_toml = tmp_path / "reach.toml"
-    custom_toml.write_text(
-        "[lint]\nmin_description_length = 42\nmax_description_length = 650\n",
-        encoding="utf-8",
-    )
-
-    prompt = build_optimization_prompt(
-        target=target,
-        rivals=[],
-        config=custom_toml,
-    )
-    assert "between 42 and 650 characters" in prompt
-
-
 def test_optimize_skill_propagates_lint_config(
     write_skill: Callable[..., Path],
+    write_reach_toml: Callable[[str], Path],
+    mock_optimize_driver: FakeGenerator,
     tmp_path: Path,
 ) -> None:
     """Verify optimize_skill passes loaded LintSettings to filtering and synthesis."""
-    from unittest.mock import patch
-
     write_skill(
         name="cfg-tool",
         description="A tool for testing lint config propagation.",
     )
-    custom_toml = tmp_path / "reach.toml"
-    custom_toml.write_text(
-        "[general]\ndefault_agent = 'fake'\n[lint]\nmin_description_length = 150\n",
-        encoding="utf-8",
+    custom_toml = write_reach_toml(
+        "[general]\ndefault_agent = 'fake'\n[lint]\nmin_description_length = 150\n"
     )
 
-    with patch("reach.optimize._setup_driver") as mock_setup:
-        from reach.runtime.fake import FakeGenerator
+    report = optimize_skill(
+        skill_name="cfg-tool",
+        skills_path=tmp_path,
+        config=custom_toml,
+    )
+    assert report.candidates
+    for cand in report.candidates:
+        if len(cand.description) < 150:
+            assert cand.lint_clean is False
 
-        mock_setup.return_value = FakeGenerator()
+
+def test_multi_round_hill_climbing_preserves_best_incumbent(
+    write_skill: Callable[..., Path],
+    tmp_path: Path,
+) -> None:
+    """Verify multi-round optimization retains the global best candidate across iterations."""
+    write_skill(name="target-tool", description="Original description.")
+    round_calls = 0
+
+    class MultiRoundDriver(FakeGenerator):
+        name = "custom-llm"
+
+        def complete(self, prompt: str, system: str | None = None) -> str:
+            nonlocal round_calls
+            round_calls += 1
+            if round_calls == 1:
+                return (
+                    '{"candidates": [{"description": "Round 1 amazing description.", '
+                    '"rationale": "r1"}]}'
+                )
+            return (
+                '{"candidates": [{"description": "Round 2 mediocre description.", '
+                '"rationale": "r2"}]}'
+            )
+
+    qs = QuerySet(
+        catalog_id="test",
+        provenance=QuerySetProvenance(origin=Origin.GENERATED),
+        queries=(
+            Query(
+                id="q1",
+                text="target query 1",
+                expected_skill="target-tool",
+                kind=QueryKind.IMPLICIT,
+            ),
+            Query(
+                id="q2",
+                text="target query 2",
+                expected_skill="target-tool",
+                kind=QueryKind.IMPLICIT,
+            ),
+            Query(
+                id="q3",
+                text="target query 3",
+                expected_skill="target-tool",
+                kind=QueryKind.IMPLICIT,
+            ),
+        ),
+    )
+    queries_file = tmp_path / "queries.json"
+    queries_file.write_text(qs.model_dump_json(), encoding="utf-8")
+
+    with (
+        patch("reach.optimize._setup_driver", return_value=MultiRoundDriver()),
+        patch("reach.optimize._setup_runtime") as mock_runtime,
+    ):
+
+        def runtime_response(query_text: str) -> str:
+            if round_calls == 0:
+                return "rival-tool"
+            if round_calls == 1:
+                return (
+                    "target-tool"
+                    if query_text in {"target query 1", "target query 2"}
+                    else "rival-tool"
+                )
+            return "target-tool" if query_text == "target query 1" else "rival-tool"
+
+        mock_runtime.return_value = FakeRuntime(runtime_response)
+
         report = optimize_skill(
-            skill_name="cfg-tool",
+            skill_name="target-tool",
             skills_path=tmp_path,
-            config=custom_toml,
+            queries_path=queries_file,
+            settings=OptimizeSettings(iterations=2, auto_queries=False),
         )
-        assert report.candidates
-        for cand in report.candidates:
-            if len(cand.description) < 150:
-                assert cand.lint_clean is False
+
+        assert len(report.rounds) == 2
+        assert report.rounds[0].iteration == 1
+        assert report.rounds[1].iteration == 2
+        assert len(report.candidates) >= 1
+        assert report.candidates[0].description == "Round 1 amazing description."
 
 
-def test_synthesize_directional_disclaimer() -> None:
-    """Verify directional disclaimer synthesizer produces valid bounded phrasing."""
-    # With ceded terms
-    res = synthesize_directional_disclaimer(
-        "Deploy containerized apps.",
-        "container-builder",
-        ceded_terms=("docker", "image"),
-    )
-    assert res == "Deploy containerized apps. For docker, image, use container-builder instead."
+def test_optimize_skill_auto_queries_bootstraps_heuristic_probes(
+    write_skill: Callable[..., Path],
+    mock_optimize_driver: FakeGenerator,
+    tmp_path: Path,
+) -> None:
+    """Verify auto_queries bootstraps probes even when no queries file is provided."""
+    write_skill(name="auto-tool", description="A tool that generates queries automatically.")
+    write_skill(name="rival-tool", description="A rival tool.")
 
-    # Without trailing punctuation
-    res_no_punct = synthesize_directional_disclaimer(
-        "Deploy containerized apps",
-        "container-builder",
+    report = optimize_skill(
+        skill_name="auto-tool",
+        skills_path=tmp_path,
+        agent="fake",
+        settings=OptimizeSettings(auto_queries=True),
     )
-    assert res_no_punct == (
-        "Deploy containerized apps. For container-builder-related tasks, "
-        "use container-builder instead."
-    )
+    assert report.has_probes is True
+    assert report.candidates[0].recall is not None
 
 
-def test_heuristic_candidates_includes_directional_disclaimer(tmp_path: Path) -> None:
-    """Verify _heuristic_candidates generates zero-cost directional disclaimer candidate."""
-    target = Skill(
-        name="cloud-deployer",
-        description="Deploy applications to cloud platforms.",
-        path=tmp_path / "s1",
+def test_optimize_skill_with_review_triggers_launcher(
+    write_skill: Callable[..., Path],
+    mock_optimize_driver: FakeGenerator,
+    tmp_path: Path,
+) -> None:
+    """Verify review=True launches interactive review before probe evaluation."""
+    write_skill(name="rev-tool", description="Review testing tool.")
+
+    queries = (Query(id="q1", text="query 1", expected_skill="rev-tool", kind=QueryKind.IMPLICIT),)
+    mock_qs = QuerySet(
+        catalog_id="test",
+        queries=queries,
+        provenance=QuerySetProvenance(origin=Origin.GENERATED),
     )
-    rival = Skill(
-        name="container-builder",
-        description="Build container images.",
-        path=tmp_path / "s2",
-    )
-    candidates = _synthesize_via_heuristics(
-        target=target,
-        rivals=[rival],
-        ceded_terms=("docker", "build"),
-    )
-    # Check that a candidate names container-builder with directional disclaimer
-    matching = [c for c in candidates if "container-builder" in c.description]
-    assert len(matching) >= 1
-    assert "use container-builder instead" in matching[0].description
+
+    with patch("reach.optimize.launch_query_review", return_value=mock_qs) as mock_review:
+        report = optimize_skill(
+            skill_name="rev-tool",
+            skills_path=tmp_path,
+            agent="fake",
+            settings=OptimizeSettings(auto_queries=True, review=True),
+        )
+        mock_review.assert_called_once()
+        assert report.has_probes is True
 
 
-def test_synthesize_candidates_injects_directional_candidate_with_llm(tmp_path: Path) -> None:
-    """Verify synthesize_candidates injects directional candidate alongside LLM results."""
-    from unittest.mock import MagicMock
+def test_optimize_skill_wires_positive_and_adversarial_counts(
+    write_skill: Callable[..., Path],
+    mock_optimize_driver: FakeGenerator,
+    tmp_path: Path,
+) -> None:
+    """Verify positive_count and adversarial_count are wired into _bootstrap_queries."""
+    write_skill(name="count-tool", description="Count testing tool.")
 
-    target = Skill(
-        name="cloud-deployer",
-        description="Deploy applications to cloud platforms.",
-        path=tmp_path / "s1",
+    with patch("reach.optimize._bootstrap_queries", return_value=None) as mock_bootstrap:
+        optimize_skill(
+            skill_name="count-tool",
+            skills_path=tmp_path,
+            agent="fake",
+            settings=OptimizeSettings(auto_queries=True, positive_count=7, adversarial_count=3),
+        )
+        assert mock_bootstrap.called
+        kwargs = mock_bootstrap.call_args.kwargs
+        assert kwargs["positive_count"] == 7
+        assert kwargs["adversarial_count"] == 3
+
+
+def test_optimize_skill_evaluates_baseline_on_train_queries_with_holdout(
+    write_skill: Callable[..., Path],
+    write_queries: Callable[..., Path],
+    make_test_queries: Callable[..., list[Query]],
+    mock_optimize_driver: FakeGenerator,
+    tmp_path: Path,
+) -> None:
+    """Verify baseline evaluation uses train_queries when holdout is active."""
+    write_skill(name="split-tool", description="Split testing tool.")
+    queries = make_test_queries(count=10, target="split-tool")
+    query_file = write_queries(target="split-tool", queries=queries)
+    eval_queries_passed: list[list[Query]] = []
+
+    def mock_eval_cand(*args: object, **kwargs: object) -> OptimizationCandidate:
+        raw_queries = kwargs.get("queries") or (args[3] if len(args) > 3 else [])
+        assert isinstance(raw_queries, (list, tuple))
+        eval_queries_passed.append([q for q in raw_queries if isinstance(q, Query)])
+        cand = kwargs.get("candidate") or args[0]
+        assert isinstance(cand, OptimizationCandidate)
+        return cand.model_copy(update={"recall": 0.5, "accuracy": 0.5, "misroute_rate": 0.0})
+
+    with (
+        patch(
+            "reach.optimize.synthesize_candidates",
+            return_value=[OptimizationCandidate(description="better description")],
+        ),
+        patch(
+            "reach.optimize.filter_candidates",
+            return_value=[OptimizationCandidate(description="better description")],
+        ),
+        patch("reach.optimize.evaluate_candidate", side_effect=mock_eval_cand),
+    ):
+        optimize_skill(
+            skill_name="split-tool",
+            skills_path=tmp_path,
+            queries_path=query_file,
+            agent="fake",
+            settings=OptimizeSettings(holdout=0.3, auto_queries=False),
+        )
+
+    # First evaluation must be baseline on train_queries (7 items), NOT full queries (10 items)
+    assert len(eval_queries_passed) >= 1
+    assert len(eval_queries_passed[0]) == 7
+
+
+def test_holdout_evaluates_all_candidates_and_discriminates(
+    write_skill: Callable[..., Path],
+    write_queries: Callable[..., Path],
+    make_test_queries: Callable[..., list[Query]],
+    mock_optimize_driver: FakeGenerator,
+    tmp_path: Path,
+) -> None:
+    """Verify holdout evaluation scores all candidates so holdout metrics can discriminate."""
+    write_skill(name="disc-tool", description="Discrimination tool.")
+    queries = make_test_queries(count=10, target="disc-tool")
+    query_file = write_queries(target="disc-tool", queries=queries)
+
+    cand_a = OptimizationCandidate(description="Candidate A (train ties, holdout 0.5).")
+    cand_b = OptimizationCandidate(description="Candidate B (train ties, holdout 1.0).")
+
+    def mock_eval(*args: object, **kwargs: object) -> OptimizationCandidate:
+        cand = kwargs.get("candidate") or (args[0] if args else None)
+        assert isinstance(cand, OptimizationCandidate)
+        is_test = kwargs.get("is_test", False)
+        if not is_test:
+            return cand.model_copy(update={"recall": 1.0, "accuracy": 1.0, "delta_recall": 0.0})
+        # On test queries, cand_b achieves higher recall than cand_a
+        score = 1.0 if "Candidate B" in cand.description else 0.5
+        return cand.model_copy(update={"test_recall": score, "test_accuracy": score})
+
+    with (
+        patch("reach.optimize.synthesize_candidates", return_value=[cand_a, cand_b]),
+        patch("reach.optimize.filter_candidates", return_value=[cand_a, cand_b]),
+        patch("reach.optimize.evaluate_candidate", side_effect=mock_eval),
+    ):
+        report = optimize_skill(
+            skill_name="disc-tool",
+            skills_path=tmp_path,
+            queries_path=query_file,
+            agent="fake",
+            settings=OptimizeSettings(holdout=0.3, auto_queries=False),
+        )
+
+    assert len(report.candidates) == 2
+    assert report.candidates[0].test_recall is not None
+    assert report.candidates[1].test_recall is not None
+    assert "Candidate B" in report.candidates[0].description
+    assert report.candidates[0].test_recall == 1.0
+    assert report.candidates[1].test_recall == 0.5
+
+
+def test_optimize_skill_strictly_respects_probe_budget(
+    write_skill: Callable[..., Path],
+    write_queries: Callable[..., Path],
+    make_test_queries: Callable[..., list[Query]],
+    mock_optimize_driver: FakeGenerator,
+    tmp_path: Path,
+) -> None:
+    """Verify optimize_skill executes no more empirical probes than the stated budget."""
+    write_skill(name="budget-tool", description="Budget clamping test tool.")
+    queries = make_test_queries(count=20, target="budget-tool")
+    query_file = write_queries(target="budget-tool", queries=queries)
+
+    probes_run = 0
+
+    def mock_eval(
+        candidate: OptimizationCandidate,
+        *args: object,
+        queries: Sequence[object] = (),
+        budget: int = 1,
+        **kwargs: object,
+    ) -> OptimizationCandidate:
+        nonlocal probes_run
+        probes_run += min(len(queries), budget)
+        return candidate.model_copy(update={"recall": 1.0, "accuracy": 1.0, "delta_recall": 0.0})
+
+    with (
+        patch(
+            "reach.optimize.synthesize_candidates",
+            return_value=[OptimizationCandidate(description=f"Candidate {i}") for i in range(3)],
+        ),
+        patch(
+            "reach.optimize.filter_candidates",
+            side_effect=lambda cands, **_kw: cands,
+        ),
+        patch("reach.optimize.evaluate_candidate", side_effect=mock_eval),
+    ):
+        optimize_skill(
+            skill_name="budget-tool",
+            skills_path=tmp_path,
+            queries_path=query_file,
+            agent="fake",
+            budget=6,
+            candidates_count=3,
+            settings=OptimizeSettings(auto_queries=False),
+        )
+
+    # Total probes must be capped at stated budget
+    assert probes_run <= 6
+
+
+def test_holdout_zero_test_share_skips_holdout_and_preserves_budget(
+    write_skill: Callable[..., Path],
+    write_queries: Callable[..., Path],
+    mock_optimize_driver: FakeGenerator,
+    tmp_path: Path,
+) -> None:
+    """Verify holdout pass is skipped and preserves budget when round_budget <= 1."""
+    write_skill(name="tight-tool", description="Tight budget tool.")
+    queries = [
+        Query(id=f"q{i}", text=f"query {i}", expected_skill="tight-tool", kind=QueryKind.IMPLICIT)
+        for i in range(10)
+    ]
+    query_file = write_queries(target="tight-tool", queries=queries)
+
+    # 5 iterations with total budget of 10 -> each round gets ~2 probes
+    # test_share = int(2 * 0.2) = 0 -> holdout test pass should be skipped,
+    # leaving budget for later rounds
+    report = optimize_skill(
+        skill_name="tight-tool",
+        skills_path=tmp_path,
+        queries_path=query_file,
+        agent="fake",
+        budget=10,
+        settings=OptimizeSettings(iterations=5, holdout=0.2, auto_queries=False),
     )
-    rival = Skill(
-        name="container-builder",
-        description="Build container images.",
-        path=tmp_path / "s2",
+    assert len(report.rounds) == 5
+    # When test_share was 0, holdout test pass was not run and test_evaluated should be False
+    assert report.rounds[0].test_evaluated is False
+
+
+def test_multi_round_deduplicates_identical_descriptions(
+    write_skill: Callable[..., Path],
+    write_queries: Callable[..., Path],
+    tmp_path: Path,
+) -> None:
+    """Verify report.candidates deduplicates candidates with identical descriptions."""
+    write_skill(name="dedup-tool", description="Deduplication tool.")
+    queries = [
+        Query(id="q1", text="query 1", expected_skill="dedup-tool", kind=QueryKind.IMPLICIT),
+    ]
+    query_file = write_queries(target="dedup-tool", queries=queries)
+
+    class DuplicateGeneratingDriver(FakeGenerator):
+        name = "mock-llm"
+
+        def complete(self, prompt: str, system: str | None = None) -> str:
+            # Returns identical description on every round
+            return (
+                '{"candidates": [{"description": "Identical candidate description across rounds.", '
+                '"rationale": "Same phrasing"}]}'
+            )
+
+    with patch("reach.optimize._setup_driver", return_value=DuplicateGeneratingDriver()):
+        report = optimize_skill(
+            skill_name="dedup-tool",
+            skills_path=tmp_path,
+            queries_path=query_file,
+            settings=OptimizeSettings(iterations=3, auto_queries=False),
+        )
+
+    # Candidates should have unique descriptions
+    descriptions = [c.description for c in report.candidates]
+    assert len(descriptions) == len(set(descriptions))
+    assert descriptions.count("Identical candidate description across rounds.") == 1
+
+
+def test_multi_round_prefers_later_round_on_score_tie(
+    write_skill: Callable[..., Path],
+    write_queries: Callable[..., Path],
+    tmp_path: Path,
+) -> None:
+    """Verify global_best prefers candidate from later iteration round on metric ties."""
+    write_skill(name="tie-tool", description="Score tie tool.")
+    queries = [
+        Query(id="q1", text="query 1", expected_skill="tie-tool", kind=QueryKind.IMPLICIT),
+    ]
+    query_file = write_queries(target="tie-tool", queries=queries)
+    round_calls = 0
+
+    class TieDriver(FakeGenerator):
+        name = "mock-llm"
+
+        def complete(self, prompt: str, system: str | None = None) -> str:
+            nonlocal round_calls
+            round_calls += 1
+            return (
+                f'{{"candidates": [{{"description": "Round {round_calls} candidate.", '
+                f'"rationale": "r{round_calls}"}}]}}'
+            )
+
+    def mock_eval(
+        candidate: OptimizationCandidate,
+        *args: object,
+        **kwargs: object,
+    ) -> OptimizationCandidate:
+        # Both rounds achieve identical scores
+        return candidate.model_copy(update={"recall": 1.0, "accuracy": 1.0, "delta_recall": 0.5})
+
+    with (
+        patch("reach.optimize._setup_driver", return_value=TieDriver()),
+        patch("reach.optimize.evaluate_candidate", side_effect=mock_eval),
+    ):
+        report = optimize_skill(
+            skill_name="tie-tool",
+            skills_path=tmp_path,
+            queries_path=query_file,
+            settings=OptimizeSettings(iterations=2, auto_queries=False),
+        )
+
+    # Later round's candidate should be selected as best candidate on equality
+    assert report.best_candidate is not None
+    assert report.best_candidate.description == "Round 2 candidate."
+
+
+def test_optimize_skill_auto_apply_safely_refuses_when_no_improvement_unless_forced(
+    write_skill: Callable[..., Path],
+    write_queries: Callable[..., Path],
+    tmp_path: Path,
+) -> None:
+    """Verify auto_apply=True does not write when candidate has 0 improvement unless force=True."""
+    target_dir = write_skill(
+        name="safe-tool",
+        description="Initial description that should remain intact.",
     )
-    driver = MagicMock()
-    driver.name = "mock-llm"
-    driver.complete.return_value = (
-        '{"candidates": [{"description": "LLM description for cloud deployments.", '
-        '"rationale": "Optimized phrasing."}]}'
+    manifest = target_dir / "SKILL.md"
+    queries = [
+        Query(id="q1", text="query 1", expected_skill="safe-tool", kind=QueryKind.IMPLICIT),
+    ]
+    query_file = write_queries(target="safe-tool", queries=queries)
+
+    cands = [
+        OptimizationCandidate(
+            description="Unimproved candidate description.",
+            recall=0.0,
+            delta_recall=0.0,
+        ),
+    ]
+
+    with (
+        patch("reach.optimize.synthesize_candidates", return_value=cands),
+        patch("reach.optimize.filter_candidates", return_value=cands),
+        patch("reach.optimize.evaluate_candidate", return_value=cands[0]),
+    ):
+        # 1. Without force: auto_apply refused
+        rep1 = optimize_skill(
+            skill_name="safe-tool",
+            skills_path=tmp_path,
+            queries_path=query_file,
+            agent="fake",
+            auto_apply=True,
+            force=False,
+            settings=OptimizeSettings(auto_queries=False),
+        )
+        assert rep1.applied is False
+        content = manifest.read_text(encoding="utf-8")
+        assert "Initial description that should remain intact." in content
+
+        # 2. With force=True: auto_apply succeeds even with 0 improvement
+        rep2 = optimize_skill(
+            skill_name="safe-tool",
+            skills_path=tmp_path,
+            queries_path=query_file,
+            agent="fake",
+            auto_apply=True,
+            force=True,
+            settings=OptimizeSettings(auto_queries=False),
+        )
+        assert rep2.applied is True
+        assert "Unimproved candidate description." in manifest.read_text(encoding="utf-8")
+
+
+def test_optimization_candidate_nullable_metric_constraints() -> None:
+    """Verify test metrics enforce ge=0.0, le=1.0 while allowing None."""
+    # Valid with None
+    cand = OptimizationCandidate(description="Valid desc", test_recall=None)
+    assert cand.test_recall is None
+
+    # Valid with in-range float
+    cand_valid = OptimizationCandidate(
+        description="Valid desc",
+        test_recall=0.8,
+        test_accuracy=1.0,
+        test_misroute_rate=0.0,
     )
-    candidates = synthesize_candidates(
-        target=target,
-        rivals=[rival],
-        driver=driver,
-        ceded_terms=("docker", "build"),
+    assert cand_valid.test_recall == 0.8
+
+    # Invalid cases
+    with pytest.raises(ValidationError):
+        OptimizationCandidate(description="Valid desc", test_recall=-0.1)
+
+    with pytest.raises(ValidationError):
+        OptimizationCandidate(description="Valid desc", test_recall=1.1)
+
+    with pytest.raises(ValidationError):
+        OptimizationCandidate(description="Valid desc", test_accuracy=1.05)
+
+    with pytest.raises(ValidationError):
+        OptimizationCandidate(description="Valid desc", test_misroute_rate=-0.01)
+
+
+def test_iteration_record_iteration_ge_1() -> None:
+    """Verify IterationRecord requires iteration >= 1."""
+    cand = OptimizationCandidate(description="Candidate")
+    with pytest.raises(ValidationError):
+        IterationRecord(
+            iteration=0,
+            candidates=(cand,),
+            best_candidate=cand,
+        )
+
+    rec = IterationRecord(
+        iteration=1,
+        candidates=(cand,),
+        best_candidate=cand,
     )
-    assert len(candidates) == 2
-    assert "use container-builder instead" in candidates[0].description
-    assert candidates[1].description == "LLM description for cloud deployments."
+    assert rec.iteration == 1
+
+
+def test_candidate_payload_whitespace_description_rejected() -> None:
+    """Verify _CandidatePayload rejects whitespace-only descriptions."""
+    from reach.optimize import _CandidatePayload
+
+    with pytest.raises(ValidationError):
+        _CandidatePayload(description="   ")
+
+    payload = _CandidatePayload(description="  Clean description  ")
+    assert payload.description == "Clean description"
+
+
+def test_optimization_response_requires_candidates() -> None:
+    """Verify _OptimizationResponse requires candidates and raises when omitted or renamed."""
+    from reach.optimize import _OptimizationResponse
+
+    with pytest.raises(ValidationError):
+        _OptimizationResponse.model_validate_json('{"rewrites": []}')
+
+    resp = _OptimizationResponse.model_validate_json(
+        '{"candidates": [{"description": "Valid candidate"}]}'
+    )
+    assert len(resp.candidates) == 1
+    assert resp.candidates[0].description == "Valid candidate"

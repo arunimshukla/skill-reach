@@ -24,7 +24,7 @@ This project adheres to [Google's Open Source Community Guidelines](https://open
 ## Development Workflow & Local Verification
 
 1. Fork the repository and create a dedicated feature branch for your changes.
-1. Install dependencies with `uv sync --all-groups`.
+1. Install Python dependencies with `uv sync --all-groups` and Node tools with `npm install`.
 1. Follow Test-Driven Development (TDD), adding tests in `tests/` for all bug fixes and features.
 1. Run the full local pre-flight suite before opening your pull request:
 
@@ -32,14 +32,18 @@ This project adheres to [Google's Open Source Community Guidelines](https://open
 # 1. Run the test suite
 uv run pytest -q
 
-# 2. Lint and format checks
+# 2. Python lint and format checks
 uv run ruff check .
 uv run ruff format --check .
 
 # 3. Static type checks
 uvx ty check
 
-# 4. Strict documentation build
+# 4. Web assets and markdown formatting checks
+npx @biomejs/biome ci
+npx prettier --check "**/*.md"
+
+# 5. Strict documentation build
 uv run mkdocs build --strict
 ```
 

@@ -372,6 +372,7 @@ def test_optimize_description_heuristics_via_cli(
             "--candidates",
             "2",
             "--auto-apply",
+            "--force",
             "--agent",
             "keyword",
         ]

@@ -1,0 +1,160 @@
+<!-- Copyright 2026 Google LLC
+  --
+  -- Licensed under the Apache License, Version 2.0 (the "License");
+  -- you may not use this file except in compliance with the License.
+  -- You may obtain a copy of the License at
+  --
+  --      http://www.apache.org/licenses/LICENSE-2.0
+  --
+  -- Unless required by applicable law or agreed to in writing, software
+  -- distributed under the License is distributed on an "AS IS" BASIS,
+  -- WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  -- See the License for the specific language governing permissions and
+  -- limitations under the License.
+  -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Boundary Curation: {skill_name} — reach</title>
+<style>{style}</style>
+</head>
+<body data-target-skill="{target_skill}" data-rivals="{rivals_json}" data-out-of-scope="{out_of_scope}">
+
+<!-- Header Context Card -->
+<div class="skill-context-card">
+  <div class="title-row">
+    <h1>Target Skill: <code id="skill-name">{skill_name}</code></h1>
+    <span class="skill-tag">Skill Boundary Curation</span>
+  </div>
+  <p class="description" id="skill-desc">{skill_desc}</p>
+  {rivals_section}
+</div>
+
+<!-- Control Ribbon & Balance Meter -->
+<div class="control-ribbon">
+  <div class="balance-section">
+    <div class="balance-labels">
+      <span>Catalog Boundary Balance</span>
+      <span id="summary">{summary}</span>
+    </div>
+    <div class="balance-bar">
+      <div
+        class="balance-fill-triggers"
+        id="balance-triggers"
+        style="width: {trig_pct}%;"
+      ></div>
+      <div
+        class="balance-fill-guardrails"
+        id="balance-guardrails"
+        style="width: {guard_pct}%;"
+      ></div>
+    </div>
+  </div>
+  <div class="action-buttons">
+    <button type="button" class="btn btn-outlined" onclick="exportEvalSetJson()">Export Set</button>
+    <button
+      type="button"
+      class="btn btn-primary approve-btn"
+      id="approve-btn"
+      onclick="approveQueries()"
+    >
+      <span>Approve &amp; Run Probes</span>
+      <kbd class="btn-kbd">Ctrl/⌘↵</kbd>
+    </button>
+  </div>
+</div>
+
+<!-- Hotkey Guide -->
+<div class="hotkey-bar">
+  <span>Shortcuts:</span>
+  <span><kbd>J</kbd> / <kbd>K</kbd> Navigate cards</span>
+  <span><kbd>Space</kbd> / <kbd>T</kbd> Swap Territory (⇄)</span>
+  <span><kbd>Enter</kbd> Edit query</span>
+  <span><kbd>⌫</kbd> Delete</span>
+  <span><kbd>Ctrl/⌘↵</kbd> Approve</span>
+</div>
+
+<!-- Split Territory Board -->
+<div class="territory-board">
+  <!-- In-Scope Territory Column -->
+  <div class="territory-column">
+    <div class="column-header triggers-header">
+      <div class="column-title-group">
+        <span class="column-title">In-Scope Territory</span>
+        <span class="count-badge triggers-count" id="triggers-count">
+          {triggers_count} Triggers
+        </span>
+      </div>
+      <button
+        type="button"
+        class="btn btn-tonal btn-sm"
+        id="triggers-add-btn"
+        onclick="addRow('', true)"
+      >+ Add Trigger</button>
+    </div>
+    <div class="column-subtitle">
+      Prompts that <strong>MUST</strong> route to <code>{target_skill}</code>
+    </div>
+    <div class="card-list" id="triggers-list">
+      {triggers_cards}
+      <div id="triggers-empty" class="card-list empty" style="{trig_empty_style}">
+        No trigger queries. Click <strong>+ Add Trigger</strong> to create one.
+      </div>
+    </div>
+  </div>
+
+  <!-- Neighbor Guardrails Column -->
+  <div class="territory-column">
+    <div class="column-header guardrails-header">
+      <div class="column-title-group">
+        <span class="column-title">Neighbor Guardrails &amp; Rivals</span>
+        <span class="count-badge guardrails-count" id="guardrails-count">
+          {guardrails_count} Guardrails
+        </span>
+      </div>
+      <button
+        type="button"
+        class="btn btn-tonal btn-sm"
+        id="guardrails-add-btn"
+        onclick="addRow('', false)"
+      >+ Add Guardrail</button>
+    </div>
+    <div class="column-subtitle">
+      Prompts that <strong>MUST CEDE</strong> to rival skills or general out-of-scope
+    </div>
+    <div class="card-list" id="guardrails-list">
+      {guardrails_cards}
+      <div id="guardrails-empty" class="card-list empty" style="{guard_empty_style}">
+        No guardrail queries. Click <strong>+ Add Guardrail</strong> to protect boundaries.
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Unified Empty State -->
+<div class="empty-state-card" id="empty-state" style="{empty_style}">
+  <h3>No Queries in Review Set</h3>
+  <p style="margin-top: 0.5rem; font-size: 0.9rem;">
+    Add at least one trigger or guardrail query above before approving.
+  </p>
+</div>
+
+<!-- Bottom Action Bar -->
+<div style="display: flex; justify-content: flex-end; margin-top: 1.5rem;">
+  <button
+    type="button"
+    class="btn btn-primary approve-btn"
+    id="approve-btn-bottom"
+    onclick="approveQueries()"
+  >
+    <span>Approve &amp; Run Probes</span>
+    <kbd class="btn-kbd">⌘↵</kbd>
+  </button>
+</div>
+<div class="status-bar" id="status-bar"></div>
+
+<script>{script}</script>
+</body>
+</html>

@@ -104,7 +104,7 @@ Empirically probe agent runtimes to score selection accuracy, recall, and confid
 
 ### Description Optimization ([`reach optimize`](cli/optimize.md))
 
-Synthesize, benchmark, and apply candidate rewrites that disambiguate rival skills.
+Synthesize, benchmark, and apply candidate rewrites that disambiguate rival skills with multi-round hill climbing, holdout validation, and query boundary curation.
 
 ### CI Gates ([`reach check`](cli/check.md))
 

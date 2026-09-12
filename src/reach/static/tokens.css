@@ -1,0 +1,79 @@
+/* Copyright 2026 Google LLC
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+:root {
+  /* Google Design System Colors */
+  --reach-primary: #0b57d0;
+  --reach-primary-hover: #0842a0;
+  --reach-primary-container: #e8f0fe;
+  --reach-primary-container-hover: #d3e3fd;
+  --reach-on-primary: #ffffff;
+  --reach-on-primary-container: #041e49;
+  --reach-secondary: #00639b;
+  --reach-secondary-container: #c2e7ff;
+  --reach-on-secondary-container: #001d35;
+
+  --reach-surface-background: #f8f9fa;
+  --reach-surface: #ffffff;
+  --reach-surface-variant: #f0f4f9;
+  --reach-surface-container-low: #f8fafd;
+  --reach-surface-container-alt: #f4f5f8;
+  --reach-surface-container-high: #e9eef6;
+  --reach-surface-container-highest: #e1e3e1;
+  --reach-on-surface: #1f1f1f;
+  --reach-on-surface-variant: #444746;
+  --reach-outline: #747775;
+  --reach-outline-variant: #e0e2ec;
+  --reach-divider: #f1f3f4;
+  --reach-muted: #5f6368;
+  --reach-dim: #80868b;
+
+  /* Semantic Routing Colors */
+  --reach-success-bg: #e6f4ea;
+  --reach-success-text: #137333;
+  --reach-error-bg: #fce8e6;
+  --reach-error-text: #b3261e;
+  --reach-on-error: #ffffff;
+  --reach-on-error-container: #410e0b;
+  --reach-guardrail-accent: #6750a4;
+
+  /* Corner Radius Scale */
+  --reach-radius-sm: 4px;
+  --reach-radius-md: 8px;
+  --reach-radius-lg: 12px;
+  --reach-radius-xl: 16px;
+  --reach-radius-full: 9999px;
+
+  /* Spacing Scale */
+  --reach-spacing-xs: 4px;
+  --reach-spacing-sm: 8px;
+  --reach-spacing-md: 16px;
+  --reach-spacing-lg: 24px;
+  --reach-spacing-xl: 32px;
+
+  /* Typography */
+  --reach-font-headline: "Google Sans", Roboto, -apple-system, BlinkMacSystemFont, sans-serif;
+  --reach-font-body: Roboto, "Google Sans Text", -apple-system, BlinkMacSystemFont, sans-serif;
+  --reach-font-text: "Google Sans Text", Roboto, sans-serif;
+  --reach-font-mono: "Roboto Mono", "Google Sans Mono", ui-monospace, Menlo, monospace;
+
+  /* Elevation & Shadows */
+  --reach-shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.03);
+  --reach-shadow-md: 0 1px 3px rgba(0, 0, 0, 0.05);
+  --reach-shadow-lg: 0 2px 6px rgba(0, 0, 0, 0.06);
+
+  /* Transitions */
+  --reach-transition: all 0.15s ease;
+}

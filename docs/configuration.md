@@ -118,6 +118,12 @@ unbounded-attractor = "warn"
 [optimize]
 budget = 30
 temperature = 0.7
+iterations = 1
+holdout = 0.2
+review = false
+auto_queries = true
+adversarial_count = 5
+positive_count = 5
 
 # ==============================================================================
 # Lexical Overlap & Vocabulary Rewrite Heuristics
@@ -379,10 +385,18 @@ Parameters for synthetic query drafting and leakage detection.
 
 Parameters for closed-loop skill description optimization.
 
-| Key           | Type    | Default | Description                                                            |
-| :------------ | :------ | :------ | :--------------------------------------------------------------------- |
-| `budget`      | Integer | `30`    | Maximum empirical probe budget allocated across candidate evaluations. |
-| `temperature` | Float   | `0.7`   | Sampling temperature for candidate rewrite generation.                 |
+| Key                 | Type    | Default | Description                                                                   |
+| :------------------ | :------ | :------ | :---------------------------------------------------------------------------- |
+| `budget`            | Integer | `30`    | Maximum empirical probe budget allocated across candidate evaluations.        |
+| `temperature`       | Float   | `0.7`   | Sampling temperature for candidate rewrite generation.                        |
+| `iterations`        | Integer | `1`     | Number of iterative hill-climbing refinement rounds (1-10).                   |
+| `holdout`           | Float   | `0.2`   | Fraction of queries held out for generalization validation (`0.0` - `0.9`).   |
+| `review`            | Boolean | `false` | Launch interactive browser boundary review for drafted queries before probes. |
+| `auto_queries`      | Boolean | `true`  | Automatically synthesize positive and adversarial queries when none provided. |
+| `adversarial_count` | Integer | `5`     | Number of adversarial negative near-miss queries to synthesize per round.     |
+| `positive_count`    | Integer | `5`     | Number of positive in-scope trigger queries to synthesize per round.          |
+| `seed`              | Integer | `42`    | Pseudo-random seed for train/test query splitting and reproducible runs.      |
+| `review_timeout`    | Float   | `600.0` | Maximum timeout in seconds waiting for interactive browser query review.      |
 
 ### [registry]
 
