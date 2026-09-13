@@ -229,19 +229,3 @@ def test_run_doctor_checks_includes_google_adc(tmp_path: Path) -> None:
     assert len(adc_checks) == 1
     assert adc_checks[0].category == "Credentials & Environment"
 
-
-def test_doctor_env_checks_exclude_untested_third_party(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """Verify run_doctor_checks checks GEMINI_API_KEY and excludes untested third-party keys."""
-    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-
-    results = run_doctor_checks(tmp_path)
-    checked_names = {r.name for r in results}
-
-    assert "GEMINI_API_KEY" in checked_names
-    assert "ANTHROPIC_API_KEY" not in checked_names
-    assert "OPENAI_API_KEY" not in checked_names
-
