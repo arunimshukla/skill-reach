@@ -19,7 +19,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from reach.models import Catalog, CatalogMode, Skill
-from reach.runtime.keyword import KeywordOptions, KeywordRuntime
+from reach.runtime.keyword import KeywordGenerator, KeywordOptions, KeywordRuntime
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -128,3 +128,30 @@ def test_keyword_runtime_parse_stream_extracts_skill() -> None:
     assert summary.invoked_skill == "cloud-sql"
     assert summary.invoked_skills == ("cloud-sql",)
     assert summary.saw_result
+
+
+def test_keyword_runtime_match_skill_helper() -> None:
+    """Verify match_skill correctly matches skills and handles empty or missing inputs."""
+    runtime = KeywordRuntime()
+    runtime._set_resident(("cloud-run", "cloud-sql"))
+
+    # Matches resident skill
+    assert runtime.match_skill("Deploy app to cloud-run") == "cloud-run"
+    assert runtime.match_skill("Query database using cloud sql") == "cloud-sql"
+
+    # Dynamic resident override
+    assert runtime.match_skill("Use bigquery storage", resident=("bigquery",)) == "bigquery"
+
+    # Non-matches and empty cases
+    assert runtime.match_skill("Unrelated query") is None
+    assert runtime.match_skill("") is None
+    assert runtime.match_skill("cloud-run", resident=()) is not None
+    empty_runtime = KeywordRuntime()
+    assert empty_runtime.match_skill("cloud-run") is None
+
+
+def test_keyword_generator_complete() -> None:
+    """Verify KeywordGenerator complete returns empty string and increments counter."""
+    generator = KeywordGenerator()
+    assert generator.complete("hello") == ""
+    assert generator.completions == 1

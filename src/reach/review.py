@@ -22,6 +22,7 @@ import html
 import http.server
 import json
 import os
+import secrets
 import select
 import socketserver
 import sys
@@ -31,7 +32,7 @@ import urllib.parse
 import webbrowser
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import TYPE_CHECKING, Annotated, ClassVar, Self, cast, override
+from typing import TYPE_CHECKING, Annotated, Self, cast, override
 
 from reach.models import Query, QueryKind, Skill
 from reach.queries import QuerySet, QuerySetProvenance
@@ -238,6 +239,7 @@ class _ReviewSession:
     """Encapsulate session-specific state for an ephemeral review server."""
 
     html_content: str
+    auth_token: str = field(default_factory=lambda: secrets.token_urlsafe(16))
     done_event: threading.Event = field(default_factory=threading.Event)
     saved_queries: tuple[_ReviewQueryItem, ...] | None = None
     allowed_skills: set[str] = field(default_factory=set)
@@ -245,11 +247,6 @@ class _ReviewSession:
 
 class ReviewServerHandler(http.server.BaseHTTPRequestHandler):
     """Handle HTTP requests for the ephemeral interactive review server."""
-
-    html_content: ClassVar[str] = ""
-    saved_queries: ClassVar[tuple[_ReviewQueryItem, ...] | None] = None
-    done_event: ClassVar[threading.Event | None] = None
-    allowed_skills: ClassVar[set[str]] = set()
 
     def __init__(
         self,
@@ -259,8 +256,8 @@ class ReviewServerHandler(http.server.BaseHTTPRequestHandler):
         *,
         session: _ReviewSession | None = None,
     ) -> None:
-        """Initialize the request handler with an optional bound review session."""
-        self.session = session
+        """Initialize the request handler with a bound review session."""
+        self.session = session if session is not None else _ReviewSession(html_content="")
         super().__init__(request, client_address, server)
 
     def _is_valid_host(self) -> bool:
@@ -278,10 +275,8 @@ class ReviewServerHandler(http.server.BaseHTTPRequestHandler):
     def _is_valid_origin(self) -> bool:
         """Validate Origin header on mutating requests to protect against CSRF."""
         origin = self.headers.get("Origin")
-        if not origin:
-            return True
-        if origin == "null":
-            return True
+        if not origin or origin == "null":
+            return False
         try:
             parsed = urllib.parse.urlsplit(origin)
         except ValueError:
@@ -295,6 +290,10 @@ class ReviewServerHandler(http.server.BaseHTTPRequestHandler):
         """Add defensive security headers to all responses."""
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "DENY")
+        self.send_header(
+            "Content-Security-Policy",
+            "default-src 'self' 'unsafe-inline'; connect-src 'self';",
+        )
 
     def _send_json(self, status: int, payload: object) -> None:
         """Serialize and transmit a JSON response with standard security headers."""
@@ -312,8 +311,18 @@ class ReviewServerHandler(http.server.BaseHTTPRequestHandler):
             self.send_error(403, "Forbidden: Invalid Host header")
             return
 
-        if self.path in ("/", "/index.html"):
-            html_source = self.session.html_content if self.session else self.html_content
+        path_clean = urllib.parse.urlsplit(self.path).path
+        if path_clean in ("/", "/index.html"):
+            if not self._is_valid_token():
+                self.send_error(403, "Forbidden: Invalid or missing session token")
+                return
+            html_source = self.session.html_content
+            token = self.session.auth_token
+            if token and "</head>" in html_source:
+                meta_tag = (
+                    f'<meta name="reach-token" content="{html.escape(token, quote=True)}">\n</head>'
+                )
+                html_source = html_source.replace("</head>", meta_tag, 1)
             encoded = html_source.encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -321,10 +330,21 @@ class ReviewServerHandler(http.server.BaseHTTPRequestHandler):
             self._send_security_headers()
             self.end_headers()
             self.wfile.write(encoded)
-        elif self.path == "/api/status":
+        elif path_clean == "/api/status":
             self._send_json(200, {"status": "running"})
         else:
             self.send_error(404, "Not Found")
+
+    def _is_valid_token(self) -> bool:
+        """Validate ephemeral session authentication token if configured."""
+        expected_token = self.session.auth_token
+        if not expected_token:
+            return True
+        provided_token = self.headers.get("X-Reach-Token")
+        if not provided_token and self.command == "GET":
+            query_params = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            provided_token = query_params.get("token", [None])[0]
+        return bool(provided_token and secrets.compare_digest(provided_token, expected_token))
 
     def do_POST(self) -> None:
         """Receive and validate curated queries from the browser."""
@@ -336,38 +356,39 @@ class ReviewServerHandler(http.server.BaseHTTPRequestHandler):
             self.send_error(403, "Forbidden: Cross-origin request rejected")
             return
 
-        if self.path == "/api/save":
-            try:
-                content_len = int(self.headers.get("Content-Length", 0))
-                if content_len < 0 or content_len > 5 * 1024 * 1024:
-                    msg = "Content-Length must be between 0 and 5MB"
-                    raise ValueError(msg)
-            except (ValueError, TypeError) as exc:
-                self._send_json(400, {"status": "error", "message": str(exc)})
-                return
-
-            post_body = self.rfile.read(content_len)
-            try:
-                data = json.loads(post_body.decode("utf-8"))
-                allowed = self.session.allowed_skills if self.session else self.allowed_skills
-                context = {"allowed_skills": allowed} if allowed else None
-                payload = _ReviewPayload.model_validate(data, context=context)
-            except (json.JSONDecodeError, ValueError) as exc:
-                self._send_json(400, {"status": "error", "message": str(exc)})
-                return
-
-            # Save queries and unblock review loop
-            if self.session is not None:
-                self.session.saved_queries = payload.queries
-                self.session.done_event.set()
-            else:
-                ReviewServerHandler.saved_queries = payload.queries
-                if ReviewServerHandler.done_event:
-                    ReviewServerHandler.done_event.set()
-
-            self._send_json(200, {"status": "ok", "saved": len(payload.queries)})
-        else:
+        path_clean = urllib.parse.urlsplit(self.path).path
+        if path_clean != "/api/save":
             self.send_error(404, "Not Found")
+            return
+
+        if not self._is_valid_token():
+            self.send_error(403, "Forbidden: Invalid or missing session token")
+            return
+
+        try:
+            content_len = int(self.headers.get("Content-Length", 0))
+            if content_len < 0 or content_len > 5 * 1024 * 1024:
+                msg = "Content-Length must be between 0 and 5MB"
+                raise ValueError(msg)
+        except (ValueError, TypeError) as exc:
+            self._send_json(400, {"status": "error", "message": str(exc)})
+            return
+
+        post_body = self.rfile.read(content_len)
+        try:
+            data = json.loads(post_body.decode("utf-8"))
+            allowed = self.session.allowed_skills
+            context = {"allowed_skills": allowed} if allowed else None
+            payload = _ReviewPayload.model_validate(data, context=context)
+        except (json.JSONDecodeError, ValueError) as exc:
+            self._send_json(400, {"status": "error", "message": str(exc)})
+            return
+
+        # Save queries and unblock review loop
+        self.session.saved_queries = payload.queries
+        self.session.done_event.set()
+
+        self._send_json(200, {"status": "ok", "saved": len(payload.queries)})
 
     @override
     def log_message(self, format: str, *args: object) -> None:
@@ -440,7 +461,7 @@ def launch_query_review(
         cast(type[http.server.BaseHTTPRequestHandler], handler),
     )
     server_port = server.server_port
-    url = f"http://127.0.0.1:{server_port}"
+    url = f"http://127.0.0.1:{server_port}/?token={session.auth_token}"
 
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
     server_thread.start()

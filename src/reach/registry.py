@@ -34,6 +34,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from reach._io import atomic_write_text
 from reach.config import resolve_path
 from reach.models import Skill
+from reach.runtime._fs import ensure_private_directory
 
 __all__ = [
     "AuthenticationError",
@@ -463,7 +464,6 @@ def _safe_resolve_subpath(
     *segments: tuple[str, str],
     disallow_separators: bool = False,
     fallbacks: dict[str, str] | None = None,
-    empty_error_suffix: str = "",
 ) -> Path:
     """Resolve and validate a relative subpath under a root directory.
 
@@ -472,7 +472,6 @@ def _safe_resolve_subpath(
         *segments: Tuples of (value, label) for each path segment.
         disallow_separators: If True, reject values containing path separators or absolute paths.
         fallbacks: Optional mapping of segment label to fallback string when slug is empty.
-        empty_error_suffix: Optional suffix appended to error message when slug is empty.
 
     Returns:
         The validated Path strictly contained within root.
@@ -498,9 +497,6 @@ def _safe_resolve_subpath(
                 slug = fallbacks[label]
             elif disallow_separators:
                 msg = f"Invalid {label} identifier: {value!r} escapes cache directory"
-                raise ValueError(msg)
-            elif empty_error_suffix:
-                msg = f"Invalid {label} {empty_error_suffix}: {value!r}"
                 raise ValueError(msg)
             else:
                 msg = f"Invalid {label} identifier: {value!r}"
@@ -567,7 +563,6 @@ class RegistryCacheManager:
             (skill_name, "skill name"),
             (revision_slug, "revision"),
             fallbacks={"revision": "default"},
-            empty_error_suffix="escapes cache directory",
         )
 
     def get_cached_manifest(
@@ -614,6 +609,7 @@ class RegistryCacheManager:
     def save_manifest(self, manifest: RegistryManifest) -> None:
         """Atomically persist a RegistryManifest to disk."""
         target_path = self.manifest_path(manifest.project, manifest.location, manifest.publisher)
+        ensure_private_directory(target_path.parent)
         atomic_write_text(target_path, manifest.model_dump_json(indent=2) + "\n")
 
     def hydrate_skill_file(
@@ -632,11 +628,13 @@ class RegistryCacheManager:
         Returns:
             Path to the enclosing directory of the hydrated skill.
         """
-        skill_dir = self.skill_dir(
-            project=project,
-            location=location,
-            skill_name=skill_data.identifier,
-            revision_slug=skill_data.revision_slug,
+        skill_dir = ensure_private_directory(
+            self.skill_dir(
+                project=project,
+                location=location,
+                skill_name=skill_data.identifier,
+                revision_slug=skill_data.revision_slug,
+            )
         )
         skill_file = skill_dir / "SKILL.md"
 

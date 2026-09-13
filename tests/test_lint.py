@@ -29,6 +29,7 @@ from reach.lint import (
     lint_file,
     lint_tree,
 )
+from reach.rendering import format_github_annotation
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -359,9 +360,7 @@ def test_format_github_annotation_basic() -> None:
 
 
 def test_format_github_annotation_escapes_newlines_and_percent() -> None:
-    """Verify format_github_annotation encodes newlines and percent signs."""
-    from reach.rendering import format_github_annotation
-
+    """Verify format_github_annotation encodes newlines and percent signs in messages."""
     result = format_github_annotation(
         "warn",
         "First line\nSecond line has 50% rate",
@@ -369,12 +368,25 @@ def test_format_github_annotation_escapes_newlines_and_percent() -> None:
     assert result == "::warning::First line%0ASecond line has 50%25 rate"
 
 
+def test_format_github_annotation_escapes_parameter_delimiters() -> None:
+    """Verify format_github_annotation escapes %, CRLF, colons, and commas in parameter values."""
+    result = format_github_annotation(
+        "error",
+        "Found issue",
+        title="bad:rule,v100%\r\n::workflow-cmd",
+        file="skills/demo:special,v1%0A/SKILL.md",
+    )
+    assert "title=bad%3Arule%2Cv100%25%0D%0A%3A%3Aworkflow-cmd" in result
+    assert "file=skills/demo%3Aspecial%2Cv1%250A/SKILL.md" in result
+    # Ensure raw unescaped delimiters do not split parameters or commands
+    assert "\r" not in result
+    assert "\n" not in result
+
+
 def test_format_github_annotation_converts_absolute_workspace_path_to_relative(
     tmp_path: Path,
 ) -> None:
     """Verify format_github_annotation converts absolute file paths under root to relative paths."""
-    from reach.rendering import format_github_annotation
-
     workspace = tmp_path / "repo"
     skill_file = workspace / "skills" / "demo" / "SKILL.md"
     result = format_github_annotation(

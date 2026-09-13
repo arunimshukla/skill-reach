@@ -283,10 +283,19 @@ async function approveQueries() {
   }
   setStatus('Saving queries and resuming optimizer in terminal...');
 
+  const token =
+    document.querySelector('meta[name="reach-token"]')?.content ||
+    new URLSearchParams(window.location.search).get('token') ||
+    '';
+  const headers = { 'Content-Type': 'application/json' };
+  if (token) {
+    headers['X-Reach-Token'] = token;
+  }
+
   try {
     const resp = await fetch('/api/save', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: headers,
       body: JSON.stringify({ queries: queries }),
     });
     if (resp.ok) {

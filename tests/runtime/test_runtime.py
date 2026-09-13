@@ -17,6 +17,8 @@
 from __future__ import annotations
 
 import contextlib
+import json
+import os
 import subprocess
 import tomllib
 from collections.abc import Callable, Iterable, Sequence
@@ -24,7 +26,6 @@ from pathlib import Path
 from typing import Any, cast, override
 
 import pytest
-from pydantic import BaseModel
 from pydantic import ValidationError as PydanticValidationError
 
 from reach.catalog import build_catalogs, load_skills
@@ -51,10 +52,13 @@ from reach.runtime import (
     find_agent_for_model,
     known_agents,
     options_model,
+    resolve_options,
     runtime_class,
 )
 from reach.runtime._env import (
     apply_provider_api_key,
+    sanitize_subprocess_env,
+    sync_claude_settings_env,
     sync_google_and_gemini_keys,
 )
 from reach.runtime._fs import (
@@ -69,13 +73,13 @@ from reach.runtime._subprocess import (
     format_subprocess_error,
     process_failure_reason,
 )
-from reach.runtime.fake import FakeGenerator, FakeRuntime
+from reach.runtime.fake import FakeGenerator, FakeOptions, FakeRuntime
 from reach.runtime.profiles import model_profile
 
 from .conftest import MINIMAL_OPTIONS
 from .conftest import build_agent as _build_agent
 
-_EXECUTION_AGENTS = tuple(a for a in known_agents() if a not in ("keyword", "fake"))
+_KEY_SYNC_AGENTS = ("antigravity-cli", "antigravity-sdk", "goose", "pi")
 
 
 def test_agent_runtime_cannot_be_instantiated_directly() -> None:
@@ -104,8 +108,7 @@ def _assert_runtime_attributes(runtime: AgentRuntime, agent: str) -> None:
     profile = agent_profiles().get(agent)
     if profile is not None and profile.skills_dir:
         assert runtime.skills_subpath == profile.skills_dir
-    assert hasattr(runtime, "options")
-    assert isinstance(runtime.options, BaseModel)
+    assert isinstance(runtime.options, AgentOptions)
 
 
 def _assert_runtime_interface(runtime: AgentRuntime, tmp_path: Path) -> None:
@@ -179,13 +182,12 @@ def test_an_unknown_agent_names_the_alternatives() -> None:
         assert agent in err_msg
 
 
-def test_the_agent_carries_the_configured_model() -> None:
-    """Verify configured model string is stored on constructed runtime instance."""
-    assert build_runtime(RuntimeSettings(options={"model": "haiku"})).model == "haiku"
-    keyword_runtime = build_runtime(
-        RuntimeSettings(agent="keyword", options={"model": "haiku"}),
-    )
-    assert keyword_runtime.model == "haiku"
+@pytest.mark.parametrize("agent", known_agents())
+def test_the_agent_carries_the_configured_model(agent: str) -> None:
+    """Verify configured model string is stored on constructed instance across all agents."""
+    rt = build_runtime(RuntimeSettings(agent=agent, options={"model": "haiku"}))
+    assert rt.model == "haiku"
+    assert rt.options.model == "haiku"
 
 
 def test_two_agents_make_the_seam_real() -> None:
@@ -227,40 +229,21 @@ def test_install_rejects_a_catalog_naming_an_unloaded_skill(
 
 
 def test_the_fake_reports_the_catalog_it_was_given(catalog, skills, tmp_path) -> None:
-    """Verify FakeRuntime observed_catalog matches installed catalog skills."""
+    """Verify FakeRuntime observed_catalog and invoked_skills match installed catalog skills."""
     runtime = FakeRuntime({"q": "a"})
     runtime.install(catalog, skills, tmp_path)
-    assert runtime.select("q", tmp_path).observed_catalog == ("a", "b")
+    outcome = runtime.select("q", tmp_path)
+    assert outcome.observed_catalog == ("a", "b")
+    assert outcome.invoked_skills == ("a",)
 
 
 def test_the_fake_abstains_on_anything_unscripted(catalog, skills, tmp_path) -> None:
-    """Verify FakeRuntime returns None for unscripted queries."""
+    """Verify FakeRuntime returns None and empty invoked_skills for unscripted queries."""
     runtime = FakeRuntime({"scripted": "a"})
     runtime.install(catalog, skills, tmp_path)
-    assert runtime.select("unscripted", tmp_path).invoked_skill is None
-
-
-def test_selection_outcome_carries_no_invocations_by_default() -> None:
-    """Verify default SelectionOutcome initializes with empty invoked_skills tuple."""
-    assert SelectionOutcome().invoked_skills == ()
-
-
-def test_the_fake_names_its_one_selection_in_invoked_skills_too(
-    catalog,
-    skills,
-    tmp_path,
-) -> None:
-    """Verify FakeRuntime mirrors invoked_skill into invoked_skills tuple."""
-    runtime = FakeRuntime({"q": "a"})
-    runtime.install(catalog, skills, tmp_path)
-    assert runtime.select("q", tmp_path).invoked_skills == ("a",)
-
-
-def test_the_fakes_abstention_carries_no_invocations(catalog, skills, tmp_path) -> None:
-    """Verify FakeRuntime abstention produces empty invoked_skills tuple."""
-    runtime = FakeRuntime({"scripted": "a"})
-    runtime.install(catalog, skills, tmp_path)
-    assert runtime.select("unscripted", tmp_path).invoked_skills == ()
+    outcome = runtime.select("unscripted", tmp_path)
+    assert outcome.invoked_skill is None
+    assert outcome.invoked_skills == ()
 
 
 def test_a_scripted_outcome_can_override_residency(catalog, skills, tmp_path) -> None:
@@ -382,8 +365,9 @@ def test_every_agent_supports_prompt_budget_query(agent: str) -> None:
 
 
 def test_fake_generator_custom_completion() -> None:
-    """Verify FakeGenerator complete supports custom responses and tracks counts."""
-    generator = FakeGenerator(completion="custom completion response")
+    """Verify FakeGenerator supports completions, budget override, and tracks counts."""
+    generator = FakeGenerator(completion="custom completion response", prompt_budget_chars=500)
+    assert generator.prompt_budget_chars() == 500
     assert generator.complete("prompt 1") == "custom completion response"
     assert generator.complete("prompt 2") == "custom completion response"
     assert generator.completions == 2
@@ -629,7 +613,7 @@ def test_install_places_only_catalog_members(
     skills_dir = runtime.skills_dir(workdir)
     installed = sorted(p.name for p in skills_dir.iterdir())
     assert installed == ["gcs-lifecycle-rules", "gcs-retention-policy"]
-    assert getattr(runtime, "_resident", None) == catalog.skills
+    assert runtime._resident == catalog.skills
 
 
 @pytest.mark.parametrize("agent", known_agents())
@@ -738,6 +722,153 @@ def test_install_skills_rejects_path_traversal(
         install_skills(catalog, by_name, dest)
 
 
+def test_install_skills_rejects_escaping_symlink(
+    tmp_path: Path,
+) -> None:
+    """Verify install_skills raises ValueError if a skill contains an escaping symlink."""
+    skill_dir = tmp_path / "evil_skill"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: evil-skill\ndescription: Evil.\n---\nBody",
+        encoding="utf-8",
+    )
+    secret_file = tmp_path / "secret.txt"
+    secret_file.write_text("super_secret", encoding="utf-8")
+    leak_link = skill_dir / "leak"
+    leak_link.symlink_to(secret_file)
+
+    skill = Skill(name="evil-skill", description="Evil", path=skill_dir)
+    catalog = Catalog(id="c", mode=CatalogMode.SINGLETON, skills=("evil-skill",))
+    by_name = {"evil-skill": skill}
+    dest = tmp_path / "installed_skills"
+
+    with pytest.raises(ValueError, match="escaping skill directory"):
+        install_skills(catalog, by_name, dest)
+
+
+def test_install_skills_rejects_escaping_relative_symlink(
+    tmp_path: Path,
+) -> None:
+    """Verify install_skills detects and rejects relative escaping symlinks."""
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    secret_file = repo_dir / "secret.env"
+    secret_file.write_text("API_KEY=leak", encoding="utf-8")
+
+    skills_root = repo_dir / "skills"
+    skill_dir = skills_root / "subdir" / "escaping-skill"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: escaping-skill\ndescription: Traversal.\n---\nBody",
+        encoding="utf-8",
+    )
+    escape_link = skill_dir / "escape_link"
+    escape_link.symlink_to(Path("../../../secret.env"))
+
+    skill = Skill(name="escaping-skill", description="Traversal", path=skill_dir)
+    catalog = Catalog(id="c", mode=CatalogMode.SINGLETON, skills=("escaping-skill",))
+    by_name = {"escaping-skill": skill}
+    dest = tmp_path / "dest"
+
+    with pytest.raises(ValueError, match="escaping skill directory"):
+        install_skills(catalog, by_name, dest)
+
+
+def test_install_skills_rejects_broken_internal_symlink(
+    tmp_path: Path,
+) -> None:
+    """Verify install_skills rejects broken intra-directory symlinks."""
+    skill_dir = tmp_path / "broken_symlink_skill"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: broken-skill\ndescription: Broken.\n---\nBody",
+        encoding="utf-8",
+    )
+    broken_link = skill_dir / "missing_target"
+    broken_link.symlink_to(skill_dir / "non_existent.txt")
+
+    skill = Skill(name="broken-skill", description="Broken", path=skill_dir)
+    catalog = Catalog(id="c", mode=CatalogMode.SINGLETON, skills=("broken-skill",))
+    by_name = {"broken-skill": skill}
+    dest = tmp_path / "installed_skills"
+
+    with pytest.raises(ValueError, match="broken or cyclical symlink"):
+        install_skills(catalog, by_name, dest)
+
+
+def test_install_skills_rejects_self_referential_symlink(
+    tmp_path: Path,
+) -> None:
+    """Verify install_skills rejects self-referential symlinks resolving to skill root."""
+    skill_dir = tmp_path / "recursive_symlink_skill"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: loop-skill\ndescription: Loop.\n---\nBody",
+        encoding="utf-8",
+    )
+    loop_link = skill_dir / "loop"
+    loop_link.symlink_to(Path())
+
+    skill = Skill(name="loop-skill", description="Loop", path=skill_dir)
+    catalog = Catalog(id="c", mode=CatalogMode.SINGLETON, skills=("loop-skill",))
+    by_name = {"loop-skill": skill}
+    dest = tmp_path / "installed_skills"
+
+    with pytest.raises(ValueError, match="escaping skill directory"):
+        install_skills(catalog, by_name, dest)
+
+
+def test_install_skills_rejects_internal_directory_cycle(
+    tmp_path: Path,
+) -> None:
+    """Verify install_skills rejects symlinks pointing to an enclosing ancestor directory."""
+    skill_dir = tmp_path / "cycle_symlink_skill"
+    sub_dir = skill_dir / "nested" / "deep"
+    sub_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: cycle-skill\ndescription: Cycle.\n---\nBody",
+        encoding="utf-8",
+    )
+    cycle_link = sub_dir / "back_to_nested"
+    cycle_link.symlink_to(Path(".."))
+
+    skill = Skill(name="cycle-skill", description="Cycle", path=skill_dir)
+    catalog = Catalog(id="c", mode=CatalogMode.SINGLETON, skills=("cycle-skill",))
+    by_name = {"cycle-skill": skill}
+    dest = tmp_path / "installed_skills"
+
+    with pytest.raises(ValueError, match="escaping skill directory"):
+        install_skills(catalog, by_name, dest)
+
+
+def test_install_skills_allows_valid_internal_symlinks(
+    tmp_path: Path,
+) -> None:
+    """Verify install_skills cleanly installs skills with valid intra-directory symlinks."""
+    skill_dir = tmp_path / "valid_symlink_skill"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: symlink-skill\ndescription: Symlink skill.\n---\nBody",
+        encoding="utf-8",
+    )
+    docs_dir = skill_dir / "docs"
+    docs_dir.mkdir()
+    (docs_dir / "guide.md").write_text("Valid guide documentation.", encoding="utf-8")
+    internal_link = skill_dir / "README.md"
+    internal_link.symlink_to(docs_dir / "guide.md")
+
+    skill = Skill(name="symlink-skill", description="Symlink skill", path=skill_dir)
+    catalog = Catalog(id="c", mode=CatalogMode.SINGLETON, skills=("symlink-skill",))
+    by_name = {"symlink-skill": skill}
+    dest = tmp_path / "installed_skills"
+
+    installed = install_skills(catalog, by_name, dest)
+    assert "symlink-skill" in installed
+    installed_skill = dest / "symlink-skill"
+    assert (installed_skill / "SKILL.md").exists()
+    assert (installed_skill / "README.md").exists()
+
+
 @pytest.mark.parametrize("agent", known_agents())
 def test_install_uses_symlinks_by_default(
     agent: str,
@@ -813,7 +944,7 @@ def test_prompt_budget_uses_default_for_unregistered_model(agent: str) -> None:
     assert gen.prompt_budget_chars() == 4_194_304
 
 
-@pytest.mark.parametrize("agent", _EXECUTION_AGENTS)
+@pytest.mark.parametrize("agent", [a for a in known_agents() if agent_default_model(a)])
 def test_prompt_budget_is_measured_for_recognized_models(agent: str) -> None:
     """Verify prompt_budget_chars returns positive integer for registered model profiles."""
     gen = build_text_generator(agent=agent)
@@ -1075,9 +1206,9 @@ def test_cli_options_helpers() -> None:
     assert opts_empty.api_key_args("--api-key") == []
 
 
-@pytest.mark.parametrize("agent", _EXECUTION_AGENTS)
-def test_cli_agent_shared_options_conformance(agent: str, tmp_path: Path) -> None:
-    """Verify all CLI agents expose common options and properties uniformly."""
+@pytest.mark.parametrize("agent", known_agents())
+def test_all_agents_shared_options_conformance(agent: str, tmp_path: Path) -> None:
+    """Verify all agent drivers expose common options and properties uniformly."""
     rt = _build_agent(
         agent,
         tmp_path,
@@ -1121,11 +1252,9 @@ def test_all_agents_default_performance_and_isolation_options(agent: str, tmp_pa
     assert rt.use_symlinks is True
     assert rt.isolate_config_dir is True
     assert rt.auto_clean is False
-    opts = getattr(rt, "options", None)
-    assert opts is not None
-    assert opts.use_symlinks is True
-    assert opts.isolate_config_dir is True
-    assert opts.auto_clean is False
+    assert rt.options.use_symlinks is True
+    assert rt.options.isolate_config_dir is True
+    assert rt.options.auto_clean is False
 
 
 @pytest.mark.parametrize("agent", known_agents())
@@ -1144,11 +1273,9 @@ def test_all_agents_configurable_performance_and_isolation_options(
     assert rt.use_symlinks is False
     assert rt.isolate_config_dir is False
     assert rt.auto_clean is True
-    opts = getattr(rt, "options", None)
-    assert opts is not None
-    assert opts.use_symlinks is False
-    assert opts.isolate_config_dir is False
-    assert opts.auto_clean is True
+    assert rt.options.use_symlinks is False
+    assert rt.options.isolate_config_dir is False
+    assert rt.options.auto_clean is True
 
 
 @pytest.mark.parametrize("agent", known_agents())
@@ -1160,14 +1287,13 @@ def test_all_agents_select_invokes_post_probe(
 ) -> None:
     """Verify select invokes post_probe lifecycle hook upon completion across all agents."""
     mock_subprocess(stdout="")
-    if agent == "antigravity-sdk":
-        sdk_cls = runtime_class(agent)
-        assert sdk_cls is not None
+    rt_cls = runtime_class(agent)
+    if rt_cls is not None and hasattr(rt_cls, "_select_async"):
 
         async def _mock_select_async(*_args: Any, **_kwargs: Any) -> SelectionOutcome:
             return SelectionOutcome()
 
-        monkeypatch.setattr(sdk_cls, "_select_async", _mock_select_async)
+        monkeypatch.setattr(rt_cls, "_select_async", _mock_select_async)
 
     runtime = _build_agent(agent, tmp_path)
     called_workdirs: list[Path] = []
@@ -1187,7 +1313,7 @@ def test_all_agents_select_invokes_post_probe(
 
 @pytest.mark.parametrize(
     "agent",
-    [a for a in _EXECUTION_AGENTS if a != "claude-code"],
+    _KEY_SYNC_AGENTS,
 )
 def test_agent_build_env_synchronizes_google_and_gemini_keys(
     agent: str,
@@ -1208,6 +1334,201 @@ def test_agent_build_env_synchronizes_google_and_gemini_keys(
     env2 = rt2.build_env()
     assert env2["GEMINI_API_KEY"] == "google-secret"
     assert env2["GOOGLE_API_KEY"] == "google-secret"
+
+
+@pytest.mark.parametrize(
+    "agent",
+    known_agents(),
+)
+def test_agent_build_env_sanitizes_ambient_sensitive_variables(
+    agent: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify build_env strips ambient sensitive credentials from child process environment."""
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "unwanted-aws-secret")
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_unwanted_token")
+    monkeypatch.setenv("SSH_AUTH_SOCK", str(tmp_path / "ssh.sock"))
+    monkeypatch.setenv("GEMINI_API_KEY", "valid-key")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "valid-key")
+    monkeypatch.setenv("OPENAI_API_KEY", "valid-key")
+    rt = _build_agent(agent, tmp_path)
+    env = rt.build_env()
+    assert "AWS_SECRET_ACCESS_KEY" not in env
+    assert "GITHUB_TOKEN" not in env
+    assert "SSH_AUTH_SOCK" not in env
+    assert env.get("ANTHROPIC_API_KEY") == "valid-key"
+    assert env.get("OPENAI_API_KEY") == "valid-key"
+
+
+def test_sanitize_subprocess_env_custom_override() -> None:
+    """Verify sanitize_subprocess_env with explicit blocked_env_vars overrides defaults."""
+    k_aws = "AWS_SECRET_ACCESS_KEY"
+    k_gh = "GITHUB_TOKEN"
+    env = {
+        k_aws: "val-1",
+        k_gh: "val-2",
+        "CUSTOM_VAR": "val-3",
+    }
+    # Only CUSTOM_VAR should be stripped
+    result = sanitize_subprocess_env(dict(env), blocked_env_vars=("CUSTOM_VAR",))
+    assert "CUSTOM_VAR" not in result
+    assert result[k_aws] == env[k_aws]
+    assert result[k_gh] == env[k_gh]
+
+    # Empty tuple means nothing is stripped
+    result_empty = sanitize_subprocess_env(dict(env), blocked_env_vars=())
+    assert result_empty == env
+
+
+@pytest.mark.parametrize(
+    "agent",
+    [
+        "antigravity-cli",
+        "claude-code",
+        "antigravity-sdk",
+    ],
+)
+def test_agent_build_env_honors_custom_blocked_env_vars(
+    agent: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify build_env honors explicit blocked_env_vars configured in settings."""
+    monkeypatch.setenv("GITHUB_TOKEN", "keep-me")
+    monkeypatch.setenv("CUSTOM_BLOCKED_VAR", "strip-me")
+    settings = RuntimeSettings(
+        agent=agent,
+        blocked_env_vars=("CUSTOM_BLOCKED_VAR",),
+    )
+    rt = build_runtime(settings)
+    env = rt.build_env(tmp_path)
+    assert "CUSTOM_BLOCKED_VAR" not in env
+    assert env.get("GITHUB_TOKEN") == "keep-me"
+
+
+@pytest.mark.parametrize(
+    ("flag_key", "flag_val", "expected_retained"),
+    [
+        ("CLAUDE_CODE_USE_VERTEX", "1", True),
+        ("GOOGLE_GENAI_USE_ENTERPRISE", "true", True),
+        ("CLAUDE_CODE_USE_VERTEX", "0", False),
+        ("OTHER_ENV_VAR", "1", False),
+    ],
+)
+def test_sanitize_subprocess_env_google_application_credentials_exemption(
+    flag_key: str,
+    flag_val: str,
+    *,
+    expected_retained: bool,
+) -> None:
+    """Verify GOOGLE_APPLICATION_CREDENTIALS is preserved under Vertex or Enterprise mode."""
+    env = {
+        "GOOGLE_APPLICATION_CREDENTIALS": "/path/to/sa.json",
+        flag_key: flag_val,
+    }
+    result = sanitize_subprocess_env(env)
+    if expected_retained:
+        assert result.get("GOOGLE_APPLICATION_CREDENTIALS") == "/path/to/sa.json"
+    else:
+        assert "GOOGLE_APPLICATION_CREDENTIALS" not in result
+
+
+def test_sync_claude_settings_env_loads_settings_file(tmp_path: Path) -> None:
+    """Verify sync_claude_settings_env populates environment variables from settings.json."""
+    settings_file = tmp_path / "settings.json"
+    settings_file.write_text(
+        json.dumps(
+            {
+                "env": {
+                    "CLAUDE_CODE_USE_VERTEX": "1",
+                    "ANTHROPIC_VERTEX_PROJECT_ID": "my-vertex-project",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    env: dict[str, str] = {}
+    result = sync_claude_settings_env(env, claude_home=tmp_path)
+    assert result["CLAUDE_CODE_USE_VERTEX"] == "1"
+    assert result["ANTHROPIC_VERTEX_PROJECT_ID"] == "my-vertex-project"
+    assert result["CLOUD_ML_REGION"] == "global"
+
+
+def test_sync_claude_settings_env_preserves_google_application_credentials(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify sync_claude_settings_env restores credentials when Vertex is enabled."""
+    monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", "/path/to/creds.json")
+    settings_file = tmp_path / "settings.json"
+    settings_file.write_text(
+        json.dumps({"env": {"CLAUDE_CODE_USE_VERTEX": "1"}}),
+        encoding="utf-8",
+    )
+    env: dict[str, str] = {}
+    result = sync_claude_settings_env(env, claude_home=tmp_path)
+    assert result["GOOGLE_APPLICATION_CREDENTIALS"] == "/path/to/creds.json"
+    assert result["CLOUD_ML_REGION"] == "global"
+
+
+def test_sync_claude_settings_env_respects_blocked_env_vars(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify sync_claude_settings_env blocks specified credentials even when Vertex is active."""
+    monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", "/path/to/creds.json")
+    settings_file = tmp_path / "settings.json"
+    settings_file.write_text(
+        json.dumps(
+            {
+                "env": {
+                    "CLAUDE_CODE_USE_VERTEX": "1",
+                    "CUSTOM_SECRET": "blocked-value",
+                    "ALLOWED_VAR": "kept-value",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    env: dict[str, str] = {}
+    result = sync_claude_settings_env(
+        env,
+        claude_home=tmp_path,
+        blocked_env_vars=["GOOGLE_APPLICATION_CREDENTIALS", "CUSTOM_SECRET"],
+    )
+    assert result["ALLOWED_VAR"] == "kept-value"
+    assert "CUSTOM_SECRET" not in result
+    assert "GOOGLE_APPLICATION_CREDENTIALS" not in result
+    assert result["CLOUD_ML_REGION"] == "global"
+
+
+def test_sync_claude_settings_env_handles_missing_or_corrupt_file(tmp_path: Path) -> None:
+    """Verify sync_claude_settings_env handles missing or malformed settings.json gracefully."""
+    env = {"EXISTING": "1"}
+    assert sync_claude_settings_env(env, claude_home=tmp_path) == {"EXISTING": "1"}
+
+    bad_file = tmp_path / "settings.json"
+    bad_file.write_text("{not valid json", encoding="utf-8")
+    assert sync_claude_settings_env(env, claude_home=tmp_path) == {"EXISTING": "1"}
+
+
+def test_subprocess_probe_preserves_caller_configured_env(tmp_path: Path) -> None:
+    """Verify run_subprocess_probe preserves explicitly allowed variables in caller env."""
+    from reach.runtime._subprocess import run_subprocess_probe
+
+    caller_env = {
+        "PATH": os.environ.get("PATH", ""),
+        "GITHUB_TOKEN": "custom-permitted-token",
+    }
+    completed, err = run_subprocess_probe(
+        ["echo", "hello"],
+        workdir=tmp_path,
+        env=caller_env,
+    )
+    assert err is None
+    assert completed is not None
+    assert completed.returncode == 0
 
 
 @pytest.mark.parametrize(
@@ -1257,30 +1578,28 @@ def test_cli_generator_receives_prompt(agent: str) -> None:
     assert in_command or gen.name == "claude-code"
 
 
-@pytest.mark.parametrize("agent", cli_agents())
+@pytest.mark.parametrize("agent", [a for a in known_agents() if agent_default_model(a)])
 def test_build_text_generator_resolves_agent_default_model(agent: str) -> None:
     """Verify build_text_generator resolves agent-specific default model when none is passed."""
     expected_model = agent_default_model(agent)
     assert expected_model is not None
     gen = build_text_generator(agent=agent)
     assert gen.model == expected_model
-    opts = getattr(gen, "options", None)
-    if opts is not None and hasattr(opts, "model"):
-        assert opts.model == expected_model
+    assert gen.options.model == expected_model
 
 
 def test_build_text_generator_explicit_model_overrides_agent_default() -> None:
     """Verify explicit model parameter overrides the agent runtime default model."""
     gen = build_text_generator(agent="claude-code", model="claude-opus-5")
     assert gen.model == "claude-opus-5"
-    assert getattr(getattr(gen, "options", None), "model", None) == "claude-opus-5"
+    assert gen.options.model == "claude-opus-5"
 
 
 def test_build_text_generator_options_model_is_respected() -> None:
     """Verify options dictionary model is respected when model argument is omitted."""
     gen = build_text_generator(agent="claude-code", options={"model": "claude-haiku-4-5"})
     assert gen.model == "claude-haiku-4-5"
-    assert getattr(getattr(gen, "options", None), "model", None) == "claude-haiku-4-5"
+    assert gen.options.model == "claude-haiku-4-5"
 
 
 def test_agent_options_inheritance_hierarchy() -> None:
@@ -1855,10 +2174,7 @@ def test_all_cli_agents_conform_to_timeout_handling(
     assert "timeout" in outcome.error.lower() or "timed out" in outcome.error.lower()
 
 
-@pytest.mark.parametrize(
-    "agent",
-    [a for a in known_agents() if a.startswith("antigravity")],
-)
+@pytest.mark.parametrize("agent", antigravity_agents())
 def test_all_antigravity_agents_share_selection_tools(agent: str, tmp_path: Path) -> None:
     """Verify that both Antigravity drivers expose identical selection inspection tools."""
     runtime = _build_agent(agent, tmp_path)
@@ -1866,10 +2182,7 @@ def test_all_antigravity_agents_share_selection_tools(agent: str, tmp_path: Path
     assert runtime.selection_tools == AntigravityRuntime.ANTIGRAVITY_SELECTION_TOOLS
 
 
-@pytest.mark.parametrize(
-    "agent",
-    [a for a in known_agents() if a.startswith("antigravity")],
-)
+@pytest.mark.parametrize("agent", antigravity_agents())
 def test_all_antigravity_agents_conform_to_schema_contract(agent: str, tmp_path: Path) -> None:
     """Verify that Antigravity drivers generate consistent selection schemas."""
     runtime = _build_agent(agent, tmp_path)
@@ -1881,7 +2194,7 @@ def test_all_antigravity_agents_conform_to_schema_contract(agent: str, tmp_path:
     assert "skill-b" in json_schema
 
 
-@pytest.mark.parametrize("agent", list(known_agents()))
+@pytest.mark.parametrize("agent", known_agents())
 def test_all_agents_install_catalog_and_report_skill_roots(
     agent: str,
     tmp_path: Path,
@@ -1905,7 +2218,7 @@ def test_all_agents_install_catalog_and_report_skill_roots(
     assert any(r.path == runtime.skills_dir(target) for r in roots)
 
 
-@pytest.mark.parametrize("agent", list(known_agents()))
+@pytest.mark.parametrize("agent", known_agents())
 def test_all_agents_parse_stream_empty_input(agent: str, tmp_path: Path) -> None:
     """Verify all drivers return a valid SessionSummary without skills for empty stream."""
     runtime = _build_agent(agent, tmp_path)
@@ -2075,6 +2388,122 @@ def test_model_validators_preserve_input_dict_immutability() -> None:
     assert outcome_dict["error"] == "process killed"
 
 
+def test_ensure_private_directory_creates_and_secures(tmp_path: Path) -> None:
+    """Verify ensure_private_directory creates directory with 0o700 permissions on POSIX."""
+    from reach.runtime._fs import ensure_private_directory
+
+    target = tmp_path / "deep" / "nested" / "private_dir"
+    res = ensure_private_directory(target)
+    assert res == target.resolve()
+    assert res.is_dir()
+
+    if os.name == "posix":
+        mode = res.stat().st_mode & 0o777
+        assert mode == 0o700
+
+
+def test_ensure_private_directory_tightens_existing_permissions(tmp_path: Path) -> None:
+    """Verify ensure_private_directory tightens pre-existing loose permissions to 0o700."""
+    from reach.runtime._fs import ensure_private_directory
+
+    target = tmp_path / "preexisting_dir"
+    target.mkdir(mode=0o777)
+    if os.name == "posix":
+        target.chmod(0o755)
+
+    res = ensure_private_directory(target)
+    assert res.is_dir()
+
+    if os.name == "posix":
+        mode = res.stat().st_mode & 0o777
+        assert mode == 0o700
+
+
+def test_ensure_private_directory_accepts_str(tmp_path: Path) -> None:
+    """Verify ensure_private_directory works seamlessly when passed a string path."""
+    from reach.runtime._fs import ensure_private_directory
+
+    target_str = str(tmp_path / "str_dir")
+    res = ensure_private_directory(target_str)
+    assert res.is_dir()
+    assert res == Path(target_str).resolve()
+
+
+def test_ensure_private_directory_tolerates_chmod_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify ensure_private_directory tolerates OSError during chmod without raising."""
+    from reach.runtime._fs import ensure_private_directory
+
+    target = tmp_path / "chmod_fail_dir"
+
+    def _failing_chmod(path: Any, mode: int, **kwargs: Any) -> None:
+        msg = "Operation not permitted"
+        raise OSError(msg)
+
+    monkeypatch.setattr(os, "chmod", _failing_chmod)
+    res = ensure_private_directory(target)
+    assert res.is_dir()
+
+
+def test_runtimes_create_private_isolation_directories(tmp_path: Path) -> None:
+    """Verify runtimes establish private 0o700 isolation directories on POSIX."""
+    from reach.runtime.claude_code import ClaudeCodeRuntime
+    from reach.runtime.goose import GooseRuntime
+    from reach.runtime.pi import PiRuntime
+
+    workdir = tmp_path / "workspace"
+    workdir.mkdir()
+
+    claude = ClaudeCodeRuntime()
+    claude_env = claude.build_env(workdir)
+    claude_cfg = Path(claude_env["CLAUDE_CONFIG_DIR"])
+    assert claude_cfg.is_dir()
+
+    goose = GooseRuntime()
+    goose_env = goose.build_env(workdir)
+    goose_home = Path(goose_env["HOME"])
+    assert goose_home.is_dir()
+
+    pi = PiRuntime()
+    pi_env = pi.build_env(workdir)
+    pi_agent = Path(pi_env["PI_CODING_AGENT_DIR"])
+    assert pi_agent.is_dir()
+
+    if os.name == "posix":
+        assert (claude_cfg.stat().st_mode & 0o777) == 0o700
+        assert (goose_home.stat().st_mode & 0o777) == 0o700
+        assert (pi_agent.stat().st_mode & 0o777) == 0o700
+
+
+def test_registry_cache_manager_creates_private_directories(tmp_path: Path) -> None:
+    """Verify RegistryCacheManager creates private directories when writing manifest or skill."""
+    from datetime import UTC, datetime
+
+    from reach.registry import RegistryCacheManager, RegistryManifest, RegistrySkillData
+
+    cache_dir = tmp_path / "cache"
+    mgr = RegistryCacheManager(cache_root=cache_dir)
+    manifest = RegistryManifest(
+        project="my-proj",
+        location="us-central1",
+        fetched_at=datetime.now(UTC),
+        skills=(),
+    )
+    mgr.save_manifest(manifest)
+
+    manifest_file = mgr.manifest_path("my-proj", "us-central1")
+    assert manifest_file.is_file()
+    if os.name == "posix":
+        assert (manifest_file.parent.stat().st_mode & 0o777) == 0o700
+
+    skill_data = RegistrySkillData(name="projects/my-proj/locations/us-central1/skills/demo")
+    skill_dir = mgr.hydrate_skill_file("my-proj", "us-central1", skill_data)
+    assert skill_dir.is_dir()
+    if os.name == "posix":
+        assert (skill_dir.stat().st_mode & 0o777) == 0o700
+
+
 def test_validate_isolated_directory(tmp_path: Path) -> None:
     """Verify validate_isolated_directory rejects active home and root."""
     from reach.runtime._fs import validate_isolated_directory
@@ -2125,9 +2554,9 @@ def test_runtime_post_probe_never_cleans_outside_workdir(agent: str, tmp_path: P
 
     opts: dict[str, Any] = dict(MINIMAL_OPTIONS.get(agent, {}))
     opts["auto_clean"] = True
-    opt_cls = options_model(agent)
-    if opt_cls is not None and issubclass(opt_cls, AgentOptions) and opt_cls.isolation_dir_field:
-        opts[opt_cls.isolation_dir_field] = outside_dir
+    field = getattr(options_model(agent), "isolation_dir_field", None)
+    if field:
+        opts[field] = outside_dir
 
     runtime = build_runtime(RuntimeSettings(agent=agent, options=opts))
     runtime.post_probe(workdir)
@@ -2190,14 +2619,14 @@ def test_safe_cleanup_isolated_dir_refuses_outside_or_root(tmp_path: Path) -> No
 def test_runtime_isolation_dir_properties(agent: str, tmp_path: Path) -> None:
     """Verify isolation_dir_field and custom_isolation_dir properties reflect configuration."""
     opts: dict[str, Any] = dict(MINIMAL_OPTIONS.get(agent, {}))
-    opt_cls = options_model(agent)
+    field = getattr(options_model(agent), "isolation_dir_field", None)
     custom_dir = tmp_path / f"custom_{agent}"
-    if opt_cls is not None and issubclass(opt_cls, AgentOptions) and opt_cls.isolation_dir_field:
-        opts[opt_cls.isolation_dir_field] = custom_dir
+    if field:
+        opts[field] = custom_dir
 
     runtime = build_runtime(RuntimeSettings(agent=agent, options=opts))
-    if opt_cls is not None and issubclass(opt_cls, AgentOptions) and opt_cls.isolation_dir_field:
-        assert runtime.isolation_dir_field == opt_cls.isolation_dir_field
+    if field:
+        assert runtime.isolation_dir_field == field
         assert runtime.custom_isolation_dir == custom_dir
         assert runtime.options.custom_isolation_dir == custom_dir
     else:
@@ -2218,7 +2647,8 @@ def test_antigravity_agents_discovery() -> None:
 
 @pytest.mark.parametrize("agent", antigravity_agents())
 def test_antigravity_runtime_effective_model_provider(
-    agent: str, monkeypatch: pytest.MonkeyPatch
+    agent: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Verify effective_model_provider auto-detects gemini across all Antigravity runtimes."""
     # 1. Auto-detect when GEMINI_API_KEY is present
@@ -2243,7 +2673,7 @@ def test_antigravity_runtime_effective_model_provider(
             RuntimeSettings(
                 agent=agent,
                 options={"model": "gemini-3.7-flash", "model_provider": "custom-prov"},
-            )
+            ),
         )
         assert isinstance(rt, AntigravityRuntime)
         assert rt.effective_model_provider == "custom-prov"
@@ -2264,7 +2694,8 @@ def test_antigravity_runtime_effective_model_provider(
 
 @pytest.mark.parametrize("agent", antigravity_agents())
 def test_antigravity_runtime_effective_api_key_resolution(
-    agent: str, monkeypatch: pytest.MonkeyPatch
+    agent: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Verify effective_api_key resolution hierarchy across Antigravity runtimes."""
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
@@ -2288,7 +2719,7 @@ def test_antigravity_runtime_effective_api_key_resolution(
         RuntimeSettings(
             agent=agent,
             options={"model": "gemini-3.7-flash", "api_key": "explicit-key"},
-        )
+        ),
     )
     assert isinstance(rt, AntigravityRuntime)
     assert rt.effective_api_key == "explicit-key"
@@ -2296,7 +2727,9 @@ def test_antigravity_runtime_effective_api_key_resolution(
 
 @pytest.mark.parametrize("agent", cli_agents())
 def test_cli_agents_select_executes_in_workdir_cwd(
-    agent: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    agent: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     """Verify select executes underlying process with cwd pointing to workdir."""
     workdir = tmp_path / "sandbox_workspace"
@@ -2319,3 +2752,121 @@ def test_cli_agents_select_executes_in_workdir_cwd(
 
     assert "cwd" in seen
     assert Path(seen["cwd"]).resolve() == workdir.resolve()
+
+
+def test_agent_options_accepts_and_validates_blocked_env_vars() -> None:
+    """Verify AgentOptions accepts strongly-typed blocked_env_vars tuple."""
+    opts = AgentOptions(blocked_env_vars=["CUSTOM_VAR", "ANOTHER_VAR"])
+    assert opts.blocked_env_vars == ("CUSTOM_VAR", "ANOTHER_VAR")
+
+
+def test_resolve_options_propagates_blocked_env_vars() -> None:
+    """Verify resolve_options propagates blocked_env_vars into driver options."""
+    settings = RuntimeSettings(
+        agent="fake",
+        blocked_env_vars=["CUSTOM_SECRET"],
+        options={"model": "fake-model"},
+    )
+    resolved = resolve_options(settings)
+    assert isinstance(resolved, AgentOptions)
+    assert resolved.blocked_env_vars == ("CUSTOM_SECRET",)
+
+
+def test_base_text_generator_build_env_sanitizes_via_options(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify BaseTextGenerator.build_env strips blocked env vars specified in options."""
+    monkeypatch.setenv("SECRET_TOKEN", "sensitive")
+    monkeypatch.setenv("PUBLIC_VAR", "harmless")
+
+    opts = FakeOptions(model="test-model", blocked_env_vars=("SECRET_TOKEN",))
+    gen = FakeGenerator(model="test-model", options=opts)
+    env = gen.build_env()
+    assert "SECRET_TOKEN" not in env
+    assert env.get("PUBLIC_VAR") == "harmless"
+
+
+def test_agent_runtime_build_env_prioritizes_options_over_settings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify AgentRuntime.build_env prioritizes options over settings for blocked vars."""
+    monkeypatch.setenv("VAR_A", "a")
+    monkeypatch.setenv("VAR_B", "b")
+
+    settings = RuntimeSettings(agent="fake", blocked_env_vars=["VAR_A"])
+    opts = FakeOptions(model="test-model", blocked_env_vars=["VAR_B"])
+    rt = FakeRuntime(settings=settings, options=opts)
+    env = rt.build_env()
+    assert "VAR_B" not in env
+    assert env.get("VAR_A") == "a"
+
+
+def test_fake_runtime_materialize_delegates_to_super_install_and_skill_roots(
+    skill_repo: Path,
+    tmp_path: Path,
+) -> None:
+    """Verify FakeRuntime with materialize=True delegates install and skill_roots to base."""
+    skills = load_skills(skill_repo)
+    catalog = Catalog(
+        id="test-subset",
+        mode=CatalogMode.ALL,
+        skills=("gcs-lifecycle-rules", "gcs-retention-policy"),
+    )
+    runtime = FakeRuntime(materialize=True)
+    target = runtime.install(catalog, skills, tmp_path / "work")
+
+    # Verify installation materialized on disk via super().install()
+    installed_dir = runtime.skills_dir(target)
+    assert installed_dir.is_dir()
+    for name in catalog.skills:
+        assert (installed_dir / name).exists()
+
+    # Verify skill_roots returns materialized root via super().skill_roots()
+    roots = runtime.skill_roots(target)
+    assert len(roots) == 1
+    assert roots[0].path == installed_dir
+    assert roots[0].scope == "project"
+
+
+@pytest.mark.parametrize("agent", known_agents())
+def test_all_agents_model_setter_synchronizes_options(agent: str, tmp_path: Path) -> None:
+    """Verify AgentRuntime model setter updates options.model and runtime.model."""
+    runtime = _build_agent(agent, tmp_path, model="initial-model")
+    assert runtime.model == "initial-model"
+    assert runtime.options.model == "initial-model"
+
+    runtime.model = "updated-model"
+    assert runtime.model == "updated-model"
+    assert runtime.options.model == "updated-model"
+
+
+@pytest.mark.parametrize("agent", known_agents())
+def test_all_generators_model_setter_synchronizes_options(agent: str) -> None:
+    """Verify BaseTextGenerator model setter updates options.model and generator.model."""
+    gen = build_text_generator(agent=agent, options=MINIMAL_OPTIONS.get(agent, {}))
+    gen.model = "updated-model"
+    assert gen.model == "updated-model"
+    assert gen.options.model == "updated-model"
+
+
+def test_fake_runtime_multi_turn_sequence_trajectory_tracker(tmp_path: Path) -> None:
+    """Verify FakeRuntime select uses TrajectoryTracker for multi-turn sequences."""
+    # Case 1: Early exit triggered by reaching target_skill
+    runtime_hit = FakeRuntime(
+        {"q": ("s1", "target", "s3")},
+        options=FakeOptions(max_turns=3, early_exit=True),
+    )
+    outcome_hit = runtime_hit.select("q", tmp_path, target_skill="target")
+    assert outcome_hit.invoked_skills == ("s1", "target")
+    assert outcome_hit.early_exit is True
+    assert outcome_hit.turns_taken == 2
+
+    # Case 2: Max turns boundary reached before target_skill
+    runtime_max = FakeRuntime(
+        {"q": ("s1", "s2", "s3", "target")},
+        options=FakeOptions(max_turns=2, early_exit=True),
+    )
+    outcome_max = runtime_max.select("q", tmp_path, target_skill="target")
+    assert outcome_max.invoked_skills == ("s1", "s2")
+    assert outcome_max.early_exit is True
+    assert outcome_max.turns_taken == 2

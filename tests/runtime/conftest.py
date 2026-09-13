@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING, Any, Self, cast
 import pytest
 
 from reach.catalog import build_catalogs, load_skills
-from reach.config import RuntimeSettings
+from reach.config import DEFAULT_GEMINI_MODEL, RuntimeSettings
 from reach.models import Catalog, CatalogMode, Skill
 from reach.runtime import AgentRuntime, build_runtime
 
@@ -101,6 +101,19 @@ def home_dir(tmp_path: Path) -> Path:
     return tmp_path / "agy-home"
 
 
+@pytest.fixture
+def clean_api_keys(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Clear ambient model provider API keys from test environment."""
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+
+
+def read_isolated_settings(home_dir: Path) -> dict[str, Any]:
+    """Read and parse the JSON settings file from an isolated home directory."""
+    path = home_dir / ".gemini" / "antigravity-cli" / "settings.json"
+    return json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+
+
 def canned(
     mock: Callable[..., Any] | pytest.MonkeyPatch,
     lines: list[str],
@@ -138,7 +151,7 @@ def agy_stream(
     tools: Sequence[tuple[str, str | None]] = (),
     status: str | None = "SUCCESS",
     duration_seconds: float | None = 1.234,
-    model: str | None = "gemini-3.7-flash",
+    model: str | None = DEFAULT_GEMINI_MODEL,
     error: str | None = None,
 ) -> list[str]:
     """Render stream-json transcript lines matching antigravity CLI output format."""

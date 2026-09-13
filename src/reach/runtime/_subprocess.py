@@ -27,6 +27,8 @@ from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
+from reach.runtime._env import sanitize_subprocess_env
+
 #: Stored reference to standard library subprocess.run to detect test monkeypatching.
 _ORIGINAL_SUBPROCESS_RUN = subprocess.run
 
@@ -85,7 +87,7 @@ def _run_mock_probe(
             timeout=timeout_s,
             check=False,
             stdin=subprocess.DEVNULL,
-            env=dict(env if env is not None else os.environ),
+            env=dict(env) if env is not None else sanitize_subprocess_env(dict(os.environ)),
         )
     except subprocess.TimeoutExpired:
         return None, "timeout"
@@ -123,19 +125,41 @@ def _spawn_probe_process(
             text=True,
             bufsize=1,
             start_new_session=True,
-            env=dict(env if env is not None else os.environ),
+            env=dict(env) if env is not None else sanitize_subprocess_env(dict(os.environ)),
         )
     except (OSError, subprocess.SubprocessError) as exc:
         return None, f"failed to spawn process: {exc}"
     return proc, None
 
 
-def _drain_stream(stream: Iterable[str] | None, lines: list[str]) -> None:
-    """Drain lines from an input stream into a target list until EOF."""
-    if stream is None:
-        return
-    with contextlib.suppress(OSError, ValueError):
-        lines.extend(stream)
+class _StderrDrainer:
+    """Asynchronously drain and accumulate lines from a subprocess stderr stream."""
+
+    def __init__(self, stream: Iterable[str] | None) -> None:
+        """Start a background daemon thread to drain lines from stream."""
+        self._lines: list[str] = []
+        self._lock = threading.Lock()
+        self._thread = threading.Thread(
+            target=self._drain,
+            args=(stream,),
+            daemon=True,
+        )
+        self._thread.start()
+
+    def _drain(self, stream: Iterable[str] | None) -> None:
+        """Drain lines from stream into internal buffer until EOF."""
+        if stream is None:
+            return
+        with contextlib.suppress(OSError, ValueError):
+            for chunk in stream:
+                with self._lock:
+                    self._lines.append(chunk)
+
+    def join(self, timeout: float = _DEFAULT_STDERR_JOIN_TIMEOUT) -> str:
+        """Wait for the drainer thread to complete and return accumulated text."""
+        self._thread.join(timeout=timeout)
+        with self._lock:
+            return "".join(self._lines)
 
 
 def _stream_process_output(
@@ -190,8 +214,7 @@ def _stream_process_output(
 def _drain_and_reap_process(
     proc: subprocess.Popen[str],
     controller: _ProcessGroupController,
-    stderr_thread: threading.Thread,
-    stderr_lines: list[str],
+    drainer: _StderrDrainer,
     start_time: float,
     timeout_s: float | None,
 ) -> tuple[list[str], str, str | None]:
@@ -199,8 +222,7 @@ def _drain_and_reap_process(
     remaining_lines: list[str] = []
     if timeout_s is not None and time.monotonic() - start_time > timeout_s:
         controller.terminate_gracefully(wait_timeout=_DEFAULT_TERMINATE_WAIT_TIMEOUT)
-        stderr_thread.join(timeout=_DEFAULT_STDERR_JOIN_TIMEOUT)
-        return remaining_lines, "".join(stderr_lines), "timeout"
+        return remaining_lines, drainer.join(), "timeout"
 
     if proc.poll() is None:
         remaining_time = (
@@ -210,8 +232,7 @@ def _drain_and_reap_process(
             proc.wait(timeout=remaining_time)
         except subprocess.TimeoutExpired:
             controller.terminate_gracefully(wait_timeout=_DEFAULT_TERMINATE_WAIT_TIMEOUT)
-            stderr_thread.join(timeout=_DEFAULT_STDERR_JOIN_TIMEOUT)
-            return remaining_lines, "".join(stderr_lines), "timeout"
+            return remaining_lines, drainer.join(), "timeout"
 
     if proc.stdout and not proc.stdout.closed:
         with contextlib.suppress(OSError, ValueError):
@@ -220,12 +241,12 @@ def _drain_and_reap_process(
                 remaining_lines.extend(stdout_rem.splitlines(keepends=True))
             proc.stdout.close()
 
-    stderr_thread.join(timeout=_DEFAULT_STDERR_JOIN_TIMEOUT)
+    stderr_rem = drainer.join()
     if proc.stderr and not proc.stderr.closed:
         with contextlib.suppress(OSError):
             proc.stderr.close()
 
-    return remaining_lines, "".join(stderr_lines), None
+    return remaining_lines, stderr_rem, None
 
 
 def run_subprocess_probe(
@@ -244,13 +265,7 @@ def run_subprocess_probe(
     if proc is None:
         return None, spawn_err
 
-    stderr_lines: list[str] = []
-    stderr_thread = threading.Thread(
-        target=_drain_stream,
-        args=(proc.stderr, stderr_lines),
-        daemon=True,
-    )
-    stderr_thread.start()
+    drainer = _StderrDrainer(proc.stderr)
 
     controller = _ProcessGroupController(proc)
     watchdog: threading.Timer | None = None
@@ -265,11 +280,11 @@ def run_subprocess_probe(
         )
         if stream_err is not None:
             controller.terminate_gracefully(wait_timeout=_DEFAULT_TERMINATE_WAIT_TIMEOUT)
-            stderr_thread.join(timeout=_DEFAULT_STDERR_JOIN_TIMEOUT)
+            drainer.join()
             return None, stream_err
 
         rem_lines, stderr_rem, reap_err = _drain_and_reap_process(
-            proc, controller, stderr_thread, stderr_lines, start_time, timeout_s
+            proc, controller, drainer, start_time, timeout_s
         )
         if reap_err is not None:
             return None, reap_err

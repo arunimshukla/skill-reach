@@ -16,6 +16,10 @@
 
 from __future__ import annotations
 
+import json
+import os
+from collections.abc import Iterable, Mapping
+from pathlib import Path
 from typing import NoReturn
 
 _PROVIDER_KEY_ENV_VARS: dict[str, tuple[str, ...]] = {
@@ -25,6 +29,53 @@ _PROVIDER_KEY_ENV_VARS: dict[str, tuple[str, ...]] = {
     "gemini": ("GEMINI_API_KEY", "GOOGLE_API_KEY"),
 }
 
+#: Default ambient environment variables stripped from child agent subprocesses.
+DEFAULT_BLOCKED_ENV_VARS: tuple[str, ...] = (
+    "AWS_ACCESS_KEY_ID",
+    "AWS_PROFILE",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SECURITY_TOKEN",
+    "AWS_SESSION_TOKEN",
+    "DISCORD_TOKEN",
+    "GH_TOKEN",
+    "GITHUB_PAT",
+    "GITHUB_TOKEN",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "KUBECONFIG",
+    "NPM_TOKEN",
+    "PYPI_API_TOKEN",
+    "SLACK_BOT_TOKEN",
+    "SSH_AGENT_PID",
+    "SSH_AUTH_SOCK",
+    "SSH_KEY",
+    "STRIPE_API_KEY",
+)
+_DEFAULT_BLOCKED_SET = frozenset(DEFAULT_BLOCKED_ENV_VARS)
+
+
+def sanitize_subprocess_env(
+    env: dict[str, str],
+    *,
+    keep: Iterable[str] = (),
+    blocked_env_vars: Iterable[str] | None = None,
+) -> dict[str, str]:
+    """Strip sensitive ambient credentials and tokens from child process environment."""
+    keep_set = set(keep)
+    if blocked_env_vars is None and (
+        env.get("CLAUDE_CODE_USE_VERTEX") == "1" or env.get("GOOGLE_GENAI_USE_ENTERPRISE") == "true"
+    ):
+        keep_set.add("GOOGLE_APPLICATION_CREDENTIALS")
+
+    effective_blocked = (
+        set(blocked_env_vars) if blocked_env_vars is not None else _DEFAULT_BLOCKED_SET
+    )
+    for key in list(env.keys()):
+        if key in keep_set:
+            continue
+        if key in effective_blocked:
+            env.pop(key, None)
+    return env
+
 
 def sync_google_and_gemini_keys(env: dict[str, str]) -> dict[str, str]:
     """Synchronize GEMINI_API_KEY and GOOGLE_API_KEY bidirectionally in environment dict."""
@@ -32,6 +83,64 @@ def sync_google_and_gemini_keys(env: dict[str, str]) -> dict[str, str]:
         env["GOOGLE_API_KEY"] = env["GEMINI_API_KEY"]
     elif "GOOGLE_API_KEY" in env and "GEMINI_API_KEY" not in env:
         env["GEMINI_API_KEY"] = env["GOOGLE_API_KEY"]
+    return env
+
+
+def sync_claude_settings_env(
+    env: dict[str, str],
+    claude_home: Path | None = None,
+    *,
+    blocked_env_vars: Iterable[str] | None = None,
+) -> dict[str, str]:
+    """Synchronize user Claude Code settings and Vertex defaults into environment dict.
+
+    Args:
+        env: Active environment variables dictionary to update in-place.
+        claude_home: Optional path to Claude home directory (defaults to ~/.claude).
+        blocked_env_vars: Sensitive environment variables blocked from being injected.
+
+    Returns:
+        Updated environment dictionary.
+    """
+    effective_blocked = (
+        set(blocked_env_vars) if blocked_env_vars is not None else _DEFAULT_BLOCKED_SET
+    )
+    vertex_enabled = env.get("CLAUDE_CODE_USE_VERTEX") == "1"
+    allow_vertex_creds = blocked_env_vars is None and vertex_enabled
+
+    settings_file = (claude_home or (Path.home() / ".claude")) / "settings.json"
+    if settings_file.is_file():
+        try:
+            data = json.loads(settings_file.read_text(encoding="utf-8"))
+            if isinstance(data, dict) and isinstance(data.get("env"), dict):
+                if not vertex_enabled and str(data["env"].get("CLAUDE_CODE_USE_VERTEX", "")) == "1":
+                    vertex_enabled = True
+                    allow_vertex_creds = blocked_env_vars is None
+
+                for key, val in data["env"].items():
+                    if key in effective_blocked:
+                        if key == "GOOGLE_APPLICATION_CREDENTIALS" and allow_vertex_creds:
+                            pass
+                        else:
+                            continue
+                    if isinstance(val, (str, int, float)):
+                        env[key] = str(val)
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    if env.get("CLAUDE_CODE_USE_VERTEX") == "1":
+        if not env.get("CLOUD_ML_REGION"):
+            env["CLOUD_ML_REGION"] = "global"
+        creds_blocked = (
+            "GOOGLE_APPLICATION_CREDENTIALS" in effective_blocked and not allow_vertex_creds
+        )
+        if (
+            not creds_blocked
+            and "GOOGLE_APPLICATION_CREDENTIALS" in os.environ
+            and "GOOGLE_APPLICATION_CREDENTIALS" not in env
+        ):
+            env["GOOGLE_APPLICATION_CREDENTIALS"] = os.environ["GOOGLE_APPLICATION_CREDENTIALS"]
+
     return env
 
 
@@ -92,3 +201,44 @@ def raise_missing_agent_dependency(
         )
         raise RuntimeError(msg) from err
     raise err
+
+
+def detect_model_provider(
+    model: str,
+    explicit_provider: str | None = None,
+    *,
+    api_key: str | None = None,
+    env: Mapping[str, str] | None = None,
+) -> str | None:
+    """Infer model provider from explicit setting, environment variables, or model prefix.
+
+    Args:
+        model: Identifier of the model.
+        explicit_provider: Explicitly configured provider override, if any.
+        api_key: Explicitly configured API key, if any.
+        env: Optional environment mapping; defaults to os.environ.
+
+    Returns:
+        Canonical provider name ("gemini"), or None if unmapped.
+    """
+    if explicit_provider is not None:
+        return explicit_provider
+    active_env = os.environ if env is None else env
+    has_gemini_key = bool(
+        api_key or active_env.get("GEMINI_API_KEY") or active_env.get("GOOGLE_API_KEY")
+    )
+    if model.lower().startswith("gemini") and has_gemini_key:
+        return "gemini"
+    return None
+
+
+def resolve_blocked_env_vars(
+    options: object | None = None,
+    settings: object | None = None,
+) -> tuple[str, ...] | None:
+    """Return blocked environment variables prioritizing options over settings."""
+    if (blocked := getattr(options, "blocked_env_vars", None)) is not None:
+        return tuple(blocked)
+    if (blocked := getattr(settings, "blocked_env_vars", None)) is not None:
+        return tuple(blocked)
+    return None

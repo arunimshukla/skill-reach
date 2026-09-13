@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 from typing import TYPE_CHECKING
 from unittest.mock import patch
@@ -247,6 +248,17 @@ def test_changed_skills_passes_double_dash_delimiter() -> None:
         assert args == ["git", "diff", "--name-only", "HEAD~1", "--"]
 
 
+def test_changed_skills_default_since_is_head_minus_one() -> None:
+    """Verify changed_skills defaults to HEAD~1 when since is omitted."""
+    with patch("subprocess.run") as mock_run:
+        mock_run.return_value.returncode = 0
+        mock_run.return_value.stdout = ""
+        changed_skills()
+        mock_run.assert_called_once()
+        args = mock_run.call_args[0][0]
+        assert args == ["git", "diff", "--name-only", "HEAD~1", "--"]
+
+
 @pytest.mark.parametrize(
     "stderr_msg",
     [
@@ -271,10 +283,20 @@ def test_changed_skills_missing_git_returns_empty_tuple() -> None:
         assert changed_skills(since="HEAD~1") == ()
 
 
+def test_changed_skills_timeout_raises_value_error() -> None:
+    """Verify changed_skills raises ValueError with timeout hint when git diff hangs."""
+    with (
+        patch(
+            "subprocess.run",
+            side_effect=subprocess.TimeoutExpired(cmd=["git", "diff"], timeout=30.0),
+        ),
+        pytest.raises(ValueError, match=r"git diff timed out after 30\.0s"),
+    ):
+        changed_skills(since="HEAD~1")
+
+
 def test_run_check_non_existent_path_raises_value_error() -> None:
     """Verify run_check raises ValueError on missing skill paths."""
-    from pathlib import Path
-
     with pytest.raises(ValueError, match="skill path does not exist"):
         run_check(skills_paths=[Path("/non/existent/path")])
 
@@ -324,7 +346,9 @@ def test_run_check_changed_scope_drops_skills_deleted_from_disk(
         queries=[
             Query(id="q-live", text="Sample query for valid-skill", expected_skill="valid-skill"),
             Query(
-                id="q-gone", text="Sample query for deleted tool", expected_skill="deleted-skill"
+                id="q-gone",
+                text="Sample query for deleted tool",
+                expected_skill="deleted-skill",
             ),
         ],
     )
@@ -444,7 +468,7 @@ def test_build_check_assertions_trajectory_metrics_fail(
             "min_accuracy": 0.80,
             "max_misroute": 0.10,
             **metric_kwarg,
-        }
+        },
     )
     assertions = _build_check_assertions(metrics, settings)
     matching = [a for a in assertions if a.name == metric_name]

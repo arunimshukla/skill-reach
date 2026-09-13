@@ -24,13 +24,14 @@ from typing import TYPE_CHECKING, Any, Never
 
 import pytest
 
-from reach.config import agent_default_model
+from reach.config import RuntimeSettings, agent_default_model
 from reach.runtime import AntigravityRuntime
 from reach.runtime.antigravity_sdk import (
     _HAS_ANTIGRAVITY,
     AntigravitySdkGenerator,
     AntigravitySdkOptions,
     AntigravitySdkRuntime,
+    _build_model_spec,
     _tool_name,
 )
 
@@ -146,8 +147,8 @@ def test_select_config_names_the_resident_catalog_in_the_schema(
 
 def test_antigravity_sdk_options_effort() -> None:
     """Verify AntigravitySdkOptions accepts model and optional effort."""
-    opts_with_effort = AntigravitySdkOptions(model="gemini-3.7-flash", effort="medium")
-    assert opts_with_effort.model == "gemini-3.7-flash"
+    opts_with_effort = AntigravitySdkOptions(model="gemini-3.8-flash", effort="medium")
+    assert opts_with_effort.model == "gemini-3.8-flash"
     assert opts_with_effort.effort == "medium"
 
     opts_no_effort = AntigravitySdkOptions(model="gemini-3.8-flash")
@@ -158,18 +159,18 @@ def test_antigravity_sdk_options_effort() -> None:
 def test_select_config_sets_thinking_config(tmp_path: Path) -> None:
     """Verify _select_config sets thinking_config when effort is specified."""
     runtime = AntigravitySdkRuntime(
-        options=AntigravitySdkOptions(model="gemini-3.7-flash", effort="high"),
+        options=AntigravitySdkOptions(model="gemini-3.8-flash", effort="high"),
     )
     runtime._resident = ("skill-a",)
     config = runtime._select_config(tmp_path)
     assert isinstance(config.model, ag_types.ModelTarget)
-    assert config.model.name == "gemini-3.7-flash"
+    assert config.model.name == "gemini-3.8-flash"
     assert isinstance(config.model.endpoint, ag_types.GeminiAPIEndpoint)
     assert config.model.endpoint.options is not None
     assert config.model.endpoint.options.thinking_level == ag_types.ThinkingLevel.HIGH
 
     runtime_default = AntigravitySdkRuntime(
-        options=AntigravitySdkOptions(model="gemini-3.7-flash"),
+        options=AntigravitySdkOptions(model="gemini-3.8-flash"),
     )
     runtime_default._resident = ("skill-a",)
     config_default = runtime_default._select_config(tmp_path)
@@ -427,7 +428,7 @@ def test_complete_uses_thinking_config_when_effort_configured(
 ) -> None:
     """Verify complete creates agent config with thinking options when effort is configured."""
     gen = AntigravitySdkGenerator(
-        options=AntigravitySdkOptions(model="gemini-3.7-flash", effort="high"),
+        options=AntigravitySdkOptions(model="gemini-3.8-flash", effort="high"),
     )
     instances = _fake_agent(monkeypatch, _FakeResponse(text="response text"))
     gen.complete("prompt")
@@ -607,6 +608,34 @@ def test_complete_passes_env(
     assert config.env.get("GOOGLE_API_KEY") == "complete-key"
 
 
+def test_generator_build_env_sanitizes_blocked_env_vars(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify generator build_env sanitizes ambient secrets and respects blocked_env_vars."""
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "leaked-secret")
+    monkeypatch.setenv("CUSTOM_SECRET", "custom-value")
+    monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-key")
+
+    # Default settings strip default blocked vars
+    default_gen = AntigravitySdkGenerator(
+        options=AntigravitySdkOptions(model="test-model"),
+    )
+    default_env = default_gen.build_env()
+    assert "AWS_SECRET_ACCESS_KEY" not in default_env
+    assert default_env.get("CUSTOM_SECRET") == "custom-value"
+    assert default_env.get("GEMINI_API_KEY") == "test-gemini-key"
+
+    # Custom blocked settings strip specified vars
+    settings = RuntimeSettings(blocked_env_vars=["CUSTOM_SECRET"])
+    custom_gen = AntigravitySdkGenerator(
+        options=AntigravitySdkOptions(model="test-model"),
+        settings=settings,
+    )
+    custom_env = custom_gen.build_env()
+    assert "CUSTOM_SECRET" not in custom_env
+    assert custom_env.get("GEMINI_API_KEY") == "test-gemini-key"
+
+
 @pytest.mark.parametrize(
     ("max_turns", "early_exit"),
     [
@@ -631,3 +660,127 @@ def test_antigravity_sdk_enforces_schema_in_both_single_and_multi_turn(
     rt._resident = ("skill-a", "skill-b")
     config = rt._select_config(tmp_path)
     assert config.response_schema is not None
+
+
+def test_build_model_spec_plain_and_effort() -> None:
+    """Verify _build_model_spec returns plain string or ModelTarget based on effort."""
+    assert _build_model_spec("plain-model") == "plain-model"
+    assert _build_model_spec("plain-model", None) == "plain-model"
+
+    target = _build_model_spec("gemini-3.8-flash", "high")
+    assert isinstance(target, ag_types.ModelTarget)
+    assert target.name == "gemini-3.8-flash"
+    assert isinstance(target.endpoint, ag_types.GeminiAPIEndpoint)
+    assert target.endpoint.options is not None
+    assert target.endpoint.options.thinking_level == ag_types.ThinkingLevel.HIGH
+
+
+def test_select_async_registers_hooks_in_config(
+    monkeypatch: pytest.MonkeyPatch,
+    runtime: AntigravitySdkRuntime,
+    tmp_path: Path,
+) -> None:
+    """Verify _select_async registers decide hook in LocalAgentConfig hooks."""
+    runtime._resident = ("gke-basics",)
+    instances = _fake_agent(monkeypatch, _FakeResponse(structured={"selected_skill": "gke-basics"}))
+    runtime.select("how to setup", tmp_path / "work")
+    assert len(instances) == 1
+    assert instances[0].config.hooks is not None
+    assert len(instances[0].config.hooks) == 1
+
+
+def test_select_async_hook_intercepts_target_skill_early_exit(
+    monkeypatch: pytest.MonkeyPatch,
+    runtime: AntigravitySdkRuntime,
+    tmp_path: Path,
+) -> None:
+    """Verify pre-tool decide hook detects skill and denies tool call on target match."""
+    runtime._resident = ("gke-basics", "cloud-run-basics")
+    instances = _fake_agent(monkeypatch, _FakeResponse(structured={"selected_skill": "gke-basics"}))
+
+    # Run select to trigger config assembly with target_skill
+    outcome = runtime.select("how to setup", tmp_path / "work", target_skill="gke-basics")
+    assert outcome.invoked_skill == "gke-basics"
+    assert len(instances) == 1
+    hook_fn = instances[0].config.hooks[0]
+
+    async def invoke_hook() -> None:
+        # Test invoking the registered hook with matching target skill
+        tool_call_match = ag_types.ToolCall(
+            name="view_file",
+            args={"path": "/workspace/.agents/skills/gke-basics/SKILL.md"},
+        )
+        result_match = await hook_fn(tool_call_match)
+        assert result_match.allow is False
+
+        # Test non-matching skill
+        tool_call_other = ag_types.ToolCall(
+            name="view_file",
+            args={"path": "/workspace/.agents/skills/cloud-run-basics/SKILL.md"},
+        )
+        result_other = await hook_fn(tool_call_other)
+        assert result_other.allow is True
+
+    asyncio.run(invoke_hook())
+
+
+def test_generator_model_precedence() -> None:
+    """Verify explicit model argument overrides default options.model in generator."""
+    opts = AntigravitySdkOptions(model="default-model")
+    gen = AntigravitySdkGenerator(model="explicit-model", options=opts)
+    assert gen.model == "explicit-model"
+    assert gen.options.model == "explicit-model"
+
+
+def test_generator_settings_options_fallback() -> None:
+    """Verify generator resolves options from settings.options when options is None."""
+    settings = RuntimeSettings(options={"model": "settings-model", "effort": "low"})
+    gen = AntigravitySdkGenerator(settings=settings)
+    assert gen.model == "settings-model"
+    assert gen.options.model == "settings-model"
+    assert gen.options.effort == "low"
+
+
+def test_generator_effective_effort_robustness() -> None:
+    """Verify generator effective_effort handles off/none strings and unknown models."""
+    gen_off = AntigravitySdkGenerator(
+        options=AntigravitySdkOptions(model="gemini-3.8-flash", effort="off"),
+    )
+    assert gen_off.effective_effort is None
+
+    gen_none = AntigravitySdkGenerator(
+        options=AntigravitySdkOptions(model="gemini-3.8-flash", effort="None"),
+    )
+    assert gen_none.effective_effort is None
+
+    gen_unknown = AntigravitySdkGenerator(
+        options=AntigravitySdkOptions(model="custom-unknown-model-xyz"),
+    )
+    assert gen_unknown.effective_effort is None
+
+
+def test_select_handles_string_stop_reason_without_error(
+    monkeypatch: pytest.MonkeyPatch,
+    runtime: AntigravitySdkRuntime,
+    tmp_path: Path,
+) -> None:
+    """Verify non-enum string stop_reason is cleanly converted to error message."""
+    runtime._resident = ("gke-basics",)
+    _fake_agent(monkeypatch, _FakeResponse(stop_reason="BACKEND_DISCONNECT"))
+    outcome = runtime.select("q", tmp_path / "work")
+    assert outcome.error == "runtime error: BACKEND_DISCONNECT"
+
+
+def test_select_ignores_empty_or_whitespace_reasoning(
+    monkeypatch: pytest.MonkeyPatch,
+    runtime: AntigravitySdkRuntime,
+    tmp_path: Path,
+) -> None:
+    """Verify whitespace-only reasoning string results in empty tuple reasoning."""
+    runtime._resident = ("gke-basics",)
+    _fake_agent(
+        monkeypatch,
+        _FakeResponse(structured={"selected_skill": "gke-basics", "reasoning": "   \n\t  "}),
+    )
+    outcome = runtime.select("q", tmp_path / "work")
+    assert outcome.reasoning == ()

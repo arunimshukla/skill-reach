@@ -61,6 +61,11 @@ class TwoStageRetrieverRuntime(AgentRuntime):
         """Return the model name configured on the underlying runtime."""
         return self.inner.model
 
+    @model.setter
+    def model(self, value: str) -> None:
+        """Update the model identifier on the underlying runtime."""
+        self.inner.model = value
+
     @property
     @override
     def skills_subpath(self) -> str:

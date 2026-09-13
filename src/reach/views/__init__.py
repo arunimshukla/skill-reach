@@ -48,6 +48,7 @@ from reach.views.base import (
     print_resuming,
     print_wrote,
     probe_progress,
+    safety_panel,
 )
 from reach.views.cluster import (
     CLUSTER_RENDERERS,
@@ -203,6 +204,7 @@ __all__ = [
     "render_sweep",
     "render_sweep_csv",
     "render_sweep_json",
+    "safety_panel",
     "suggest_view",
     "write_github_step_summary",
 ]

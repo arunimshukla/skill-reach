@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import shutil
 import threading
@@ -28,6 +29,22 @@ from reach.config import resolve_path
 
 if TYPE_CHECKING:
     from reach.models import Catalog, Skill
+
+
+def ensure_private_directory(path: Path | str) -> Path:
+    """Create directory with 0o700 permissions if supported on host platform.
+
+    Args:
+        path: Filesystem path to create as a private directory.
+
+    Returns:
+        Resolved Path object for the created directory.
+    """
+    target = resolve_path(path)
+    target.mkdir(parents=True, exist_ok=True)
+    with contextlib.suppress(OSError):
+        target.chmod(0o700)
+    return target
 
 
 def validate_isolated_directory(value: Path | None, field_name: str = "directory") -> Path | None:
@@ -81,6 +98,28 @@ def resolve_catalog_skills(
     return {s.name: s for s in resident_skills(catalog, tuple(skills))}
 
 
+def _validate_skill_symlinks(skill_dir: Path) -> None:
+    """Ensure no symlink inside skill_dir resolves outside skill_dir."""
+    resolved_root = skill_dir.resolve()
+    for root_dir, dirnames, filenames in os.walk(resolved_root, followlinks=False):
+        current = Path(root_dir)
+        for item in (*dirnames, *filenames):
+            p = current / item
+            if p.is_symlink():
+                try:
+                    target = p.resolve(strict=True)
+                    if (
+                        not target.is_relative_to(resolved_root)
+                        or target in p.parents
+                        or target == p
+                    ):
+                        msg = f"Skill contains symlink escaping skill directory: {p} -> {target}"
+                        raise ValueError(msg)
+                except (OSError, RuntimeError) as exc:
+                    msg = f"Skill contains broken or cyclical symlink: {p}"
+                    raise ValueError(msg) from exc
+
+
 def install_skills(
     catalog: Catalog,
     by_name: Mapping[str, Skill],
@@ -95,17 +134,22 @@ def install_skills(
     resolved_dest.mkdir(parents=True, exist_ok=True)
     for name in catalog.skills:
         src = by_name[name].path
+        resolved_src = src.resolve()
+        if not resolved_src.is_dir():
+            msg = f"Skill source directory not found: {src}"
+            raise ValueError(msg)
+        _validate_skill_symlinks(resolved_src)
         dst = (resolved_dest / name).resolve()
         if not dst.is_relative_to(resolved_dest) or dst == resolved_dest:
             msg = f"Skill destination path escapes destination directory: {name!r}"
             raise ValueError(msg)
         if use_symlinks:
             try:
-                dst.symlink_to(src, target_is_directory=True)
+                dst.symlink_to(resolved_src, target_is_directory=True)
                 continue
             except OSError:
                 pass
-        shutil.copytree(src, dst)
+        shutil.copytree(resolved_src, dst, symlinks=True)
     return tuple(catalog.skills)
 
 

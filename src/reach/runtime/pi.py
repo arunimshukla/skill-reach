@@ -38,9 +38,9 @@ from reach.runtime._env import (
     sync_google_and_gemini_keys,
 )
 from reach.runtime._fs import (
+    ensure_private_directory,
     probe_slot_dir,
     resolve_skill_from_path,
-    safe_cleanup_isolated_dir,
 )
 from reach.runtime._subprocess import (
     extract_content_reasoning,
@@ -179,6 +179,7 @@ class PiRuntime(CliAgentRuntime[PiOptions]):
     options: PiOptions
     api_key_env_var: str | None = None
     _skills_subpath: str = ".pi/skills"
+    isolation_dir_name: ClassVar[str | None] = ".reach_pi_agent"
 
     def __init__(self, settings: RuntimeSettings | None = None) -> None:
         """Initialize the PiRuntime with settings or defaults."""
@@ -248,9 +249,8 @@ class PiRuntime(CliAgentRuntime[PiOptions]):
         )
         sync_google_and_gemini_keys(env)
 
-        if workdir is not None and self.options.isolate_config_dir:
-            agent_dir = (self.options.agent_dir or (Path(workdir) / ".reach_pi_agent")).resolve()
-            agent_dir.mkdir(parents=True, exist_ok=True)
+        if workdir is not None and (iso_dir := self.effective_isolation_dir(workdir)) is not None:
+            agent_dir = ensure_private_directory(iso_dir)
             env["PI_CODING_AGENT_DIR"] = str(agent_dir)
 
         return env
@@ -267,9 +267,7 @@ class PiRuntime(CliAgentRuntime[PiOptions]):
         # Prune the root only once the last concurrent worker has released its slot.
         with contextlib.suppress(OSError):
             session_root.rmdir()
-        if self.options.isolate_config_dir:
-            agent_dir = self.options.agent_dir or (Path(workdir) / ".reach_pi_agent")
-            safe_cleanup_isolated_dir(workdir, agent_dir)
+        super().post_probe(workdir)
 
     @override
     def select(
@@ -280,8 +278,7 @@ class PiRuntime(CliAgentRuntime[PiOptions]):
     ) -> SelectionOutcome:
         """Execute query evaluation probe and return SelectionOutcome."""
         # Probes run concurrently against one workdir, so each thread owns a session slot.
-        session_dir = probe_slot_dir(Path(workdir) / SESSION_DIRNAME)
-        session_dir.mkdir(parents=True, exist_ok=True)
+        session_dir = ensure_private_directory(probe_slot_dir(Path(workdir) / SESSION_DIRNAME))
 
         existing_files = set(session_dir.glob("*.jsonl"))
 

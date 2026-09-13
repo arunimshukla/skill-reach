@@ -80,6 +80,21 @@ def _normalize_annotation_file(
         return str(file)
 
 
+def _escape_annotation_param(value: str) -> str:
+    r"""Escape special characters in GitHub Actions command parameter values.
+
+    Encodes characters per the GitHub Actions workflow commands specification:
+    '%' -> '%25', '\r' -> '%0D', '\n' -> '%0A', ':' -> '%3A', ',' -> '%2C'.
+    """
+    return (
+        value.replace("%", "%25")
+        .replace("\r", "%0D")
+        .replace("\n", "%0A")
+        .replace(":", "%3A")
+        .replace(",", "%2C")
+    )
+
+
 def _build_annotation_params(
     *,
     file: str | Path | None,
@@ -94,7 +109,7 @@ def _build_annotation_params(
     params: list[str] = []
     normalized_file = _normalize_annotation_file(file, root=root)
     if normalized_file:
-        params.append(f"file={normalized_file}")
+        params.append(f"file={_escape_annotation_param(normalized_file)}")
     if line is not None:
         params.append(f"line={line}")
     if col is not None:
@@ -104,7 +119,7 @@ def _build_annotation_params(
     if end_col is not None:
         params.append(f"endColumn={end_col}")
     if title:
-        params.append(f"title={title}")
+        params.append(f"title={_escape_annotation_param(title)}")
     return f" {','.join(params)}" if params else ""
 
 

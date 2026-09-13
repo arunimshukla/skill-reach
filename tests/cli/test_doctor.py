@@ -30,6 +30,7 @@ from reach.cli.doctor import (
     _check_python,
     _check_sdk,
     _check_skills,
+    run_doctor_checks,
 )
 from reach.views import build_console, render_doctor_table
 
@@ -203,6 +204,15 @@ def test_check_config_valid_and_invalid(tmp_path: Path) -> None:
     assert res_err.status == "fail"
 
 
+def test_check_config_warns_with_target_directory(tmp_path: Path) -> None:
+    """Verify _check_config includes the target directory path when not in cwd."""
+    empty_dir = tmp_path / "custom_workdir"
+    empty_dir.mkdir()
+    res = _check_config(empty_dir)
+    assert res.status == "warn"
+    assert f"target directory '{empty_dir}'" in res.detail
+
+
 def test_render_doctor_returns_1_on_failure() -> None:
     """Verify render_doctor exits 1 when any diagnostic failure is recorded."""
     console = build_console(quiet=True)
@@ -210,3 +220,11 @@ def test_render_doctor_returns_1_on_failure() -> None:
         ("Env", "Python", "fail", "Version 3.9 unsupported", "Upgrade Python"),
     ]
     assert render_doctor_table(console, fail_res) == 1
+
+
+def test_run_doctor_checks_includes_google_adc(tmp_path: Path) -> None:
+    """Verify run_doctor_checks includes Google Cloud ADC diagnostic check."""
+    results = run_doctor_checks(tmp_path)
+    adc_checks = [r for r in results if r.name == "Google Cloud ADC"]
+    assert len(adc_checks) == 1
+    assert adc_checks[0].category == "Credentials & Environment"

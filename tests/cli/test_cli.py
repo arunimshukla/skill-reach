@@ -562,6 +562,7 @@ def cramped_argv(
         queries = "{query_file}"
         workdir = "{tmp_path / "work"}"
         partial = true
+        trusted = true
 
         [runtime]
         agent = "claude-code"
@@ -1243,6 +1244,23 @@ def test_query_command_converts_between_formats_directly(
     loaded = load_query_set(dest)
     assert len(loaded.queries) == 4
     assert any(q.id == "x-lifecycle" for q in loaded.queries)
+
+
+def test_query_view_renders_table_without_skills_catalog(
+    exported: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify reach query <file.json> renders query table even when no skills exist in cwd."""
+    empty_cwd = tmp_path / "empty_workspace"
+    empty_cwd.mkdir()
+    monkeypatch.chdir(empty_cwd)
+    assert main(["query", str(exported)]) == 0
+    err = capsys.readouterr().err
+    assert "query" in err
+    assert "expects" in err
+    assert "text" in err
 
 
 def test_query_import_refuses_to_write_over_an_existing_set(

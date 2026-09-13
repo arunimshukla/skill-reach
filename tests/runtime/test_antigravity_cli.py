@@ -28,7 +28,7 @@ if TYPE_CHECKING:
     pass
 
 from reach.catalog import build_catalogs, load_skills
-from reach.config import agent_default_model
+from reach.config import DEFAULT_GEMINI_MODEL, agent_default_model
 from reach.models import CatalogMode
 from reach.runtime.antigravity_cli import (
     DENIED_PERMISSION_ACTIONS,
@@ -43,7 +43,12 @@ from reach.runtime.antigravity_cli import (
     parse_stream,
 )
 
-from .conftest import agy_stream, canned, install_one
+from .conftest import (
+    agy_stream,
+    canned,
+    install_one,
+    read_isolated_settings,
+)
 
 
 @pytest.fixture
@@ -426,12 +431,12 @@ def test_model_provider_gemini_accepts_a_gemini_model(home_dir: Path) -> None:
     """Verify valid gemini model validation succeeds under gemini model provider."""
     options = AntigravityCliOptions.model_validate(
         {
-            "model": "gemini-3.7-flash",
+            "model": DEFAULT_GEMINI_MODEL,
             "home_dir": str(home_dir),
             "model_provider": "gemini",
         },
     )
-    assert options.model == "gemini-3.7-flash"
+    assert options.model == DEFAULT_GEMINI_MODEL
 
 
 def test_the_agent_reports_the_configured_model(runtime: AntigravityCliRuntime) -> None:
@@ -444,7 +449,7 @@ def test_constructing_the_agent_writes_the_closed_permission_policy(
 ) -> None:
     """Verify agent initialization creates isolated settings with default deny permissions."""
     AntigravityCliRuntime(options=AntigravityCliOptions(model="m", home_dir=home_dir))
-    settings = json.loads(_isolated_settings_path(home_dir).read_text())
+    settings = read_isolated_settings(home_dir)
     assert settings["permissions"]["deny"] == list(DENIED_PERMISSION_ACTIONS)
     assert "experimental" not in settings
 
@@ -453,79 +458,54 @@ def test_configuring_model_provider_writes_it_at_construction(home_dir: Path) ->
     """Verify modelProvider configuration is written to isolated settings at init."""
     AntigravityCliRuntime(
         options=AntigravityCliOptions(
-            model="gemini-3.7-flash",
+            model=DEFAULT_GEMINI_MODEL,
             home_dir=home_dir,
             model_provider="gemini",
         ),
     )
-    settings = json.loads(_isolated_settings_path(home_dir).read_text())
+    settings = read_isolated_settings(home_dir)
     assert settings["modelProvider"] == "gemini"
 
 
 def test_model_provider_defaults_to_unset(home_dir: Path) -> None:
     """Verify modelProvider key is omitted from settings when not explicitly configured."""
     AntigravityCliRuntime(options=AntigravityCliOptions(model="m", home_dir=home_dir))
-    settings = json.loads(_isolated_settings_path(home_dir).read_text())
+    settings = read_isolated_settings(home_dir)
     assert "modelProvider" not in settings
 
 
-def test_effective_model_provider_auto_detects_gemini_api_key(
+@pytest.mark.parametrize("target_cls", [AntigravityCliRuntime, AntigravityCliGenerator])
+@pytest.mark.parametrize(
+    ("env_vars", "model", "expected_provider"),
+    [
+        ({"GEMINI_API_KEY": "test-key-123"}, DEFAULT_GEMINI_MODEL, "gemini"),
+        ({"GOOGLE_API_KEY": "test-key-456"}, DEFAULT_GEMINI_MODEL, "gemini"),
+        ({"GEMINI_API_KEY": "test-key-123"}, "claude-3-opus", None),
+        ({}, DEFAULT_GEMINI_MODEL, None),
+    ],
+    ids=["gemini-key", "google-key", "non-gemini-model", "no-keys"],
+)
+def test_effective_model_provider_configures_settings(
     home_dir: Path,
+    clean_api_keys: None,
     monkeypatch: pytest.MonkeyPatch,
+    target_cls: type[AntigravityCliRuntime | AntigravityCliGenerator],
+    env_vars: dict[str, str],
+    model: str,
+    expected_provider: str | None,
 ) -> None:
-    """Verify effective_model_provider auto-detects gemini when GEMINI_API_KEY is present."""
-    monkeypatch.setenv("GEMINI_API_KEY", "test-key-123")
-    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
-    runtime = AntigravityCliRuntime(
-        options=AntigravityCliOptions(model="gemini-3.7-flash", home_dir=home_dir),
+    """Verify effective_model_provider detects keys and writes modelProvider to settings."""
+    for key, val in env_vars.items():
+        monkeypatch.setenv(key, val)
+    instance = target_cls(
+        options=AntigravityCliOptions(model=model, home_dir=home_dir),
     )
-    assert runtime.effective_model_provider == "gemini"
-    settings = json.loads(_isolated_settings_path(home_dir).read_text())
-    assert settings.get("modelProvider") == "gemini"
-
-
-def test_effective_model_provider_auto_detects_google_api_key(
-    home_dir: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Verify effective_model_provider auto-detects gemini when GOOGLE_API_KEY is present."""
-    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
-    monkeypatch.setenv("GOOGLE_API_KEY", "test-key-456")
-    runtime = AntigravityCliRuntime(
-        options=AntigravityCliOptions(model="gemini-3.7-flash", home_dir=home_dir),
-    )
-    assert runtime.effective_model_provider == "gemini"
-    settings = json.loads(_isolated_settings_path(home_dir).read_text())
-    assert settings.get("modelProvider") == "gemini"
-
-
-def test_effective_model_provider_ignores_non_gemini_models_even_with_api_key(
-    home_dir: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Verify effective_model_provider does not activate for non-Gemini models."""
-    monkeypatch.setenv("GEMINI_API_KEY", "test-key-123")
-    runtime = AntigravityCliRuntime(
-        options=AntigravityCliOptions(model="claude-3-opus", home_dir=home_dir),
-    )
-    assert runtime.effective_model_provider is None
-    settings = json.loads(_isolated_settings_path(home_dir).read_text())
-    assert "modelProvider" not in settings
-
-
-def test_effective_model_provider_remains_none_without_api_keys(
-    home_dir: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Verify effective_model_provider remains None when no API keys exist in env."""
-    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
-    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
-    runtime = AntigravityCliRuntime(
-        options=AntigravityCliOptions(model="gemini-3.7-flash", home_dir=home_dir),
-    )
-    assert runtime.effective_model_provider is None
-    settings = json.loads(_isolated_settings_path(home_dir).read_text())
-    assert "modelProvider" not in settings
+    assert instance.effective_model_provider == expected_provider
+    settings = read_isolated_settings(home_dir)
+    if expected_provider is not None:
+        assert settings.get("modelProvider") == expected_provider
+    else:
+        assert "modelProvider" not in settings
 
 
 def test_read_file_is_never_in_the_deny_list() -> None:
@@ -540,7 +520,7 @@ def test_isolated_settings_preserve_unrelated_keys(home_dir: Path) -> None:
     path.parent.mkdir(parents=True)
     path.write_text(json.dumps({"security": {"auth": {"selectedType": "vertex-ai"}}}))
     _ensure_isolated_settings(home_dir)
-    settings = json.loads(path.read_text())
+    settings = read_isolated_settings(home_dir)
     assert settings["security"] == {"auth": {"selectedType": "vertex-ai"}}
     assert settings["permissions"]["deny"] == list(DENIED_PERMISSION_ACTIONS)
 
@@ -551,7 +531,7 @@ def test_a_stray_allow_rule_is_replaced_not_merged(home_dir: Path) -> None:
     path.parent.mkdir(parents=True)
     path.write_text(json.dumps({"permissions": {"allow": ["command(rm)"]}}))
     _ensure_isolated_settings(home_dir)
-    settings = json.loads(path.read_text())
+    settings = read_isolated_settings(home_dir)
     assert "allow" not in settings["permissions"]
 
 
@@ -562,14 +542,14 @@ def test_allow_read_scopes_a_read_file_grant_to_one_directory(
     """Verify allow_read grants read_file permission for specified directory path."""
     skills_dir = tmp_path / "work" / ".agents" / "skills"
     _ensure_isolated_settings(home_dir, allow_read=skills_dir)
-    settings = json.loads(_isolated_settings_path(home_dir).read_text())
+    settings = read_isolated_settings(home_dir)
     assert settings["permissions"]["allow"] == [f"read_file({skills_dir.resolve()})"]
 
 
 def test_model_provider_is_written_when_given(home_dir: Path) -> None:
     """Verify modelProvider is written to settings when provided."""
     _ensure_isolated_settings(home_dir, model_provider="gemini")
-    settings = json.loads(_isolated_settings_path(home_dir).read_text())
+    settings = read_isolated_settings(home_dir)
     assert settings["modelProvider"] == "gemini"
 
 
@@ -577,7 +557,7 @@ def test_model_provider_is_cleared_when_not_given(home_dir: Path) -> None:
     """Verify modelProvider is removed from settings when omitted in update."""
     _ensure_isolated_settings(home_dir, model_provider="gemini")
     _ensure_isolated_settings(home_dir)
-    settings = json.loads(_isolated_settings_path(home_dir).read_text())
+    settings = read_isolated_settings(home_dir)
     assert "modelProvider" not in settings
 
 
@@ -589,7 +569,7 @@ def test_trust_replaces_rather_than_accumulates(home_dir: Path, tmp_path: Path) 
     second.mkdir()
     _ensure_isolated_settings(home_dir, trust=first)
     _ensure_isolated_settings(home_dir, trust=second)
-    settings = json.loads(_isolated_settings_path(home_dir).read_text())
+    settings = read_isolated_settings(home_dir)
     assert settings["trustedWorkspaces"] == [str(second.resolve())]
 
 
@@ -607,7 +587,7 @@ def test_install_trusts_and_scopes_read_access_to_the_workdir(
     catalog = build_catalogs(skills, CatalogMode.SINGLETON)[0]
     workdir = tmp_path / "work"
     target = runtime.install(catalog, skills, workdir)
-    settings = json.loads(_isolated_settings_path(home_dir).read_text())
+    settings = read_isolated_settings(home_dir)
     assert settings["permissions"]["allow"] == [
         f"read_file({runtime.skills_dir(target)})",
     ]
@@ -622,7 +602,7 @@ def test_install_does_not_clear_a_configured_model_provider(
     """Verify install retains configured modelProvider in isolated settings."""
     runtime = AntigravityCliRuntime(
         options=AntigravityCliOptions(
-            model="gemini-3.7-flash",
+            model=DEFAULT_GEMINI_MODEL,
             home_dir=home_dir,
             model_provider="gemini",
         ),
@@ -630,7 +610,7 @@ def test_install_does_not_clear_a_configured_model_provider(
     skills = load_skills(skill_repo)
     catalog = build_catalogs(skills, CatalogMode.SINGLETON)[0]
     runtime.install(catalog, skills, tmp_path / "work")
-    settings = json.loads(_isolated_settings_path(home_dir).read_text())
+    settings = read_isolated_settings(home_dir)
     assert settings["modelProvider"] == "gemini"
 
 
@@ -1035,7 +1015,7 @@ def test_build_completion_command_embeds_prompt_and_passes_effort(
     """Verify build_completion_command passes prompt to -p and includes effort."""
     generator = AntigravityCliGenerator(
         options=AntigravityCliOptions(
-            model="gemini-3.7-flash",
+            model=DEFAULT_GEMINI_MODEL,
             effort="low",
             home_dir=home_dir,
         ),
@@ -1053,7 +1033,7 @@ def test_build_completion_command_resolves_profile_effort(
     """Verify build_completion_command falls back to model profile effort."""
     generator = AntigravityCliGenerator(
         options=AntigravityCliOptions(
-            model="gemini-3.7-flash",
+            model=DEFAULT_GEMINI_MODEL,
             home_dir=home_dir,
         ),
     )
@@ -1103,7 +1083,7 @@ def test_build_command_emits_effort_flag(home_dir: Path) -> None:
     """Verify build_command passes --effort flag when configured."""
     runtime = AntigravityCliRuntime(
         options=AntigravityCliOptions(
-            model="gemini-3.7-flash",
+            model=DEFAULT_GEMINI_MODEL,
             effort="medium",
             home_dir=home_dir,
         ),
@@ -1111,7 +1091,7 @@ def test_build_command_emits_effort_flag(home_dir: Path) -> None:
     cmd = runtime.build_command("test query")
     idx = cmd.index("--effort")
     assert cmd[idx + 1] == "medium"
-    assert cmd[cmd.index("--model") + 1] == "gemini-3.7-flash"
+    assert cmd[cmd.index("--model") + 1] == DEFAULT_GEMINI_MODEL
 
 
 def test_build_command_omits_effort_flag_when_none(home_dir: Path) -> None:
@@ -1290,22 +1270,19 @@ def test_parse_stream_early_exit_suppresses_error_result() -> None:
     assert summary.error is None
 
 
-def test_temporary_home_dir_cleanup_on_cleanup_call(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_temporary_home_dir_cleanup_on_cleanup_call(clean_api_keys: None) -> None:
     """Verify runtime.cleanup() removes auto-generated temporary home directory."""
-    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
-    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
-    runtime = AntigravityCliRuntime(options=AntigravityCliOptions(model="gemini-3.7-flash"))
+    runtime = AntigravityCliRuntime(options=AntigravityCliOptions(model=DEFAULT_GEMINI_MODEL))
     home = runtime.home_dir
     assert home.is_dir()
     runtime.cleanup()
     assert not home.exists()
 
 
-def test_temporary_home_dir_cleanup_via_context_manager(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_temporary_home_dir_cleanup_via_context_manager(clean_api_keys: None) -> None:
     """Verify context manager automatically cleans up temporary home directory on exit."""
-    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
-    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
-    with AntigravityCliRuntime(options=AntigravityCliOptions(model="gemini-3.7-flash")) as runtime:
+    opts = AntigravityCliOptions(model=DEFAULT_GEMINI_MODEL)
+    with AntigravityCliRuntime(options=opts) as runtime:
         home = runtime.home_dir
         assert home.is_dir()
     assert not home.exists()
@@ -1321,11 +1298,9 @@ def test_explicit_home_dir_is_not_removed_by_cleanup(home_dir: Path) -> None:
 
 def test_build_env_sets_both_gemini_and_google_api_keys(
     home_dir: Path,
-    monkeypatch: pytest.MonkeyPatch,
+    clean_api_keys: None,
 ) -> None:
     """Verify build_env synchronizes GEMINI_API_KEY and GOOGLE_API_KEY from effective_api_key."""
-    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
-    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
     runtime = AntigravityCliRuntime(
         options=AntigravityCliOptions(
             home_dir=home_dir,
@@ -1382,9 +1357,7 @@ def test_extract_skill_from_line_ignores_non_resident_result(home_dir: Path) -> 
 def test_antigravity_cli_generator_configures_isolated_settings(home_dir: Path) -> None:
     """Verify AntigravityCliGenerator initializes isolated settings.json with denied permissions."""
     AntigravityCliGenerator(options=AntigravityCliOptions(home_dir=home_dir))
-    settings_file = _isolated_settings_path(home_dir)
-    assert settings_file.is_file()
-    settings = json.loads(settings_file.read_text())
+    settings = read_isolated_settings(home_dir)
     assert "permissions" in settings
     assert set(settings["permissions"]["deny"]) == set(DENIED_PERMISSION_ACTIONS)
 
@@ -1414,30 +1387,19 @@ def test_antigravity_cli_generator_cleans_owned_home_dir() -> None:
     assert not created_home.exists()
 
 
-def test_antigravity_cli_runtime_registers_atexit_for_temp_home(
+@pytest.mark.parametrize("target_cls", [AntigravityCliRuntime, AntigravityCliGenerator])
+def test_antigravity_cli_registers_atexit_for_temp_home(
     monkeypatch: pytest.MonkeyPatch,
+    target_cls: type[AntigravityCliRuntime | AntigravityCliGenerator],
 ) -> None:
-    """Verify AntigravityCliRuntime registers atexit cleanup when generating a temporary home."""
+    """Verify temporary home directory registers atexit cleanup upon creation."""
     registered: list[object] = []
     monkeypatch.setattr("atexit.register", registered.append)
-    runtime = AntigravityCliRuntime()
+    instance = target_cls()
     try:
-        assert runtime.cleanup in registered
+        assert instance.cleanup in registered
     finally:
-        runtime.cleanup()
-
-
-def test_antigravity_cli_generator_registers_atexit_for_temp_home(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Verify AntigravityCliGenerator registers atexit cleanup when generating a temporary home."""
-    registered: list[object] = []
-    monkeypatch.setattr("atexit.register", registered.append)
-    gen = AntigravityCliGenerator()
-    try:
-        assert gen.cleanup in registered
-    finally:
-        gen.cleanup()
+        instance.cleanup()
 
 
 @pytest.mark.parametrize(

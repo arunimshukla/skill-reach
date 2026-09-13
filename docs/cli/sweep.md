@@ -2,6 +2,10 @@
 
 Measure reachability decay and capacity limits across catalog sizes.
 
+> [!WARNING]
+> **Scaling Safety**
+> Scaling sweeps execute repeated live agent probe iterations across varying catalog sizes. Ensure all resident skills in the scaling neighborhood are trusted, or execute the sweep inside an isolated sandbox container (e.g. Docker or [Google Cloud Run sandboxes](../guides/sandboxing.md)). Pass `--yes` / `-y` or set `REACH_YES=1` to bypass interactive confirmation.
+
 ---
 
 ## Synopsis
@@ -78,4 +82,5 @@ reach sweep ./skills --format json > sweep.json
 | `--format`                         | Choice  | `text`                        | Output format: `text`, `json`, `csv`.                                                                                                               |
 | `--out`, `-o`                      | Path    | `.reach/sweep.json`           | File path to write results (format inferred from file extension or `--format`).                                                                     |
 | `--workdir`                        | Path    | Temp                          | Working directory for probe execution.                                                                                                              |
+| `--yes`, `-y`                      | Flag    | `false`                       | Bypass interactive safety confirmation prompts.                                                                                                     |
 | `--config`, `-c`                   | Path    | -                             | Path to reach.toml configuration file.                                                                                                              |

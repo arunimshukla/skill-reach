@@ -41,9 +41,11 @@ from reach.runtime import (
     agent_default_model,
 )
 from reach.runtime._env import (
+    detect_model_provider,
     sync_google_and_gemini_keys,
 )
 from reach.runtime._fs import (
+    ensure_private_directory,
     resolve_skill_from_path,
 )
 from reach.runtime._subprocess import (
@@ -112,8 +114,10 @@ def _ensure_isolated_settings(
     model_provider: str | None = None,
 ) -> None:
     """Write or update isolated permissions and workspace trusts in settings.json."""
-    path = _isolated_settings_path(resolve_path(home_dir))
-    path.parent.mkdir(parents=True, exist_ok=True)
+    resolved_home = resolve_path(home_dir)
+    ensure_private_directory(resolved_home)
+    path = _isolated_settings_path(resolved_home)
+    ensure_private_directory(path.parent)
     settings: dict[str, Any] = {}
     if path.exists():
         settings = json.loads(path.read_text())
@@ -458,7 +462,7 @@ class AntigravityCliRuntime(CliAgentRuntime[AntigravityCliOptions], AntigravityR
         if options.disable_slash_commands:
             command.append("--disable-slash-commands")
         timeout_s = self.timeout_s or 200
-        timeout_val = options.print_timeout or f"{int(timeout_s)}s"
+        timeout_val = options.print_timeout or f"{round(timeout_s)}s"
         command += ["--print-timeout", timeout_val]
         if self._resident:
             command += [
@@ -572,7 +576,7 @@ class AntigravityCliGenerator(BaseTextGenerator[AntigravityCliOptions]):
             atexit.register(self.cleanup)
         _ensure_isolated_settings(
             self.home_dir,
-            model_provider=self.options.model_provider,
+            model_provider=self.effective_model_provider,
         )
 
     def cleanup(self) -> None:
@@ -588,6 +592,15 @@ class AntigravityCliGenerator(BaseTextGenerator[AntigravityCliOptions]):
         self.cleanup()
 
     @property
+    def effective_model_provider(self) -> str | None:
+        """Return configured model_provider or auto-detect 'gemini' when API keys are present."""
+        return detect_model_provider(
+            self.model,
+            getattr(self.options, "model_provider", None),
+            api_key=self.options.api_key,
+        )
+
+    @property
     def effective_api_key(self) -> str | None:
         """Return configured API key or probe environment for fallback."""
         return (
@@ -596,9 +609,10 @@ class AntigravityCliGenerator(BaseTextGenerator[AntigravityCliOptions]):
             else os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
         )
 
+    @override
     def build_env(self) -> dict[str, str]:
         """Assemble process environment with API keys and isolated home directory."""
-        env = dict(os.environ)
+        env = super().build_env()
         env["HOME"] = str(self.home_dir)
         key = self.effective_api_key
         if key:
@@ -612,7 +626,7 @@ class AntigravityCliGenerator(BaseTextGenerator[AntigravityCliOptions]):
     def normalized_model(self) -> str:
         """Map canonical models to Antigravity CLI naming conventions."""
         m = self.model
-        return "gemini-3.7-flash" if "flash" in m else m
+        return "gemini-3.8-flash" if "flash" in m else m
 
     @property
     def effective_effort(self) -> str | None:
@@ -642,7 +656,7 @@ class AntigravityCliGenerator(BaseTextGenerator[AntigravityCliOptions]):
         if options.disable_slash_commands:
             cmd.append("--disable-slash-commands")
         timeout_s = self.timeout_s or 200
-        timeout_val = options.print_timeout or f"{int(timeout_s)}s"
+        timeout_val = options.print_timeout or f"{round(timeout_s)}s"
         cmd += ["--print-timeout", timeout_val]
         if self.effective_effort:
             cmd += ["--effort", self.effective_effort]

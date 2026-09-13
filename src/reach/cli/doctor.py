@@ -199,11 +199,13 @@ def _check_config(workdir: Path) -> CheckResult:
     """Validate reach.toml configuration file syntax and schema."""
     config_path = workdir / "reach.toml"
     if not config_path.is_file():
+        is_cwd = workdir.resolve() == Path.cwd().resolve()
+        location_desc = "current directory" if is_cwd else f"target directory '{workdir}'"
         return CheckResult(
             category="Project Configuration",
             name="reach.toml",
             status="warn",
-            detail="No reach.toml found in current directory (using defaults)",
+            detail=f"No reach.toml found in {location_desc} (using defaults)",
             remedy="Run 'reach init' to generate a tailored reach.toml",
         )
 
@@ -288,9 +290,16 @@ def run_doctor_checks(workdir: Path | None = None) -> list[CheckResult]:
             status="ok",
             detail="built-in Python driver (always available)",
         ),
-        _check_env_var("ANTHROPIC_API_KEY", "Anthropic Claude model completions"),
         _check_env_var("GEMINI_API_KEY", "Google Gemini model completions"),
         _check_google_adc(),
+        _check_env_var(
+            "ANTHROPIC_API_KEY",
+            "Anthropic Claude model completions (pass-through / experimental)",
+        ),
+        _check_env_var(
+            "OPENAI_API_KEY",
+            "OpenAI model completions (pass-through / experimental)",
+        ),
         _check_agent_registry(root),
         _check_skills(root),
         _check_config(root),

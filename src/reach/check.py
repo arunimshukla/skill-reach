@@ -61,8 +61,8 @@ __all__ = [
 class CheckStage(StrEnum):
     """Enumerate execution stages in the CI quality gate."""
 
-    STATIC = "static"
     EMPIRICAL = "empirical"
+    STATIC = "static"
 
 
 class EmpiricalMetrics(BaseModel):
@@ -118,6 +118,8 @@ class CheckOutcome(BaseModel):
 def changed_skills(
     since: str = "HEAD~1",
     root: Path | str | None = None,
+    *,
+    timeout: float = 30.0,
 ) -> tuple[str, ...]:
     """Identify skill names modified in git repository relative to a reference."""
     work_dir = Path(root).resolve() if root is not None else Path.cwd().resolve()
@@ -132,7 +134,11 @@ def changed_skills(
             text=True,
             cwd=work_dir,
             check=False,
+            timeout=timeout,
         )
+    except subprocess.TimeoutExpired as exc:
+        msg = f"git diff timed out after {timeout}s against ref '{since}'"
+        raise ValueError(msg) from exc
     except OSError:
         return ()
 
@@ -478,7 +484,7 @@ def _check_empty_queries_exit(
     return None
 
 
-def run_check(
+def run_check(  # noqa: PLR0913
     *,
     skills_paths: Sequence[Path | str] | None = None,
     queries_path: Path | str | None = None,
@@ -500,6 +506,7 @@ def run_check(
     rule_overrides: Mapping[str, Severity] | None = None,
     runtime_options: dict[str, Any] | None = None,
     global_scope: bool = False,
+    yes: bool = False,
 ) -> CheckOutcome:
     """Execute two-stage quality gate: static lint pre-flight then empirical assertions."""
     if settings is not None:
@@ -567,6 +574,36 @@ def run_check(
     empty_outcome = _check_empty_queries_exit(lint_report, queries_to_run, check_settings.budget)
     if empty_outcome is not None:
         return empty_outcome
+
+    from reach.config import default_agent
+
+    resolved_agent = agent or (config.runtime.agent if config is not None else default_agent())
+    if resolved_agent not in ("keyword", FAKE_AGENT):
+        from reach.cli.safety import confirm_skill_execution
+        from reach.views import build_console
+
+        console = build_console()
+        loaded = _load_catalog_skills(resolved_paths)
+        trusted = config.study.trusted if config is not None else False
+        if code := confirm_skill_execution(
+            console,
+            runtime_name=resolved_agent,
+            skills=loaded,
+            roots=resolved_paths,
+            action="check empirical probes",
+            yes=yes,
+            trusted=trusted,
+        ):
+            return CheckOutcome(
+                lint_report=lint_report,
+                stage_failed=CheckStage.EMPIRICAL,
+                assertions=(),
+                skills_checked=lint_report.skills_checked,
+                queries_probed=0,
+                probes_executed=0,
+                budget=check_settings.budget,
+                exit_code=code,
+            )
 
     report, metrics, probes_executed = _execute_empirical_probes(
         queries_to_run,

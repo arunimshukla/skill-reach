@@ -287,6 +287,11 @@ Controls default file paths for benchmark queries, skill roots, workspaces, and 
 | `early_stop` | Boolean                             | `true`   | When true, terminates scaling sweeps early if $F_1$ upper CI drops below threshold.                                        |
 | `scales`     | Sequence[Integer]                   | `None`   | Pre-configured catalog sizes for scaling sweeps (e.g. `[10, 25, 50, 100]`).                                                |
 | `anchor`     | Integer / Sequence[String] / String | `None`   | Anchor skills cohort evaluated across all scales (count, skill names list, or `"all"`).                                    |
+| `trusted`    | Boolean                             | `false`  | When true, trusts resident skills and bypasses interactive safety confirmation prompts.                                    |
+
+> [!CAUTION]
+> **Risk of Bypassing Safety Confirmation**
+> Setting `trusted = true` bypasses interactive safety confirmation prompts across all commands that launch live agent probes. **Only enable `trusted = true` in private repositories where all skill manifests and instructions have been vetted and reviewed.** Never enable `trusted = true` on repositories that evaluate untrusted or community-contributed skills.
 
 ### `[catalog]`
 
@@ -313,11 +318,12 @@ Controls probe replication and network resilience.
 
 ### `[runtime]`
 
-| Key          | Type    | Default | Description                                                                     |
-| :----------- | :------ | :------ | :------------------------------------------------------------------------------ |
-| `timeout_s`  | Integer | `200`   | Process execution timeout in seconds before aborting an unresponsive probe.     |
-| `max_turns`  | Integer | `3`     | Maximum conversation turns to execute and evaluate per probe.                   |
-| `early_exit` | Boolean | `true`  | When true, aborts probe execution immediately when the target skill is invoked. |
+| Key                | Type             | Default | Description                                                                                                                                                                                                                                                                                                         |
+| :----------------- | :--------------- | :------ | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `timeout_s`        | Integer          | `200`   | Process execution timeout in seconds before aborting an unresponsive probe.                                                                                                                                                                                                                                         |
+| `max_turns`        | Integer          | `3`     | Maximum conversation turns to execute and evaluate per probe.                                                                                                                                                                                                                                                       |
+| `early_exit`       | Boolean          | `true`  | When true, aborts probe execution immediately when the target skill is invoked.                                                                                                                                                                                                                                     |
+| `blocked_env_vars` | Sequence[String] | `None`  | Explicit list of ambient environment variables to strip from child agent processes. When omitted, Reach's default sensitive credentials are stripped (with automatic exemption of `GOOGLE_APPLICATION_CREDENTIALS` when Vertex AI or Google Enterprise mode is active). Set to `[]` to allow all ambient variables. |
 
 ### `[lint]` & `[lint.rules]`
 
@@ -441,6 +447,8 @@ Configuration values in `reach.toml` can also interpolate environment variables 
 | Variable              | Description                                                                                       |
 | :-------------------- | :------------------------------------------------------------------------------------------------ |
 | `REACH_NO_BROWSER`    | Set to `"1"` or `"true"` to bypass interactive browser review for drafted queries.                |
+| `REACH_YES`           | Set to `"1"` or `"true"` to bypass interactive safety confirmation prompts in CI/CD and scripts.  |
+| `REACH_FORCE`         | Set to `"1"` or `"true"` as an alias to bypass interactive safety confirmation prompts.           |
 | `GITHUB_STEP_SUMMARY` | When set (in GitHub Actions), `reach check` automatically writes markdown summaries to this file. |
 | `NO_MKDOCS_2_WARNING` | Set to `"1"` to suppress upstream MkDocs 2.0 console notices during documentation builds.         |
 
@@ -450,11 +458,14 @@ Configuration values in `reach.toml` can also interpolate environment variables 
 
 Reach automatically routes model API keys to the corresponding environment variables expected by each runtime agent:
 
-| Provider | Injected Environment Variables |
-| :--- | :--- |
-| `google` / `gemini` | `GEMINI_API_KEY`, `GOOGLE_API_KEY` |
-| `anthropic` | `ANTHROPIC_API_KEY` |
-| `openai` | `OPENAI_API_KEY` |
+| Provider            | Injected Environment Variables     | Support Tier                |
+| :------------------ | :--------------------------------- | :-------------------------- |
+| `google` / `gemini` | `GEMINI_API_KEY`, `GOOGLE_API_KEY` | Tested (Primary reference)  |
+| `anthropic`         | `ANTHROPIC_API_KEY`                | Pass-through (Experimental) |
+| `openai`            | `OPENAI_API_KEY`                   | Pass-through (Experimental) |
+
+> [!NOTE]
+> **Provider Support Status**: Google Gemini is the primary, tested, and benchmarked provider for Reach. Ambient environment credentials for Anthropic (`ANTHROPIC_API_KEY`) and OpenAI (`OPENAI_API_KEY`) pass through transparently to child subprocesses for Bring-Your-Own-Key (BYOK) workflows, but third-party CLI output schemas, telemetry, and model evaluations are experimental and unverified.
 
 If an unrecognized provider name is specified via options, Reach raises an error rather than mapping credentials to an unintended third-party provider. For custom, local, or self-hosted model engines (such as Ollama, vLLM, or Mistral), set the provider's expected environment variables directly in your shell or CI workflow.
 

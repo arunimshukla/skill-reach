@@ -415,6 +415,7 @@ def test_optimize_cli_forwards_new_parameters(
                 "0.25",
                 "--no-auto-queries",
                 "--review",
+                "-y",
             ],
         )
         assert ret == 0
@@ -444,7 +445,7 @@ def test_optimize_cli_defaults_holdout_to_point_two(
             candidates=(),
         )
 
-        ret = main(["optimize", "--skill", "def-tool", "--skills", str(tmp_path)])
+        ret = main(["optimize", "--skill", "def-tool", "--skills", str(tmp_path), "-y"])
         assert ret == 0
         mock_opt.assert_called_once()
         _, kwargs = mock_opt.call_args
@@ -477,6 +478,7 @@ def test_optimize_cli_forwards_candidate_parameter(
                 str(tmp_path),
                 "--candidate",
                 "2",
+                "-y",
             ]
         )
         assert ret == 0

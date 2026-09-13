@@ -17,13 +17,18 @@
 from __future__ import annotations
 
 import importlib
+import os
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from math import floor
 from typing import Any, Protocol, cast, runtime_checkable
 
 from reach.config import DEFAULT_GEMINI_MODEL
-from reach.runtime._env import raise_missing_agent_dependency
+from reach.runtime._env import (
+    raise_missing_agent_dependency,
+    resolve_blocked_env_vars,
+    sanitize_subprocess_env,
+)
 from reach.runtime.profiles import model_profile
 
 __all__ = [
@@ -37,6 +42,8 @@ __all__ = [
 class TextGenerator(Protocol):
     """Protocol for models or drivers capable of generating raw text completions."""
 
+    options: Any
+
     @property
     def name(self) -> str:
         """Return generator name or agent identifier."""
@@ -45,6 +52,11 @@ class TextGenerator(Protocol):
     @property
     def model(self) -> str:
         """Return the model identifier used for generation."""
+        ...
+
+    @model.setter
+    def model(self, value: str) -> None:
+        """Update configured model identifier."""
         ...
 
     @property
@@ -91,6 +103,13 @@ class BaseTextGenerator[OptionsT](ABC):
         """Return configured model identifier."""
         return self._model
 
+    @model.setter
+    def model(self, value: str) -> None:
+        """Update configured model identifier."""
+        self._model = value
+        if hasattr(self.options, "model_copy"):
+            self.options = self.options.model_copy(update={"model": value})
+
     def prompt_budget_chars(self) -> int | None:
         """Return maximum character length for prompts, or None if unbounded."""
         try:
@@ -99,6 +118,15 @@ class BaseTextGenerator[OptionsT](ABC):
             return floor(window * profile.chars_per_token)
         except (KeyError, ValueError):
             return None
+
+    @property
+    def blocked_env_vars(self) -> tuple[str, ...] | None:
+        """Return blocked environment variables configured on options or settings."""
+        return resolve_blocked_env_vars(self.options, getattr(self, "settings", None))
+
+    def build_env(self) -> dict[str, str]:
+        """Assemble sanitized process environment for generator execution."""
+        return sanitize_subprocess_env(dict(os.environ), blocked_env_vars=self.blocked_env_vars)
 
     @abstractmethod
     def complete(self, prompt: str) -> str:
@@ -111,7 +139,7 @@ def _build_agent_generator(
     model: str,
     timeout_s: int,
     opts: dict[str, Any],
-) -> TextGenerator | None:
+) -> BaseTextGenerator[Any] | None:
     """Instantiate a concrete TextGenerator matching the requested agent name."""
     if target_agent == "fake":
         from reach.runtime.fake import FakeGenerator, FakeOptions, resolve_fake_options
@@ -125,9 +153,10 @@ def _build_agent_generator(
             timeout_s=timeout_s,
         )
     if target_agent == "keyword":
-        from reach.runtime.keyword import KeywordGenerator
+        from reach.runtime.keyword import KeywordGenerator, KeywordOptions
 
-        return KeywordGenerator(model=model, timeout_s=timeout_s)
+        kw_opts = KeywordOptions.model_validate({"model": model, **opts})
+        return KeywordGenerator(model=model, timeout_s=timeout_s, options=kw_opts)
 
     cli_map = {
         "claude-code": (
@@ -167,7 +196,7 @@ def build_text_generator(
     agent: str | None = None,
     timeout_s: float | None = None,
     options: Mapping[str, Any] | None = None,
-) -> TextGenerator:
+) -> BaseTextGenerator[Any]:
     """Construct a TextGenerator instance configured for query drafting or optimization."""
     from reach.config import agent_default_model, default_agent
     from reach.runtime import known_agents

@@ -20,7 +20,11 @@ import subprocess
 import sys
 from typing import TYPE_CHECKING, Any
 
-from reach.runtime._subprocess import _ProcessGroupController, run_subprocess_probe
+from reach.runtime._subprocess import (
+    _ProcessGroupController,
+    _StderrDrainer,
+    run_subprocess_probe,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -207,3 +211,34 @@ def test_process_group_controller_lifecycle(tmp_path: Path) -> None:
             proc.stdout.close()
         if proc.stderr and not proc.stderr.closed:
             proc.stderr.close()
+
+
+def test_stderr_drainer_accumulates_lines() -> None:
+    """Verify StderrDrainer reads and joins lines from an input stream."""
+    stream = iter(["line1\n", "line2\n", "line3"])
+    drainer = _StderrDrainer(stream)
+    result = drainer.join(timeout=1.0)
+    assert result == "line1\nline2\nline3"
+
+
+def test_stderr_drainer_handles_none_stream() -> None:
+    """Verify StderrDrainer handles None stream without error."""
+    drainer = _StderrDrainer(None)
+    result = drainer.join(timeout=1.0)
+    assert result == ""
+
+
+def test_stderr_drainer_thread_safe_concurrent_reads() -> None:
+    """Verify StderrDrainer safely joins while background thread appends chunks."""
+    import time
+
+    def slow_stream() -> Any:
+        for i in range(50):
+            time.sleep(0.001)
+            yield f"line {i}\n"
+
+    drainer = _StderrDrainer(slow_stream())
+    _ = [drainer.join(timeout=0.005) for _ in range(5)]
+    full = drainer.join(timeout=2.0)
+    assert "line 0\n" in full
+    assert "line 49\n" in full

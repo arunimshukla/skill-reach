@@ -135,12 +135,13 @@ def _run_figures(artifact: Artifact) -> Text:
         ]
     )
 
+    attempts_label = "attempt" if spread.replicates == 1 else "attempts"
     parts.append(
         (
             (
                 f"\nmacro-F1 {scores.not_headline.macro_f1 * 100:.1f}%"
                 f"  over {len(scores.not_headline.labels)} observed labels"
-                f"  [{spread.replicates} replicates,"
+                f"  [{spread.replicates} {attempts_label},"
                 f" {spread.repeated_queries} repeated queries]"
             ),
             "reach.digest",

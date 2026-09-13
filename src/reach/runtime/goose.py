@@ -37,8 +37,8 @@ from reach.runtime._env import (
     sync_google_and_gemini_keys,
 )
 from reach.runtime._fs import (
+    ensure_private_directory,
     resolve_skill_from_path,
-    safe_cleanup_isolated_dir,
 )
 from reach.runtime._subprocess import (
     extract_content_reasoning,
@@ -246,6 +246,7 @@ class GooseRuntime(CliAgentRuntime[GooseOptions]):
     options: GooseOptions
     api_key_env_var: str | None = None
     _skills_subpath: str = ".agents/skills"
+    isolation_dir_name: ClassVar[str | None] = ".reach_goose"
 
     def __init__(
         self,
@@ -343,24 +344,14 @@ class GooseRuntime(CliAgentRuntime[GooseOptions]):
         )
         sync_google_and_gemini_keys(env)
 
-        if workdir is not None and self.options.isolate_config_dir:
-            isolated_dir = (self.options.home_dir or (Path(workdir) / ".reach_goose")).resolve()
-            isolated_dir.mkdir(parents=True, exist_ok=True)
+        if workdir is not None and (iso_dir := self.effective_isolation_dir(workdir)) is not None:
+            isolated_dir = ensure_private_directory(iso_dir)
             env["HOME"] = str(isolated_dir)
             env["XDG_CONFIG_HOME"] = str(isolated_dir / ".config")
             env["XDG_DATA_HOME"] = str(isolated_dir / ".local" / "share")
             env["XDG_STATE_HOME"] = str(isolated_dir / ".local" / "state")
 
         return env
-
-    @override
-    def post_probe(self, workdir: Path) -> None:
-        """Clean session and agent artifacts after probe execution if auto_clean is enabled."""
-        if not self.options.auto_clean:
-            return
-        if self.options.isolate_config_dir:
-            goose_dir = self.options.home_dir or (Path(workdir) / ".reach_goose")
-            safe_cleanup_isolated_dir(workdir, goose_dir)
 
 
 class GooseGenerator(BaseTextGenerator[GooseOptions]):
