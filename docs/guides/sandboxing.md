@@ -41,6 +41,8 @@ reach check --agent keyword
 reach sweep --agent keyword
 ```
 
+The keyword driver is an in-memory lexical matching engine that matches query terms against skill names and descriptions using compiled word-boundary regular expressions and BM25 scoring, simulating agent routing decisions without running subprocesses, executing tools, or making network calls.
+
 ### Why `--agent keyword` is Safe
 
 1. **Zero Process Execution**: Operates purely in Python memory using compiled word-boundary regular expressions. It never invokes `subprocess` or shell commands.

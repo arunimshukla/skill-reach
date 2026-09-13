@@ -79,7 +79,7 @@ reach eval ./my-skills/deploy-docker --agent keyword
 ```
 
 /// tip
-Use `--agent keyword` for instant, offline verification without consuming model tokens or requiring API keys. For live model probing, select `--agent claude-code` or `--agent antigravity-cli`.
+Use `--agent keyword` for instant, offline verification without consuming model tokens or requiring API keys: it is an in-memory lexical matching engine that matches query terms against skill names and descriptions using compiled word-boundary regular expressions and BM25 scoring, simulating agent routing decisions without subprocesses or network calls. For live model probing, select `--agent claude-code` or `--agent antigravity-cli`.
 ///
 
 /// note | Evaluating a Single Skill vs. Full Catalog

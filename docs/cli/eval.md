@@ -4,7 +4,7 @@ Measure whether a catalog's skills are reachable when resident alongside their r
 
 > [!WARNING]
 > **Agent Execution Safety**
-> `reach eval` executes live agent subprocesses that can run tools and shell commands on the host system. When testing third-party or untrusted skills, execute inside an isolated container sandbox (e.g. Docker or [Google Cloud Run sandboxes](../guides/sandboxing.md)) or use `--agent keyword`. Automated non-interactive environments must explicitly pass `--yes` / `-y` or set `REACH_YES=1` to bypass the safety confirmation gate.
+> `reach eval` executes live agent subprocesses that can run tools and shell commands on the host system. When testing third-party or untrusted skills, execute inside an isolated container sandbox (e.g. Docker or [Google Cloud Run sandboxes](../guides/sandboxing.md)) or use `--agent keyword` (an in-memory lexical matching engine that matches query terms against skill manifests via compiled regexes and BM25 scoring without running subprocesses or external APIs). Automated non-interactive environments must explicitly pass `--yes` / `-y` or set `REACH_YES=1` to bypass the safety confirmation gate.
 
 ---
 

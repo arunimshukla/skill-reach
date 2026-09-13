@@ -91,9 +91,7 @@ export GOOGLE_GENAI_USE_ENTERPRISE=true
 
 ### Anthropic Claude Code
 
-When evaluating with the Claude Code CLI runtime (`claude-code`), configure either Google Cloud Model Garden or direct Anthropic API credentials:
-
-**Via Google Cloud Model Garden:**
+When evaluating with the Claude Code CLI runtime (`claude-code`), authenticate via Google Cloud Model Garden with Application Default Credentials (ADC):
 
 ```sh
 # 1. Authenticate with Google Cloud
@@ -103,12 +101,6 @@ gcloud auth application-default login
 export CLAUDE_CODE_USE_VERTEX=1
 export ANTHROPIC_VERTEX_PROJECT_ID="your-project-id"
 export CLOUD_ML_REGION="us-east5"
-```
-
-**Via Anthropic API:**
-
-```sh
-export ANTHROPIC_API_KEY="your-anthropic-api-key"
 ```
 
 ## Quickstart
@@ -133,7 +125,7 @@ uv run reach overlap path/to/skills --skill my-skill --suggest
 
 > [!CAUTION]
 > **Security Notice: Probing Untrusted Skills**
-> Probing skills with live agent runtimes executes real agent processes with host filesystem and command execution permissions. When evaluating unvetted or third-party skills, **always run Reach inside an isolated sandbox** (such as Docker or [Google Cloud Run sandboxes](docs/guides/sandboxing.md)), or use the safe offline `--agent keyword` driver. Reach prompts for confirmation by default and fails closed in non-interactive CI environments unless `--yes` / `-y` (or `REACH_YES=1`) is supplied.
+> Probing skills with live agent runtimes executes real agent processes with host filesystem and command execution permissions. When evaluating unvetted or third-party skills, **always run Reach inside an isolated sandbox** (such as Docker or [Google Cloud Run sandboxes](docs/guides/sandboxing.md)), or use the safe offline `--agent keyword` driver (an in-memory lexical matching engine that matches query terms against skill names and descriptions using compiled word-boundary regexes and BM25 scoring without running subprocesses, executing tools, or making network calls). Reach prompts for confirmation by default and fails closed in non-interactive CI environments unless `--yes` / `-y` (or `REACH_YES=1`) is supplied.
 
 ### 2. Run a quick evaluation
 
@@ -444,8 +436,8 @@ Reach provides two levels of agent integration:
 Live model probing and description optimization are currently supported for:
 
 - **Google Antigravity** (`antigravity-cli`, default; `antigravity-sdk`): Drives the headless `agy` CLI with filesystem sandboxing, or the Python SDK with structured JSON schemas. Default model: `gemini-3.8-flash` (supports `gemini-3.8-flash`, `gemini-3.7-flash`, `gemini-3.6-flash`, `gemini-3.5-flash`, `gemini-3.5-flash-lite`, `gemini-3.1-pro`, `gemini-3.1-pro-preview`, `gemini-2.5-flash`, `gemini-2.5-pro`). Supports authentication via Gemini API keys or Google Cloud Agent Platform.
-- **Anthropic Claude Code** (`claude-code`): Drives the `claude` CLI with multi-turn trajectory execution (`max_turns = 3`, `early_exit = true`), denied background tools, observed `Skill` tool calls, and prompt listing budget validation. Default model: `claude-sonnet-5` (supports `claude-sonnet-5`, `claude-opus-5`, `claude-haiku-4-5`). Supports authentication via Google Cloud Vertex AI Model Garden or direct Anthropic API.
-- **Goose** (`goose`): Drives the headless `goose` CLI ([`aaif-goose/goose`](https://github.com/aaif-goose/goose)) with automated session management and execution observation. Default model: `gemini-3.6-flash` (supports `gemini-3.6-flash`, `gemini-3-flash-preview`, `gemini-3.1-flash-lite`, `gemini-3.1-pro-preview`). Authenticates via provider environment variables or standard Goose configuration profiles.
+- **Anthropic Claude Code** (`claude-code`): Drives the `claude` CLI with multi-turn trajectory execution (`max_turns = 3`, `early_exit = true`), denied background tools, observed `Skill` tool calls, and prompt listing budget validation. Default model: `claude-sonnet-5` (supports `claude-sonnet-5`, `claude-opus-5`, `claude-haiku-4-5`). Supports authentication via Google Cloud Model Garden on Agent Platform.
+- **Goose** (`goose`): Drives the headless `goose` CLI ([`aaif-goose/goose`](https://github.com/aaif-goose/goose)) with automated session management and execution observation. Default model: `gemini-3.6-flash` (supports `gemini-3.6-flash`, `gemini-3.1-flash-lite`, or any configured Goose provider model). Authenticates via provider environment variables or standard Goose configuration profiles.
 - **Pi Agent Harness** (`pi`): Drives the headless `pi` CLI ([`earendil-works/pi`](https://github.com/earendil-works/pi)) with progressive disclosure skill loading, tool isolation (`--tools read`), and native session JSONL transcript parsing. Default model: `gemini-3.8-flash` (supports any configured provider model). Authenticates via provider environment variables or `~/.pi/agent/settings.json`.
 - **Lexical Baseline**:
   - `keyword`: High-speed lexical BM25 matching without model API calls or token costs.
@@ -529,7 +521,7 @@ backoff_s = 5.0
 When evaluating, probing, or optimizing skill catalogs, live agent runtimes execute real tools, file operations, and shell commands on the host machine. Reach provides safety boundaries across three operational tiers:
 
 1. **Interactive Confirmation Gate**: Commands that launch live agent probes (`eval`, `sweep`, `check` Stage 2, `optimize`) display an interactive security panel detailing the target catalog locations, skill count, and active runtime before any probe subprocess is spawned. Non-interactive environments fail closed with exit code `2` unless `--yes` / `-y`, `REACH_YES=1`, or `trusted = true` is configured.
-2. **Deterministic Offline Keyword Driver**: For zero-risk offline evaluation, `--agent keyword` evaluates lexical reachability using compiled regular expressions entirely in Python memory—with zero subprocesses, zero tool calls, zero token spend, and automatic prompt bypass.
+2. **Deterministic Offline Keyword Driver**: For zero-risk offline evaluation, `--agent keyword` evaluates lexical reachability using compiled word-boundary regular expressions and BM25 scoring entirely in Python memory—simulating agent routing decisions with zero subprocesses, zero tool calls, zero token spend, and automatic prompt bypass.
 3. **Containerized & Cloud-Native Sandboxing**:
    - **Docker / Podman**: Mount catalogs read-only into ephemeral containers.
    - **Google Cloud Run Sandboxes**: Run Reach as a Cloud Run Job or Service with `--sandbox-launcher` (`sandboxLauncher: true`) to leverage instance-local micro-sandboxes via `sandbox do`. Cloud Run sandboxes block outbound network egress by default, restrict filesystem modifications to tmpfs overlays, and completely block access to the Google Cloud metadata server (`http://metadata.google.internal`), preventing credential theft.

@@ -151,7 +151,10 @@ def _check_google_adc() -> CheckResult:
         name="Google Cloud ADC",
         status="warn",
         detail="not found",
-        remedy="Run 'gcloud auth application-default login' if using Vertex AI",
+        remedy=(
+            "Run 'gcloud auth application-default login' if using Google Cloud "
+            "Model Garden on Agent Platform"
+        ),
     )
 
 
@@ -292,14 +295,6 @@ def run_doctor_checks(workdir: Path | None = None) -> list[CheckResult]:
         ),
         _check_env_var("GEMINI_API_KEY", "Google Gemini model completions"),
         _check_google_adc(),
-        _check_env_var(
-            "ANTHROPIC_API_KEY",
-            "Anthropic Claude model completions (pass-through / experimental)",
-        ),
-        _check_env_var(
-            "OPENAI_API_KEY",
-            "OpenAI model completions (pass-through / experimental)",
-        ),
         _check_agent_registry(root),
         _check_skills(root),
         _check_config(root),

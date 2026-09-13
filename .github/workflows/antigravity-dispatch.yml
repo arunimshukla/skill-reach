@@ -16,7 +16,7 @@ name: Antigravity Review Dispatch
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened]
+    types: [opened, reopened]
   issue_comment:
     types: [created]
 
