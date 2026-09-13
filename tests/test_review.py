@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import email.message
 import json
 import urllib.error
 import urllib.request
@@ -38,7 +39,7 @@ from reach.review import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Mapping
     from pathlib import Path
 
 
@@ -324,6 +325,11 @@ def _assert_review_server_endpoints(url: str) -> None:
         assert resp.headers.get("X-Content-Type-Options") == "nosniff"
         assert resp.headers.get("X-Frame-Options") == "DENY"
 
+    _assert_review_security_endpoints(url, post_data)
+
+
+def _assert_review_security_endpoints(url: str, post_data: Mapping[str, object]) -> None:
+    """Verify security controls on the running review server (DNS rebinding, CSRF, IPv6)."""
     # 7. Test security: Reject invalid Host header (DNS rebinding protection)
     bad_host_req = urllib.request.Request(  # noqa: S310
         f"{url}/api/status",
@@ -348,6 +354,29 @@ def _assert_review_server_endpoints(url: str) -> None:
         urllib.request.urlopen(csrf_req)  # noqa: S310
     exc_info.value.close()
     assert exc_info.value.code == 403
+
+    port = url.rsplit(":", 1)[-1]
+
+    # 9. Test security: Accept valid IPv6 Host header
+    ipv6_host_req = urllib.request.Request(  # noqa: S310
+        f"{url}/api/status",
+        headers={"Host": f"[::1]:{port}"},
+    )
+    with urllib.request.urlopen(ipv6_host_req) as resp:  # noqa: S310
+        assert resp.status == 200
+
+    # 10. Test security: Accept valid IPv6 Origin header
+    ipv6_origin_req = urllib.request.Request(  # noqa: S310
+        f"{url}/api/save",
+        data=json.dumps(post_data).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "Origin": f"http://[::1]:{port}",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(ipv6_origin_req) as resp:  # noqa: S310
+        assert resp.status == 200
 
 
 def test_launch_query_review_http_server_saves_and_shuts_down(
@@ -378,11 +407,15 @@ def test_launch_query_review_http_server_saves_and_shuts_down(
     )
 
     server_port: list[int] = []
+    bg_error: list[Exception] = []
 
     def mock_webbrowser_open(url: str) -> bool:
         port = int(url.rsplit(":", maxsplit=1)[-1])
         server_port.append(port)
-        _assert_review_server_endpoints(url)
+        try:
+            _assert_review_server_endpoints(url)
+        except (urllib.error.URLError, AssertionError, json.JSONDecodeError) as exc:
+            bg_error.append(exc)
         return True
 
     with (
@@ -391,6 +424,9 @@ def test_launch_query_review_http_server_saves_and_shuts_down(
         patch("webbrowser.open", side_effect=mock_webbrowser_open),
     ):
         curated_qs = launch_query_review(qs, target, [rival], timeout=5)
+
+    if bg_error:
+        raise bg_error[0]
 
     assert len(curated_qs.queries) == 3
     q1, q2, q3 = curated_qs.queries
@@ -582,3 +618,56 @@ def test_review_query_item_unrecognized_expected_skill_rejected_with_context() -
         context={"allowed_skills": {"target-skill", "rival-skill"}},
     )
     assert valid_oos.queries[0].expected_skill is None
+
+
+@pytest.mark.parametrize(
+    ("host", "expected"),
+    [
+        ("", True),
+        ("localhost", True),
+        ("localhost:8080", True),
+        ("127.0.0.1", True),
+        ("127.0.0.1:3000", True),
+        ("testserver", True),
+        ("testserver:80", True),
+        ("[::1]", True),
+        ("[::1]:8080", True),
+        ("attacker.com", False),
+        ("attacker.com:8080", False),
+        ("127.0.0.1.attacker.com", False),
+        ("evil.com:127.0.0.1", False),
+    ],
+)
+def test_review_server_handler_is_valid_host(host: str, expected: bool) -> None:
+    """Verify Host header validation permits local IPv4/IPv6 and blocks foreign hosts."""
+    handler = object.__new__(ReviewServerHandler)
+    msg = email.message.EmailMessage()
+    if host:
+        msg["Host"] = host
+    handler.headers = msg
+    assert handler._is_valid_host() is expected
+
+
+@pytest.mark.parametrize(
+    ("origin", "expected"),
+    [
+        (None, True),
+        ("", True),
+        ("null", True),
+        ("http://127.0.0.1:8080", True),
+        ("http://localhost:3000", True),
+        ("http://[::1]:8080", True),
+        ("https://localhost:443", True),
+        ("https://attacker.com", False),
+        ("http://127.0.0.1.attacker.com", False),
+        ("javascript:void(0)", False),
+    ],
+)
+def test_review_server_handler_is_valid_origin(origin: str | None, expected: bool) -> None:
+    """Verify Origin header validation permits local loopback and blocks cross-origin requests."""
+    handler = object.__new__(ReviewServerHandler)
+    msg = email.message.EmailMessage()
+    if origin is not None:
+        msg["Origin"] = origin
+    handler.headers = msg
+    assert handler._is_valid_origin() is expected

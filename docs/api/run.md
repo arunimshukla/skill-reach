@@ -28,4 +28,5 @@ Orchestration engine for conducting evaluation runs, assembling catalogs, and ex
         - validate_catalog_fit
         - validate_query_coverage
         - validate_residency
+        - write_results
         - write_sidecar

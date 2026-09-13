@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from reach._io import atomic_write_text
 from reach.artifact import (
     DEFAULT_SAMPLE_QUERIES,
     Artifact,
@@ -44,7 +45,7 @@ from reach.runtime import AgentRuntime, CatalogFit, build_runtime
 from reach.uncertainty import detectable_delta
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator, Sequence
+    from collections.abc import Callable, Iterable, Iterator, Sequence
 
 __all__ = [
     "Composition",
@@ -68,6 +69,7 @@ __all__ = [
     "validate_catalog_fit",
     "validate_query_coverage",
     "validate_residency",
+    "write_results",
     "write_sidecar",
 ]
 
@@ -186,6 +188,14 @@ def append_result(path: Path | str, result: ProbeResult) -> None:
     """Append a ProbeResult model as a JSON line to the target file."""
     with Path(path).open("a", encoding="utf-8") as handle:
         handle.write(result.model_dump_json() + "\n")
+
+
+def write_results(path: Path | str, results: Iterable[ProbeResult]) -> Path:
+    """Persist a collection of ProbeResult models as JSON lines to the target file."""
+    resolved = Path(path).expanduser().resolve()
+    content = "".join(f"{r.model_dump_json()}\n" for r in results)
+    atomic_write_text(resolved, content)
+    return resolved
 
 
 def load_results(path: Path | str) -> list[ProbeResult]:
@@ -604,11 +614,19 @@ class ProbeHarness:
 
         previous: list[ProbeResult] = []
         skip: set[tuple[str, int]] = set()
+        raw_previous_count = 0
         if resolved_out is not None:
             resolved_out.parent.mkdir(parents=True, exist_ok=True)
             if resume and resolved_out.exists():
-                previous = load_results(resolved_out)
+                raw_previous = load_results(resolved_out)
+                raw_previous_count = len(raw_previous)
                 skip = completed_attempts(resolved_out)
+                by_attempt: dict[tuple[str, int], ProbeResult] = {
+                    (r.query_id, r.attempt): r
+                    for r in raw_previous
+                    if (r.query_id, r.attempt) in skip
+                }
+                previous = list(by_attempt.values())
 
         total = len(query_set.queries) * config.plan.attempts
         results = list(previous)
@@ -630,6 +648,8 @@ class ProbeHarness:
                 progress(index, total, result)
 
         if resolved_out is not None:
+            if resume and len(skip) < raw_previous_count:
+                write_results(resolved_out, results)
             write_sidecar(config, resolved_out)
 
         return RunOutcome(

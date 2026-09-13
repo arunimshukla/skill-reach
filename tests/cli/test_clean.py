@@ -121,3 +121,32 @@ def test_clean_all_flag(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
     assert not eval_file.exists()
     assert not queries_file.exists()
     assert not report_file.exists()
+
+
+def test_clean_all_removes_sweep_results_and_artifact_sidecars(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify reach clean --all purges sweep output and artifact sidecars, sparing other files."""
+    monkeypatch.chdir(tmp_path)
+    reach_dir = tmp_path / ".reach"
+    reach_dir.mkdir(parents=True, exist_ok=True)
+    purged = [
+        reach_dir / name
+        for name in (
+            "eval.json",
+            "eval.json.artifact.json",
+            "sweep.json",
+            "sweep.json.artifact.json",
+            "custom-run.json.artifact.json",
+        )
+    ]
+    for path in purged:
+        path.write_text("{}")
+    preserved = reach_dir / "notes.md"
+    preserved.write_text("hand-written notes")
+
+    assert main(["clean", "--all"]) == 0
+
+    assert [p.name for p in purged if p.exists()] == []
+    assert preserved.exists()

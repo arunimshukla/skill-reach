@@ -29,6 +29,7 @@ from cyclopts import Parameter
 
 from reach.catalog import load_skills
 from reach.config import RunConfig
+from reach.registry import find_adc_path
 from reach.views import build_console, render_doctor_table
 
 from .app import SETUP, app
@@ -137,8 +138,8 @@ def _check_google_adc() -> CheckResult:
             status="ok",
             detail=f"configured via GOOGLE_APPLICATION_CREDENTIALS ({custom})",
         )
-    adc_standard = Path.home() / ".config/gcloud/application_default_credentials.json"
-    if adc_standard.is_file():
+    adc_standard = find_adc_path()
+    if adc_standard is not None and adc_standard.is_file():
         return CheckResult(
             category="Credentials & Environment",
             name="Google Cloud ADC",

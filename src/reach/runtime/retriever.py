@@ -17,7 +17,6 @@
 from __future__ import annotations
 
 import shutil
-import threading
 from pathlib import Path
 from typing import TYPE_CHECKING, override
 
@@ -25,6 +24,7 @@ from reach.config import RuntimeSettings
 from reach.models import Catalog, CatalogMode, Skill
 from reach.retrieval import Bm25Scorer, TextScorer
 from reach.runtime import AgentRuntime, CatalogFit, SelectionOutcome, SkillRoot
+from reach.runtime._fs import probe_slot_dir, probe_slot_id
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -103,8 +103,8 @@ class TwoStageRetrieverRuntime(AgentRuntime):
         if not top_names and self._all_skills:
             top_names = tuple(s.name for s in self._all_skills[: self.top_k])
 
-        thread_id = getattr(threading, "get_native_id", threading.get_ident)()
-        slot_dir = Path(workdir) / f"slot_{thread_id}"
+        thread_id = probe_slot_id()
+        slot_dir = probe_slot_dir(workdir)
         slot_dir.mkdir(parents=True, exist_ok=True)
 
         subset_skills = [s for s in self._all_skills if s.name in top_names]

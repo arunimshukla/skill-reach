@@ -17,8 +17,15 @@
 from __future__ import annotations
 
 import sys
+from functools import cache
+from typing import TYPE_CHECKING
 
 from cyclopts.exceptions import CycloptsError
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator, Sequence
+
+    from cyclopts import App
 
 from reach.views import build_console, error_panel, help_console
 
@@ -63,6 +70,41 @@ __all__ = [
 ]
 
 
+@cache
+def _value_options() -> frozenset[str]:
+    """Return option names that consume at least one value token in any command."""
+    names: set[str] = set()
+    for command in _commands(app):
+        for argument in command.assemble_argument_collection():
+            if argument.token_count()[0] < 1:
+                continue
+            names.update(name for name in argument.names if name.startswith("-"))
+    return frozenset(names)
+
+
+def _commands(root: App) -> Iterator[App]:
+    """Yield an application and every subcommand registered beneath it."""
+    yield root
+    for name in root:
+        if not name.startswith("-"):
+            yield from _commands(root[name])
+
+
+def _verb_index(raw: Sequence[str], verbs: set[str], value_options: frozenset[str]) -> int | None:
+    """Locate the subcommand argument, skipping values consumed by preceding options."""
+    skip_value = False
+    for i, arg in enumerate(raw):
+        if arg == "--":
+            return None
+        if skip_value:
+            skip_value = False
+        elif arg.startswith("-"):
+            skip_value = "=" not in arg and arg in value_options
+        elif arg in verbs:
+            return i
+    return None
+
+
 def _reorder_argv(argv: list[str] | None) -> list[str]:
     """Normalize argv by positioning recognized subcommands before leading options."""
     raw = sys.argv[1:] if argv is None else list(argv)
@@ -70,14 +112,17 @@ def _reorder_argv(argv: list[str] | None) -> list[str]:
         return []
 
     verbs = set(_verbs())
-    verb_idx: int | None = None
-    for i, token in enumerate(raw):
-        if token in verbs:
-            verb_idx = i
-            break
-
+    verb_idx = _verb_index(raw, verbs, frozenset())
     if verb_idx is None or verb_idx == 0:
         return raw
+
+    # A verb preceded by an option may in fact be that option's value, such as
+    # `reach --skill diff lint`, so resolve the ambiguity using declared option arity.
+    if raw[verb_idx - 1].startswith("-"):
+        precise = _verb_index(raw, verbs, _value_options())
+        verb_idx = verb_idx if precise is None else precise
+        if verb_idx == 0:
+            return raw
 
     before = raw[:verb_idx]
     verb = raw[verb_idx]

@@ -17,6 +17,7 @@
 import contextlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -44,6 +45,7 @@ __all__ = [
     "RegistryManifest",
     "RegistrySkillData",
     "ServiceDisabledError",
+    "find_adc_path",
     "get_access_token",
     "is_adc_available",
 ]
@@ -113,12 +115,33 @@ class RegistryManifest(BaseModel):
     skills: tuple[RegistrySkillData, ...] = ()
 
 
+def find_adc_path() -> Path | None:
+    """Locate local Google Cloud Application Default Credentials file if present."""
+    if custom := os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
+        custom_path = Path(custom).expanduser()
+        if custom_path.is_file():
+            return custom_path
+    if cloudsdk_config := os.environ.get("CLOUDSDK_CONFIG"):
+        sdk_path = Path(cloudsdk_config).expanduser() / "application_default_credentials.json"
+        if sdk_path.is_file():
+            return sdk_path
+    candidates = [
+        Path.home() / ".config" / "gcloud" / "application_default_credentials.json",
+    ]
+    if appdata := os.environ.get("APPDATA"):
+        candidates.append(Path(appdata) / "gcloud" / "application_default_credentials.json")
+    candidates.append(
+        Path.home() / "AppData" / "Roaming" / "gcloud" / "application_default_credentials.json"
+    )
+    for cand in candidates:
+        if cand.is_file():
+            return cand
+    return None
+
+
 def is_adc_available() -> bool:
     """Return True if Application Default Credentials are configured locally without network I/O."""
-    if os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
-        return True
-    adc_file = Path.home() / ".config" / "gcloud" / "application_default_credentials.json"
-    return adc_file.is_file()
+    return find_adc_path() is not None
 
 
 def get_access_token() -> str:
@@ -170,6 +193,17 @@ def get_access_token() -> str:
         "'gcloud auth application-default login' to refresh credentials."
     )
     raise AuthenticationError(msg)
+
+
+def _matches_publisher(actual_publisher: str | None, requested_publisher: str | None) -> bool:
+    """Check if actual publisher resource name or identifier matches the requested publisher."""
+    if not requested_publisher:
+        return True
+    if not actual_publisher:
+        return False
+    if actual_publisher == requested_publisher:
+        return True
+    return actual_publisher.endswith(f"/{requested_publisher}")
 
 
 class RegistryClient:
@@ -296,10 +330,8 @@ class RegistryClient:
             for s in raw_skills:
                 try:
                     parsed = RegistrySkillData.model_validate(s)
-                    if publisher:
-                        pub = parsed.publisher or ""
-                        if not pub.endswith(publisher) and publisher not in pub:
-                            continue
+                    if not _matches_publisher(parsed.publisher, publisher):
+                        continue
                     skills.append(parsed)
                 except (ValidationError, ValueError):
                     continue
@@ -352,9 +384,18 @@ class RegistryCacheManager:
         """Return the directory containing manifest and cached skills for project and location."""
         return self.cache_root / project / location
 
-    def manifest_path(self, project: str, location: str) -> Path:
-        """Return the path to the cached .manifest.json file."""
-        return self.location_dir(project, location) / ".manifest.json"
+    def manifest_path(
+        self,
+        project: str,
+        location: str,
+        publisher: str | None = None,
+    ) -> Path:
+        """Return the path to the cached .manifest.json file, optionally scoped by publisher."""
+        loc_dir = self.location_dir(project, location)
+        if publisher:
+            slug = re.sub(r"[^\w.-]", "_", publisher)
+            return loc_dir / f".manifest.{slug}.json"
+        return loc_dir / ".manifest.json"
 
     def skill_dir(
         self,
@@ -370,27 +411,39 @@ class RegistryCacheManager:
         self,
         project: str,
         location: str,
+        publisher: str | None = None,
         max_age_seconds: int = 300,
     ) -> RegistryManifest | None:
-        """Load cached manifest if present and within max_age_seconds TTL."""
-        manifest_file = self.manifest_path(project, location)
-        if not manifest_file.is_file():
-            return None
+        """Load cached manifest if present, compatible with publisher, and within TTL."""
+        candidate_paths = [self.manifest_path(project, location, publisher)]
+        if publisher is not None:
+            candidate_paths.append(self.manifest_path(project, location, None))
 
-        try:
-            data = json.loads(manifest_file.read_text(encoding="utf-8"))
-            manifest = RegistryManifest.model_validate(data)
-            now = datetime.now(UTC)
-            age = (now - manifest.fetched_at).total_seconds()
-            if max_age_seconds >= 0 and age > max_age_seconds:
-                return None
-            return manifest
-        except (json.JSONDecodeError, ValidationError, OSError):
-            return None
+        for manifest_file in candidate_paths:
+            if not manifest_file.is_file():
+                continue
+
+            try:
+                data = json.loads(manifest_file.read_text(encoding="utf-8"))
+                manifest = RegistryManifest.model_validate(data)
+                now = datetime.now(UTC)
+                age = (now - manifest.fetched_at).total_seconds()
+                if max_age_seconds >= 0 and age > max_age_seconds:
+                    continue
+                if manifest.publisher is not None:
+                    if publisher is None:
+                        continue
+                    if not _matches_publisher(manifest.publisher, publisher):
+                        continue
+                return manifest
+            except (json.JSONDecodeError, ValidationError, OSError):
+                continue
+
+        return None
 
     def save_manifest(self, manifest: RegistryManifest) -> None:
         """Atomically persist a RegistryManifest to disk."""
-        target_path = self.manifest_path(manifest.project, manifest.location)
+        target_path = self.manifest_path(manifest.project, manifest.location, manifest.publisher)
         atomic_write_text(target_path, manifest.model_dump_json(indent=2) + "\n")
 
     def hydrate_skill_file(
@@ -463,6 +516,7 @@ class RegistryCacheManager:
             manifest = self.get_cached_manifest(
                 project,
                 location,
+                publisher=publisher,
                 max_age_seconds=cache_ttl_seconds,
             )
 
@@ -478,7 +532,12 @@ class RegistryCacheManager:
                     self.save_manifest(manifest)
             except Exception as net_err:
                 # If network fails, try falling back to stale cache
-                stale = self.get_cached_manifest(project, location, max_age_seconds=-1)
+                stale = self.get_cached_manifest(
+                    project,
+                    location,
+                    publisher=publisher,
+                    max_age_seconds=-1,
+                )
                 if stale is not None:
                     manifest = stale
                 else:
@@ -486,10 +545,8 @@ class RegistryCacheManager:
 
         skills: list[Skill] = []
         for s in manifest.skills:
-            if publisher:
-                pub = s.publisher or ""
-                if not pub.endswith(publisher) and publisher not in pub:
-                    continue
+            if not _matches_publisher(s.publisher, publisher):
+                continue
 
             skill_path = self.hydrate_skill_file(project, location, s)
             model_invocable = s.state == "STATE_ACTIVE"

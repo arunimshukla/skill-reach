@@ -27,6 +27,7 @@ import socketserver
 import sys
 import threading
 import time
+import urllib.parse
 import webbrowser
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -70,6 +71,9 @@ _REVIEW_STYLE = get_review_css()
 
 #: Inlined client-side JavaScript for keyboard navigation and interactive curation.
 _REVIEW_SCRIPT = get_review_js()
+
+#: Allowed hostnames for loopback / local review server validation.
+_ALLOWED_HOSTS: frozenset[str] = frozenset({"127.0.0.1", "localhost", "testserver", "::1"})
 
 
 def render_query_review_html(
@@ -264,16 +268,28 @@ class ReviewServerHandler(http.server.BaseHTTPRequestHandler):
         host = self.headers.get("Host", "")
         if not host:
             return True
-        hostname = host.split(":")[0].lower()
-        return hostname in ("127.0.0.1", "localhost", "testserver")
+        try:
+            parsed = urllib.parse.urlsplit(f"//{host}")
+            hostname = (parsed.hostname or "").lower()
+        except ValueError:
+            return False
+        return hostname in _ALLOWED_HOSTS
 
     def _is_valid_origin(self) -> bool:
         """Validate Origin header on mutating requests to protect against CSRF."""
         origin = self.headers.get("Origin")
         if not origin:
             return True
-        allowed = ("http://127.0.0.1:", "http://localhost:", "null")
-        return any(origin.startswith(prefix) for prefix in allowed)
+        if origin == "null":
+            return True
+        try:
+            parsed = urllib.parse.urlsplit(origin)
+        except ValueError:
+            return False
+        if parsed.scheme not in ("http", "https"):
+            return False
+        hostname = (parsed.hostname or "").lower()
+        return hostname in _ALLOWED_HOSTS
 
     def _send_security_headers(self) -> None:
         """Add defensive security headers to all responses."""

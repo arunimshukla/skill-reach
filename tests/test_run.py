@@ -23,7 +23,7 @@ import pytest
 from pydantic import ValidationError
 
 from reach.catalog import corpus_digest, load_skills
-from reach.models import Catalog, CatalogMode
+from reach.models import Catalog, CatalogMode, ProbeResult
 from reach.queries import Origin, QuerySet, QuerySetProvenance, load_query_set
 from reach.run import (
     Plan,
@@ -37,6 +37,7 @@ from reach.run import (
     sidecar_path,
     validate_catalog_fit,
     validate_query_coverage,
+    write_results,
     write_sidecar,
 )
 from reach.runtime import CatalogFit, SelectionOutcome
@@ -476,6 +477,45 @@ def test_a_resumed_run_reports_on_the_whole_set(
     assert answering_runtime.queries == [queries[1].text]
     assert {o.query_id for o in report.queries} == {"q-lifecycle", "q-retention"}
     assert report.scores.scored == 2
+
+
+def test_resumed_run_deduplicates_errored_probes_in_outcome_and_disk(
+    make_config,
+    answering_runtime,
+    queries,
+    tmp_path,
+) -> None:
+    """Verify resuming replaces prior errored attempts without duplicates in memory or disk."""
+    out = tmp_path / "results.jsonl"
+    config = make_config(study={"out": out}, plan={"attempts": 1, "retries": 0})
+    half = FakeRuntime(
+        {
+            queries[0].text: queries[0].expected_skill,
+            queries[1].text: SelectionOutcome(error="timeout"),
+        },
+    )
+    # First run: 1 success, 1 failure
+    conduct(config, half)
+    assert len(load_results(out)) == 2
+
+    # Second run: retry query 1 with answering runtime
+    outcome = conduct(config, answering_runtime)
+    assert outcome.reused == 1
+    assert len(outcome.results) == 2
+    assert len({(r.query_id, r.attempt) for r in outcome.results}) == 2
+
+    q1_result = next(r for r in outcome.results if r.query_id == queries[1].id)
+    assert q1_result.error is None
+    assert q1_result.invoked_skill == queries[1].expected_skill
+
+    # Disk file must be compacted without duplicate/stale error records
+    disk_rows = load_results(out)
+    assert len(disk_rows) == 2
+    assert all(r.error is None for r in disk_rows)
+
+    report = outcome.report
+    assert report.probes == 2
+    assert report.errors == 0
 
 
 def test_topping_up_a_recorded_run_to_a_deeper_plan_pays_only_for_the_tail(
@@ -962,3 +1002,40 @@ def test_plan_forbids_extra_fields() -> None:
                 "extra_field": "disallowed",
             }
         )
+
+
+def test_write_results_atomic_roundtrip(tmp_path: Path) -> None:
+    """Verify write_results atomically writes ProbeResult items and roundtrips with load_results."""
+    results = [
+        ProbeResult(
+            query_id="q1",
+            catalog_id="cat1",
+            catalog_mode=CatalogMode.ALL,
+            catalog_size=2,
+            model="test-model",
+            runtime="fake",
+            attempt=1,
+            invoked_skills=("s1",),
+        ),
+        ProbeResult(
+            query_id="q2",
+            catalog_id="cat1",
+            catalog_mode=CatalogMode.ALL,
+            catalog_size=2,
+            model="test-model",
+            runtime="fake",
+            attempt=1,
+            error="timeout",
+        ),
+    ]
+    target = tmp_path / "subdir" / "out.jsonl"
+    written = write_results(target, results)
+    assert written == target.resolve()
+    assert target.exists()
+
+    loaded = load_results(target)
+    assert len(loaded) == 2
+    assert loaded[0].query_id == "q1"
+    assert loaded[0].invoked_skills == ("s1",)
+    assert loaded[1].query_id == "q2"
+    assert loaded[1].error == "timeout"

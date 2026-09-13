@@ -125,6 +125,37 @@ def test_check_google_adc(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> No
     assert "GOOGLE_APPLICATION_CREDENTIALS" in res.detail
 
 
+def test_check_google_adc_detects_windows_appdata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify _check_google_adc locates credentials in Windows APPDATA directory."""
+    monkeypatch.delenv("GOOGLE_APPLICATION_CREDENTIALS", raising=False)
+    monkeypatch.delenv("CLOUDSDK_CONFIG", raising=False)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "fake_home")
+    appdata = tmp_path / "AppData" / "Roaming"
+    gcloud = appdata / "gcloud"
+    gcloud.mkdir(parents=True)
+    adc = gcloud / "application_default_credentials.json"
+    adc.write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("APPDATA", str(appdata))
+
+    res = _check_google_adc()
+    assert res.status == "ok"
+    assert "standard location" in res.detail
+
+
+def test_check_google_adc_missing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify _check_google_adc reports warning when no credentials exist."""
+    monkeypatch.delenv("GOOGLE_APPLICATION_CREDENTIALS", raising=False)
+    monkeypatch.delenv("CLOUDSDK_CONFIG", raising=False)
+    monkeypatch.delenv("APPDATA", raising=False)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "fake_home")
+
+    res = _check_google_adc()
+    assert res.status == "warn"
+    assert res.detail == "not found"
+
+
 @pytest.mark.parametrize(
     ("rel_path", "expected_label"),
     [

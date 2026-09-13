@@ -299,7 +299,8 @@ def cosine_similarity(v1: Sequence[float], v2: Sequence[float]) -> float:
 
     if norm_a <= 0.0 or norm_b <= 0.0:
         return 0.0
-    return dot / (math.sqrt(norm_a) * math.sqrt(norm_b))
+    raw = dot / (math.sqrt(norm_a) * math.sqrt(norm_b))
+    return max(-1.0, min(1.0, raw))
 
 
 def directional_projection(target: Sequence[float], candidate: Sequence[float]) -> float:
@@ -491,23 +492,66 @@ class DenseScorer(BaseModel):
 
         return sorted(pairs, key=lambda p: (-p[2], p[0], p[1]))
 
-    def score_query(self, query: str, skill: Skill) -> float:
-        """Calculate semantic similarity between a query text and a skill."""
+    def _get_or_compute_text_vector(self, text: str) -> list[float]:
+        """Retrieve or compute the dense embedding vector for a given text string."""
+        if not text:
+            return []
+        if text in self.vectors:
+            return self.vectors[text]
         try:
             model = _load_model2vec_model(self.model_name)
-            query_vec = model.encode([query])[0]
-            query_vec_list = (
+            query_vec = model.encode([text])[0]
+            return (
                 query_vec.tolist()
                 if hasattr(query_vec, "tolist")
                 else [float(x) for x in query_vec]
             )
-            skill_u = self._get_or_compute_unit_vector(skill)
-            if not skill_u or not query_vec_list:
-                return 0.0
-            query_u = _unit_vector(query_vec_list)
-            return sum(a * b for a, b in zip(query_u, skill_u, strict=False))
         except (RuntimeError, ValueError, TypeError, AttributeError):
+            return []
+
+    def rank_text(
+        self,
+        text: str,
+        candidates: Sequence[Skill],
+    ) -> list[tuple[str, float]]:
+        """Rank candidate skills against query text using semantic similarity."""
+        if not text or not candidates:
+            return sorted(((c.name, 0.0) for c in candidates), key=lambda pair: pair[0])
+
+        query_vec_list = self._get_or_compute_text_vector(text)
+        if not query_vec_list:
+            return sorted(((c.name, 0.0) for c in candidates), key=lambda pair: pair[0])
+
+        if self.mode == "directional":
+            scored = [
+                (
+                    c.name,
+                    directional_projection(query_vec_list, self._get_or_compute_vector(c)),
+                )
+                for c in candidates
+            ]
+            return sorted(scored, key=lambda pair: (-pair[1], pair[0]))
+
+        query_u = _unit_vector(query_vec_list)
+        scored = [
+            (
+                c.name,
+                sum(a * b for a, b in zip(query_u, cand_u, strict=False))
+                if (cand_u := self._get_or_compute_unit_vector(c))
+                else 0.0,
+            )
+            for c in candidates
+        ]
+        return sorted(scored, key=lambda pair: (-pair[1], pair[0]))
+
+    def score_query(self, query: str, skill: Skill) -> float:
+        """Calculate semantic similarity between a query text and a skill."""
+        query_vec_list = self._get_or_compute_text_vector(query)
+        skill_u = self._get_or_compute_unit_vector(skill)
+        if not skill_u or not query_vec_list:
             return 0.0
+        query_u = _unit_vector(query_vec_list)
+        return sum(a * b for a, b in zip(query_u, skill_u, strict=False))
 
 
 class HybridScorer(BaseModel):
@@ -546,6 +590,20 @@ class HybridScorer(BaseModel):
         lexical = Bm25Scorer.from_skills(skills, k1=k1, b=b)
         semantic = DenseScorer(vectors=vectors)
         return cls(lexical=lexical, semantic=semantic, rrf_k=rrf_k)
+
+    def rank_text(
+        self,
+        text: str,
+        candidates: Sequence[Skill],
+    ) -> list[tuple[str, float]]:
+        """Rank candidate skills against query text using Reciprocal Rank Fusion."""
+        if not candidates:
+            return []
+
+        lex_ranks = [name for name, _ in self.lexical.rank_text(text, candidates)]
+        sem_ranks = [name for name, _ in self.semantic.rank_text(text, candidates)]
+
+        return compute_rrf([lex_ranks, sem_ranks], k=self.rrf_k)
 
     def rank(
         self,

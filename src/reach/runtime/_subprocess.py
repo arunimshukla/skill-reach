@@ -21,6 +21,7 @@ import json
 import os
 import signal
 import subprocess
+import threading
 import time
 from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
@@ -28,6 +29,12 @@ from typing import Any
 
 #: Stored reference to standard library subprocess.run to detect test monkeypatching.
 _ORIGINAL_SUBPROCESS_RUN = subprocess.run
+
+#: Default timeout in seconds when waiting for a process to terminate gracefully.
+_DEFAULT_TERMINATE_WAIT_TIMEOUT: float = 1.0
+
+#: Default timeout in seconds when joining the stderr drain background thread.
+_DEFAULT_STDERR_JOIN_TIMEOUT: float = 1.0
 
 
 class _ProcessGroupController:
@@ -46,7 +53,7 @@ class _ProcessGroupController:
         except (ProcessLookupError, OSError):
             pass
 
-    def terminate_gracefully(self, wait_timeout: float = 1.0) -> None:
+    def terminate_gracefully(self, wait_timeout: float = _DEFAULT_TERMINATE_WAIT_TIMEOUT) -> None:
         """Send SIGTERM to process group, escalating to SIGKILL on timeout."""
         self.send_signal(signal.SIGTERM)
         try:
@@ -123,6 +130,14 @@ def _spawn_probe_process(
     return proc, None
 
 
+def _drain_stream(stream: Iterable[str] | None, lines: list[str]) -> None:
+    """Drain lines from an input stream into a target list until EOF."""
+    if stream is None:
+        return
+    with contextlib.suppress(OSError, ValueError):
+        lines.extend(stream)
+
+
 def _stream_process_output(
     proc: subprocess.Popen[str],
     controller: _ProcessGroupController,
@@ -153,13 +168,17 @@ def _stream_process_output(
         if early_stopped and proc.poll() is None:
             controller.send_signal(signal.SIGTERM)
             try:
-                extra_out, _ = proc.communicate(timeout=1.5)
-                if extra_out:
-                    stdout_lines.extend(extra_out.splitlines(keepends=True))
-            except (subprocess.TimeoutExpired, ProcessLookupError):
+                proc.wait(timeout=1.0)
+            except subprocess.TimeoutExpired:
                 controller.kill()
                 with contextlib.suppress(OSError, subprocess.SubprocessError):
                     proc.wait(timeout=1.0)
+
+            if proc.stdout and not proc.stdout.closed:
+                with contextlib.suppress(OSError, ValueError):
+                    extra_out = proc.stdout.read()
+                    if extra_out:
+                        stdout_lines.extend(extra_out.splitlines(keepends=True))
 
     if timeout_s is not None and time.monotonic() - start_time > timeout_s:
         controller.terminate_gracefully(wait_timeout=1.0)
@@ -171,40 +190,42 @@ def _stream_process_output(
 def _drain_and_reap_process(
     proc: subprocess.Popen[str],
     controller: _ProcessGroupController,
+    stderr_thread: threading.Thread,
+    stderr_lines: list[str],
     start_time: float,
     timeout_s: float | None,
 ) -> tuple[list[str], str, str | None]:
     """Drain remaining process streams and wait for termination."""
     remaining_lines: list[str] = []
     if timeout_s is not None and time.monotonic() - start_time > timeout_s:
-        controller.terminate_gracefully(wait_timeout=1.0)
-        return remaining_lines, "", "timeout"
+        controller.terminate_gracefully(wait_timeout=_DEFAULT_TERMINATE_WAIT_TIMEOUT)
+        stderr_thread.join(timeout=_DEFAULT_STDERR_JOIN_TIMEOUT)
+        return remaining_lines, "".join(stderr_lines), "timeout"
 
     if proc.poll() is None:
         remaining_time = (
             max(0.1, timeout_s - (time.monotonic() - start_time)) if timeout_s is not None else None
         )
         try:
-            stdout_rem, stderr_rem = proc.communicate(timeout=remaining_time)
-            if stdout_rem:
-                remaining_lines.extend(stdout_rem.splitlines(keepends=True))
+            proc.wait(timeout=remaining_time)
         except subprocess.TimeoutExpired:
-            controller.terminate_gracefully(wait_timeout=1.0)
-            return remaining_lines, "", "timeout"
-    else:
-        try:
-            _, stderr_rem = proc.communicate(timeout=0.5)
-        except (OSError, subprocess.SubprocessError):
-            stderr_rem = ""
+            controller.terminate_gracefully(wait_timeout=_DEFAULT_TERMINATE_WAIT_TIMEOUT)
+            stderr_thread.join(timeout=_DEFAULT_STDERR_JOIN_TIMEOUT)
+            return remaining_lines, "".join(stderr_lines), "timeout"
 
     if proc.stdout and not proc.stdout.closed:
-        with contextlib.suppress(OSError):
+        with contextlib.suppress(OSError, ValueError):
+            stdout_rem = proc.stdout.read()
+            if stdout_rem:
+                remaining_lines.extend(stdout_rem.splitlines(keepends=True))
             proc.stdout.close()
+
+    stderr_thread.join(timeout=_DEFAULT_STDERR_JOIN_TIMEOUT)
     if proc.stderr and not proc.stderr.closed:
         with contextlib.suppress(OSError):
             proc.stderr.close()
 
-    return remaining_lines, stderr_rem or "", None
+    return remaining_lines, "".join(stderr_lines), None
 
 
 def run_subprocess_probe(
@@ -223,16 +244,32 @@ def run_subprocess_probe(
     if proc is None:
         return None, spawn_err
 
+    stderr_lines: list[str] = []
+    stderr_thread = threading.Thread(
+        target=_drain_stream,
+        args=(proc.stderr, stderr_lines),
+        daemon=True,
+    )
+    stderr_thread.start()
+
+    controller = _ProcessGroupController(proc)
+    watchdog: threading.Timer | None = None
+    if timeout_s is not None:
+        watchdog = threading.Timer(timeout_s, controller.terminate_gracefully)
+        watchdog.daemon = True
+        watchdog.start()
+
     try:
-        controller = _ProcessGroupController(proc)
         stdout_lines, _early_stopped, stream_err = _stream_process_output(
             proc, controller, start_time, timeout_s, on_line
         )
         if stream_err is not None:
+            controller.terminate_gracefully(wait_timeout=_DEFAULT_TERMINATE_WAIT_TIMEOUT)
+            stderr_thread.join(timeout=_DEFAULT_STDERR_JOIN_TIMEOUT)
             return None, stream_err
 
         rem_lines, stderr_rem, reap_err = _drain_and_reap_process(
-            proc, controller, start_time, timeout_s
+            proc, controller, stderr_thread, stderr_lines, start_time, timeout_s
         )
         if reap_err is not None:
             return None, reap_err
@@ -245,6 +282,8 @@ def run_subprocess_probe(
             stderr=stderr_rem,
         ), None
     finally:
+        if watchdog is not None:
+            watchdog.cancel()
         if proc.stdout and not proc.stdout.closed:
             with contextlib.suppress(OSError):
                 proc.stdout.close()

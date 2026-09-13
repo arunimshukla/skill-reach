@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
@@ -31,7 +32,6 @@ from reach.lint import (
 
 if TYPE_CHECKING:
     from collections.abc import Callable
-    from pathlib import Path
 
 
 def test_valid_skill_passes_clean(write_skill: Callable[..., Path]) -> None:
@@ -89,6 +89,20 @@ def test_invalid_frontmatter_rules(
     report = lint_file(manifest)
     assert report.has_errors
     assert any(i.rule == expected_rule and i.severity == expected_severity for i in report.issues)
+
+
+def test_lint_file_accepts_unicode_bom(tmp_path: Path) -> None:
+    """Verify lint_file successfully parses and lints files with leading Unicode BOM."""
+    skill_dir = tmp_path / "bom-skill"
+    skill_dir.mkdir(parents=True)
+    manifest = skill_dir / "SKILL.md"
+    manifest.write_text(
+        "\ufeff---\nname: bom-skill\ndescription: Skill saved with Unicode BOM.\n---\nBody\n",
+        encoding="utf-8",
+    )
+    report = lint_file(manifest)
+    assert not report.has_errors
+    assert report.skills_checked == 1
 
 
 @pytest.mark.parametrize(
@@ -353,6 +367,37 @@ def test_format_github_annotation_escapes_newlines_and_percent() -> None:
         "First line\nSecond line has 50% rate",
     )
     assert result == "::warning::First line%0ASecond line has 50%25 rate"
+
+
+def test_format_github_annotation_converts_absolute_workspace_path_to_relative(
+    tmp_path: Path,
+) -> None:
+    """Verify format_github_annotation converts absolute file paths under root to relative paths."""
+    from reach.rendering import format_github_annotation
+
+    workspace = tmp_path / "repo"
+    skill_file = workspace / "skills" / "demo" / "SKILL.md"
+    result = format_github_annotation(
+        "error",
+        "Invalid schema",
+        file=skill_file,
+        root=workspace,
+    )
+    assert "file=skills/demo/SKILL.md" in result
+    assert str(skill_file) not in result
+
+
+def test_format_github_annotation_converts_cwd_path_to_relative() -> None:
+    """Verify format_github_annotation relativizes paths under current working directory."""
+    from reach.rendering import format_github_annotation
+
+    abs_path = Path.cwd() / "skills" / "demo" / "SKILL.md"
+    result = format_github_annotation(
+        "error",
+        "Invalid schema",
+        file=abs_path,
+    )
+    assert "file=skills/demo/SKILL.md" in result
 
 
 def test_render_lint_github_formats_all_issues(write_skill: Callable[..., Path]) -> None:

@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, ConfigDict
 
-from reach.catalog import load_skills
+from reach.catalog import deduplicate_skills, load_skills
 from reach.config import (
     CheckSettings,
     RunConfig,
@@ -40,7 +40,7 @@ from reach.runtime import FAKE_AGENT, AgentRuntime, build_runtime
 from reach.runtime.keyword import KeywordRuntime
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+    from collections.abc import Collection, Mapping, Sequence
 
 #: Pattern matching skill directories or files in git diff output.
 _SKILL_PATH_PATTERN = re.compile(
@@ -223,7 +223,7 @@ def _setup_runtime(
 
 
 def _load_catalog_skills(resolved_paths: Sequence[Path]) -> list[Skill]:
-    """Load resident skills from resolved candidate paths."""
+    """Load resident skills from resolved candidate paths, deduplicated by name."""
     loaded_skills: list[Skill] = []
     for path in resolved_paths:
         if path.is_dir() and (path / "SKILL.md").exists():
@@ -232,7 +232,7 @@ def _load_catalog_skills(resolved_paths: Sequence[Path]) -> list[Skill]:
             loaded_skills.extend(load_skills(path))
         elif path.is_file() and path.name == "SKILL.md":
             loaded_skills.extend(load_skills(path.parent.parent))
-    return loaded_skills
+    return deduplicate_skills(loaded_skills)
 
 
 def _filter_check_queries(
@@ -403,11 +403,14 @@ def _apply_changed_scope(
     changed: bool,
     since: str,
     budget: int,
+    available: Collection[str] = (),
 ) -> tuple[LintReport, set[str], CheckOutcome | None]:
     """Filter lint report to changed skills or return early clean outcome if none changed."""
     if not changed:
         return lint_report, set(), None
-    modified = set(changed_skills(since=since))
+    # A diff reports deleted and renamed skills too, and those can never be probed
+    # against the current corpus, so scope the gate to skills still on disk.
+    modified = set(changed_skills(since=since)) & set(available)
     if not modified:
         return (
             LintReport(issues=(), skills_checked=0),
@@ -535,8 +538,9 @@ def run_check(
         msg = f"No skill paths specified and no skills found {scope_msg}."
         raise ValueError(msg)
 
+    available = {s.name for s in _load_catalog_skills(resolved_paths)} if changed else set()
     lint_report, modified, early_outcome = _apply_changed_scope(
-        lint_report, changed, check_settings.since, check_settings.budget
+        lint_report, changed, check_settings.since, check_settings.budget, available
     )
     if early_outcome is not None:
         return early_outcome

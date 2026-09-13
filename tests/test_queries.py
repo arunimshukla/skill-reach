@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING
 import pytest
 from pydantic import ValidationError
 
-from reach.models import Query
+from reach.models import NO_SKILL, Query, QueryKind
 from reach.queries import (
     Origin,
     QuerySet,
@@ -293,3 +293,22 @@ def test_save_and_load_query_set_csv(tmp_path: Path) -> None:
     assert loaded.queries[0].id == "q1"
     assert loaded.queries[0].text == "tier cold objects"
     assert loaded.queries[0].expected_skill == "gcs-lifecycle-rules"
+
+
+def test_query_set_for_skill_matches_expected_skill() -> None:
+    """Verify QuerySet.for_skill filters queries by expected skill name."""
+    q1 = Query(id="q1", text="text 1", expected_skill="s1")
+    q2 = Query(id="q2", text="text 2", expected_skill="s2")
+    qs = QuerySet(catalog_id="c", queries=(q1, q2), provenance=provenance())
+    assert qs.for_skill("s1") == (q1,)
+    assert qs.for_skill("s2") == (q2,)
+    assert qs.for_skill("s3") == ()
+
+
+def test_query_set_for_skill_matches_out_of_scope_truth_label() -> None:
+    """Verify QuerySet.for_skill matches out-of-scope queries via NO_SKILL sentinel."""
+    q1 = Query(id="q1", text="text 1", expected_skill="s1")
+    q2 = Query(id="q2", text="out of scope", kind=QueryKind.OUT_OF_SCOPE)
+    qs = QuerySet(catalog_id="c", queries=(q1, q2), provenance=provenance())
+    assert qs.for_skill(NO_SKILL) == (q2,)
+    assert qs.for_skill("(no skill)") == (q2,)

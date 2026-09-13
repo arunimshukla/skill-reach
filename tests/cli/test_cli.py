@@ -33,6 +33,7 @@ from reach.cli import (
     AgentName,
     Format,
     Vary,
+    _reorder_argv,
     app,
     build_config,
     drafting,
@@ -1810,6 +1811,31 @@ def test_an_unknown_verb_names_the_verbs_that_exist(capsys) -> None:
     reported = capsys.readouterr().err
     assert "frobnicate" in reported
     assert "eval" in reported
+
+
+REORDER_CASES: list[tuple[list[str], list[str]]] = [
+    ([], []),
+    (["eval", "--dry-run"], ["eval", "--dry-run"]),
+    (["--help"], ["--help"]),
+    (["--verbose", "eval"], ["eval", "--verbose"]),
+    (["--config", "reach.toml", "eval"], ["eval", "--config", "reach.toml"]),
+    (["--skills", "./corpus", "eval", "--dry-run"], ["eval", "--dry-run", "--skills", "./corpus"]),
+    (["--skill", "diff", "lint"], ["lint", "--skill", "diff"]),
+    (["--skill=diff", "lint"], ["lint", "--skill=diff"]),
+]
+REORDER_IDS = [" ".join(raw) or "empty" for raw, _ in REORDER_CASES]
+
+
+@pytest.mark.parametrize(("raw", "expected"), REORDER_CASES, ids=REORDER_IDS)
+def test_the_verb_leads_however_it_was_typed(raw: list[str], expected: list[str]) -> None:
+    """Verify argv normalization hoists the subcommand ahead of leading options."""
+    assert _reorder_argv(raw) == expected
+
+
+@pytest.mark.parametrize("verb", registered_verbs())
+def test_an_option_value_is_never_mistaken_for_the_verb(verb: str) -> None:
+    """Verify a verb-shaped option value does not hijack the executed subcommand."""
+    assert _reorder_argv(["--skills", verb, "lint"]) == ["lint", "--skills", verb]
 
 
 ALL_HELP_COMMANDS = [

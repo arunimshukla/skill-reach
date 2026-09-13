@@ -8,6 +8,7 @@ Google Cloud Agent Registry client, token resolution, and cache management.
       show_root_heading: false
       members:
         - AuthenticationError
+        - find_adc_path
         - get_access_token
         - is_adc_available
         - NotFoundError

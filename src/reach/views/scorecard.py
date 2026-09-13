@@ -97,7 +97,11 @@ def _worst_first(skills: Sequence[SkillScore]) -> list[SkillScore]:
     shown = [s for s in skills if s.probes or s.absorbed]
     return sorted(
         shown,
-        key=lambda s: (s.recall is None, s.recall or 0.0, -s.absorbed, s.skill),
+        key=lambda s: (
+            s.recall if s.recall is not None else 0.0,
+            -s.absorbed,
+            s.skill,
+        ),
     )
 
 

@@ -17,7 +17,10 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
+import threading
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -428,3 +431,150 @@ def test_select_passes_env_and_cleans_when_auto_clean(
     # Because auto_clean=True, session dir should have been removed in post_probe
     assert not (workdir / ".reach_pi_sessions").exists()
     assert not (workdir / ".reach_pi_agent").exists()
+
+
+#: Resident skills used by the concurrent probe isolation tests.
+SLOT_SKILLS = ("alpha", "beta")
+
+
+def write_pi_session(path: Path, skill: str) -> None:
+    """Write a Pi JSONL transcript recording a single skill invocation."""
+    path.write_text(
+        "\n".join(json.dumps(entry) for entry in pi_entries(invoked=skill)),
+        encoding="utf-8",
+    )
+
+
+def session_writer(
+    captured: list[Path] | None = None,
+    barrier: threading.Barrier | None = None,
+) -> Callable[..., subprocess.CompletedProcess[str]]:
+    """Return a subprocess handler writing a transcript that names the queried skill."""
+
+    def _run(cmd: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        skill = cmd[cmd.index("-p") + 1].rsplit(" ", 1)[-1]
+        session_dir = Path(cmd[cmd.index("--session-dir") + 1])
+        session_dir.mkdir(parents=True, exist_ok=True)
+        if captured is not None:
+            captured.append(session_dir)
+        write_pi_session(session_dir / f"session_{skill}.jsonl", skill)
+        if barrier is not None:
+            barrier.wait()
+        return subprocess.CompletedProcess(cmd, returncode=0, stdout="OK", stderr="")
+
+    return _run
+
+
+def probe_concurrently(runtime: PiRuntime, workdir: Path) -> dict[str, Any]:
+    """Run one probe per resident skill on separate threads and collect outcomes."""
+    outcomes: dict[str, Any] = {}
+
+    def _probe(skill: str) -> None:
+        outcomes[skill] = runtime.select(f"please use {skill}", workdir)
+
+    threads = [threading.Thread(target=_probe, args=(skill,)) for skill in SLOT_SKILLS]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+    return outcomes
+
+
+def test_concurrent_selects_do_not_cross_attribute_sessions(
+    mock_subprocess: Callable[..., Any],
+    tmp_path: Path,
+) -> None:
+    """Verify parallel probes read their own transcript rather than a sibling worker's."""
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+
+    rt = PiRuntime()
+    rt._resident = SLOT_SKILLS
+
+    # Both transcripts exist before either probe reads, as under real parallel execution.
+    mock_subprocess(handler=session_writer(barrier=threading.Barrier(2, timeout=10)))
+
+    outcomes = probe_concurrently(rt, workdir)
+
+    assert set(outcomes) == set(SLOT_SKILLS)
+    for skill in SLOT_SKILLS:
+        assert outcomes[skill].error is None
+        assert outcomes[skill].invoked_skill == skill
+
+
+def test_concurrent_selects_use_distinct_session_directories(
+    mock_subprocess: Callable[..., Any],
+    tmp_path: Path,
+) -> None:
+    """Verify each worker thread receives its own session directory under the session root."""
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+
+    rt = PiRuntime()
+    rt._resident = SLOT_SKILLS
+
+    captured: list[Path] = []
+    mock_subprocess(
+        handler=session_writer(captured=captured, barrier=threading.Barrier(2, timeout=10)),
+    )
+
+    probe_concurrently(rt, workdir)
+
+    root = workdir / ".reach_pi_sessions"
+    assert len(captured) == 2
+    assert len({str(path) for path in captured}) == 2
+    assert all(path.is_relative_to(root) for path in captured)
+
+
+def test_select_prefers_the_newest_session_transcript(
+    mock_subprocess: Callable[..., Any],
+    tmp_path: Path,
+) -> None:
+    """Verify select reads the most recently written transcript, not an arbitrary glob entry."""
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+
+    rt = PiRuntime()
+    rt._resident = SLOT_SKILLS
+
+    def mock_run(cmd: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        session_dir = Path(cmd[cmd.index("--session-dir") + 1])
+        session_dir.mkdir(parents=True, exist_ok=True)
+        newest = session_dir / "aaa_current.jsonl"
+        stale = session_dir / "zzz_resumed.jsonl"
+        write_pi_session(newest, "alpha")
+        write_pi_session(stale, "beta")
+        stale_time = time.time() - 3600
+        os.utime(stale, (stale_time, stale_time))
+        return subprocess.CompletedProcess(cmd, returncode=0, stdout="OK", stderr="")
+
+    mock_subprocess(handler=mock_run)
+
+    outcome = rt.select("please use alpha", workdir)
+    assert outcome.invoked_skill == "alpha"
+
+
+def test_auto_clean_spares_transcripts_of_other_workers(
+    mock_subprocess: Callable[..., Any],
+    tmp_path: Path,
+) -> None:
+    """Verify auto_clean removes only the calling thread's session slot."""
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+
+    foreign_slot = workdir / ".reach_pi_sessions" / "slot_other_worker"
+    foreign_slot.mkdir(parents=True)
+    foreign_session = foreign_slot / "in_flight.jsonl"
+    write_pi_session(foreign_session, "beta")
+
+    rt = PiRuntime(RuntimeSettings(agent="pi", options={"auto_clean": True}))
+    rt._resident = SLOT_SKILLS
+
+    captured: list[Path] = []
+    mock_subprocess(handler=session_writer(captured=captured))
+
+    outcome = rt.select("please use alpha", workdir)
+
+    assert outcome.invoked_skill == "alpha"
+    assert not captured[0].exists()
+    assert foreign_session.exists()

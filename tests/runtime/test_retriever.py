@@ -116,3 +116,32 @@ def test_retriever_runtime_concurrent_slot_isolation(tmp_path: Path) -> None:
     assert len(results) == 8
     for catalog_subset in results:
         assert len(catalog_subset) == 4
+
+
+def test_retriever_runtime_with_dense_scorer(tmp_path: Path) -> None:
+    """Verify retriever runtime functions with DenseScorer as ranker."""
+    from reach.retrieval import DenseScorer
+
+    skills = _make_skills(tmp_path / "skills", 5)
+    catalog = Catalog(id="all-5", mode=CatalogMode.ALL, skills=tuple(s.name for s in skills))
+
+    inner = FakeRuntime(default="cloud-tool-00", model="fake-model")
+    dense_scorer = DenseScorer(
+        vectors={
+            "query": [1.0, 0.0],
+            "cloud-tool-00": [0.99, 0.01],
+            "cloud-tool-01": [0.5, 0.5],
+            "cloud-tool-02": [0.0, 1.0],
+            "cloud-tool-03": [0.1, 0.9],
+            "cloud-tool-04": [0.2, 0.8],
+        }
+    )
+    runtime = TwoStageRetrieverRuntime(inner, top_k=2, scorer=dense_scorer)
+
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+    runtime.install(catalog, skills, workdir)
+
+    outcome = runtime.select("query", workdir)
+    assert len(outcome.observed_catalog) == 2
+    assert outcome.observed_catalog[0] == "cloud-tool-00"

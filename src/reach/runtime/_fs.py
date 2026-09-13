@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import shutil
+import threading
 from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -25,6 +26,16 @@ from reach.catalog import resident_skills
 
 if TYPE_CHECKING:
     from reach.models import Catalog, Skill
+
+
+def probe_slot_id() -> int:
+    """Return an identifier unique to the calling OS thread."""
+    return getattr(threading, "get_native_id", threading.get_ident)()
+
+
+def probe_slot_dir(parent: Path, prefix: str = "slot") -> Path:
+    """Return the scratch directory reserved for the calling thread under parent."""
+    return Path(parent) / f"{prefix}_{probe_slot_id()}"
 
 
 def resolve_catalog_skills(

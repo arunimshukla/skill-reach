@@ -31,6 +31,7 @@ from reach.check import (
     run_check,
 )
 from reach.config import CheckSettings, RunConfig
+from reach.models import Query
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -293,6 +294,63 @@ def test_run_check_changed_no_modified_skills_passes_instantly(
         assert outcome.exit_code == 0
 
 
+def test_run_check_changed_scope_drops_skills_deleted_from_disk(
+    write_skill: Callable[..., Path],
+    write_queries: Callable[..., Path],
+) -> None:
+    """Verify a skill removed by the diff is excluded from the empirical scope."""
+    skill_dir = write_skill(
+        name="valid-skill",
+        description="Valid description with sufficient length.",
+    )
+    queries_file = write_queries(
+        queries=[
+            Query(id="q-live", text="Sample query for valid-skill", expected_skill="valid-skill"),
+            Query(
+                id="q-gone", text="Sample query for deleted tool", expected_skill="deleted-skill"
+            ),
+        ],
+    )
+
+    with patch("reach.check.changed_skills", return_value=("deleted-skill", "valid-skill")):
+        outcome = run_check(
+            skills_paths=[skill_dir],
+            queries_path=queries_file,
+            changed=True,
+            agent="keyword",
+            strict=False,
+        )
+
+    assert outcome.skills_checked == 1
+    assert outcome.queries_probed == 1
+
+
+def test_run_check_changed_scope_with_only_deletions_passes_instantly(
+    write_skill: Callable[..., Path],
+    write_queries: Callable[..., Path],
+) -> None:
+    """Verify a deletion-only diff passes rather than gating on unreachable queries."""
+    skill_dir = write_skill(
+        name="valid-skill",
+        description="Valid description with sufficient length.",
+    )
+    queries_file = write_queries(target="deleted-skill", count=2)
+
+    with patch("reach.check.changed_skills", return_value=("deleted-skill",)):
+        outcome = run_check(
+            skills_paths=[skill_dir],
+            queries_path=queries_file,
+            changed=True,
+            agent="keyword",
+            strict=False,
+        )
+
+    assert outcome.passed
+    assert outcome.skills_checked == 0
+    assert outcome.probes_executed == 0
+    assert outcome.exit_code == 0
+
+
 def test_build_check_assertions_trajectory_metrics_pass() -> None:
     """Verify _build_check_assertions generates passing assertions for all 5 trajectory metrics."""
     metrics = EmpiricalMetrics(
@@ -451,3 +509,28 @@ def test_run_config_resolve_check_settings() -> None:
     assert resolved.min_recall == 0.90
     assert resolved.min_accuracy == 0.80
     assert resolved.budget == 25
+
+
+def test_load_catalog_skills_deduplicates_overlapping_paths(
+    write_skill: Callable[..., Path],
+) -> None:
+    """Verify _load_catalog_skills deduplicates duplicate skills across candidate paths."""
+    from reach.check import _load_catalog_skills
+    from reach.models import Catalog, CatalogMode
+
+    skill_path = write_skill(
+        name="duplicate-tool",
+        description="A distinct description for testing duplicate skill loading.",
+    )
+    # Provide both the skills parent directory and the skill path itself (overlapping)
+    skills_root = skill_path.parent
+    loaded = _load_catalog_skills([skills_root, skill_path])
+
+    names = [s.name for s in loaded]
+    assert names == ["duplicate-tool"]
+    catalog = Catalog(
+        id="check-catalog",
+        skills=tuple(names),
+        mode=CatalogMode.ALL,
+    )
+    assert catalog.skills == ("duplicate-tool",)

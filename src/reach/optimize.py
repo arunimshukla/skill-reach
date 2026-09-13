@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import difflib
 import random
+import shutil
 import tempfile
 from enum import StrEnum
 from pathlib import Path
@@ -575,6 +576,36 @@ def _run_candidate_probes(
     )
 
 
+def _write_fallback_manifest(manifest_path: Path, skill_name: str, description: str) -> None:
+    """Write a minimal SKILL.md file with frontmatter and header."""
+    frontmatter = yaml.safe_dump(
+        {"name": skill_name, "description": description}, sort_keys=False
+    ).strip()
+    manifest_path.write_text(
+        f"---\n{frontmatter}\n---\n\n# {skill_name}\n\n{description}\n",
+        encoding="utf-8",
+    )
+
+
+def _materialize_candidate_skill(
+    target: Skill,
+    description: str,
+    destination: Path,
+) -> Skill:
+    """Materialize a skill directory on disk containing the candidate description."""
+    if target.path.is_dir():
+        shutil.copytree(target.path, destination, dirs_exist_ok=True, symlinks=True)
+        manifest_path = destination / "SKILL.md"
+        if not update_skill_description(manifest_path, description):
+            _write_fallback_manifest(manifest_path, target.name, description)
+    else:
+        destination.mkdir(parents=True, exist_ok=True)
+        manifest_path = destination / "SKILL.md"
+        _write_fallback_manifest(manifest_path, target.name, description)
+
+    return target.model_copy(update={"path": destination, "description": description})
+
+
 def evaluate_candidate(
     candidate: OptimizationCandidate,
     target: Skill,
@@ -592,22 +623,23 @@ def evaluate_candidate(
         return candidate
 
     queries_to_run = list(queries)[:budget]
-    candidate_skill = Skill(
-        name=target.name,
-        description=candidate.description,
-        path=target.path,
-    )
-    all_skills = [candidate_skill, *rivals]
-    catalog = Catalog(
-        id="opt-catalog",
-        skills=tuple(s.name for s in all_skills),
-        mode=CatalogMode.ALL,
-    )
-
     runtime = _setup_runtime(agent, config=config)
 
     with tempfile.TemporaryDirectory() as temp_dir:
-        workdir = Path(temp_dir)
+        temp_path = Path(temp_dir)
+        workdir = temp_path / "workdir"
+        workdir.mkdir(parents=True, exist_ok=True)
+        candidate_stage = temp_path / "candidate_skill" / target.name
+        candidate_skill = _materialize_candidate_skill(
+            target, candidate.description, candidate_stage
+        )
+        all_skills = [candidate_skill, *rivals]
+        catalog = Catalog(
+            id="opt-catalog",
+            skills=tuple(s.name for s in all_skills),
+            mode=CatalogMode.ALL,
+        )
+
         runtime.install(catalog, all_skills, workdir)
         (
             triggers,

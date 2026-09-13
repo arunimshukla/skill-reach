@@ -213,6 +213,22 @@ def test_a_response_with_inner_code_fences_in_citation_parses() -> None:
     assert "```bash" in queries[0].citation
 
 
+def test_parse_response_handles_preamble_and_postamble_with_braces() -> None:
+    """Verify JSON parsing succeeds when preamble and postamble contain curly braces."""
+    raw = (
+        "Here is the context for {environment}:\n"
+        "```bash\n"
+        "for i in {1..3}; do echo $i; done\n"
+        "```\n\n"
+        "Here is the query JSON:\n"
+        f"```json\n{VALID_RESPONSE}\n```\n\n"
+        "Note: remember to configure {extra_options}."
+    )
+    queries = parse_response(raw)
+    assert len(queries) == 1
+    assert queries[0].text.startswith("Our incident response")
+
+
 def test_a_response_that_is_not_json_is_rejected() -> None:
     """Verify non-JSON response string raises ValueError."""
     with pytest.raises(ValueError, match="not JSON"):
@@ -260,6 +276,28 @@ def test_a_paraphrased_citation_fails() -> None:
     """Verify paraphrased citation text fails verification against original body."""
     query = GeneratedQuery(text="q", citation="it structures risk", reason="r")
     assert not verify_citation(query, BODY)
+
+
+def test_citation_matching_ignores_inline_markdown_formatting() -> None:
+    """Verify citations match body text containing inline markdown emphasis."""
+    body = "The **security pillar** provides a `structured approach` to *risk management*."
+    query = GeneratedQuery(
+        text="q",
+        citation="The security pillar provides a structured approach to risk management.",
+        reason="r",
+    )
+    assert verify_citation(query, body)
+
+
+def test_citation_with_markdown_matches_plain_body() -> None:
+    """Verify citations with inline markdown match plain body text."""
+    body = "The security pillar provides a structured approach to risk management."
+    query = GeneratedQuery(
+        text="q",
+        citation="The **security pillar** provides a `structured approach`",
+        reason="r",
+    )
+    assert verify_citation(query, body)
 
 
 @pytest.fixture

@@ -83,6 +83,38 @@ def test_run_subprocess_probe_silent_command_timeout(tmp_path: Path) -> None:
     assert err == "timeout"
 
 
+def test_run_subprocess_probe_large_stderr_does_not_deadlock(tmp_path: Path) -> None:
+    """Verify large stderr volume drains concurrently without pipe deadlock."""
+    script = (
+        "import sys\n"
+        "sys.stderr.write('E' * (2 * 1024 * 1024))\n"
+        "sys.stderr.flush()\n"
+        "sys.stdout.write('probe_completed\\n')\n"
+        "sys.stdout.flush()\n"
+    )
+    cmd = [sys.executable, "-c", script]
+    completed, err = run_subprocess_probe(cmd, tmp_path, timeout_s=4.0)
+
+    assert err is None
+    assert completed is not None
+    assert "probe_completed" in completed.stdout
+    assert len(completed.stderr) == 2 * 1024 * 1024
+
+
+def test_run_subprocess_probe_watchdog_terminates_silent_hang(tmp_path: Path) -> None:
+    """Verify watchdog actively terminates a silent hung command when timeout expires."""
+    import time
+
+    cmd = [sys.executable, "-c", "import time; time.sleep(10)"]
+    start = time.monotonic()
+    completed, err = run_subprocess_probe(cmd, tmp_path, timeout_s=0.2)
+    elapsed = time.monotonic() - start
+
+    assert completed is None
+    assert err == "timeout"
+    assert elapsed < 2.0
+
+
 def test_run_subprocess_probe_real_spawn_failure(tmp_path: Path) -> None:
     """Verify invalid executable path gracefully returns spawn failure error."""
     cmd = ["/path/to/nonexistent/reach_executable_binary_probe"]

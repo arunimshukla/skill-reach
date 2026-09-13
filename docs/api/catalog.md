@@ -15,6 +15,7 @@ Filesystem scanning, discovery, and YAML frontmatter parsing routines.
         - build_scaling_catalogs
         - corpus_digest
         - CorpusScalingPlan
+        - deduplicate_skills
         - DEFAULT_SWEEP_SCALES
         - determine_min_scale
         - find_cluster_medoids

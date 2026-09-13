@@ -294,10 +294,23 @@ def assert_prompt_fits(
     )
 
 
+_INLINE_MARKDOWN = re.compile(r"[*`~]")
+
+
 def parse_response(raw: str) -> tuple[GeneratedQuery, ...]:
     """Parse JSON query draft payload from model completion output."""
     candidate = raw.strip()
-    start, end = candidate.find("{"), candidate.rfind("}")
+    json_fence_pos = candidate.find("```json")
+    if json_fence_pos != -1:
+        start = candidate.find("{", json_fence_pos)
+        closing_fence = candidate.rfind("```")
+        if start != -1 and closing_fence > start:
+            end = candidate.rfind("}", start, closing_fence)
+        else:
+            end = candidate.rfind("}")
+    else:
+        start, end = candidate.find("{"), candidate.rfind("}")
+
     if start != -1 and end > start:
         candidate = candidate[start : end + 1]
     elif fenced := _FENCE.search(candidate):
@@ -315,9 +328,18 @@ def _normalize(text: str) -> str:
     return " ".join(text.split())
 
 
+def _strip_markdown(text: str) -> str:
+    """Strip inline markdown formatting characters (bold, italics, code, strikethrough)."""
+    return _INLINE_MARKDOWN.sub("", text)
+
+
 def verify_citation(query: GeneratedQuery, body: str) -> bool:
-    """Verify that a query's citation string exists verbatim in the skill body."""
-    return _normalize(query.citation) in _normalize(body)
+    """Verify that a query's citation string exists verbatim or formatted in the skill body."""
+    norm_citation = _normalize(query.citation)
+    norm_body = _normalize(body)
+    if norm_citation in norm_body:
+        return True
+    return _normalize(_strip_markdown(query.citation)) in _normalize(_strip_markdown(body))
 
 
 def text_generator(

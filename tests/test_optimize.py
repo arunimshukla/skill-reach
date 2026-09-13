@@ -414,6 +414,113 @@ def test_evaluate_candidate_measures_delta_recall(
     assert isinstance(evaluated.delta_recall, float)
 
 
+def test_evaluate_candidate_materializes_candidate_description_to_disk(
+    write_skill_model: Callable[..., Skill],
+) -> None:
+    """Verify evaluate_candidate writes the candidate's description to disk for the runtime."""
+    target = write_skill_model(
+        name="calc-tool",
+        description="Original baseline description.",
+    )
+    candidate = OptimizationCandidate(
+        description="Optimized candidate description.",
+        rationale="Better phrasing.",
+    )
+    query = Query(
+        id="q1",
+        text="calculate something",
+        expected_skill="calc-tool",
+        kind=QueryKind.IMPLICIT,
+    )
+
+    installed_descriptions: list[str] = []
+
+    class InspectingRuntime(FakeRuntime):
+        def install(self, catalog, skills, workdir):
+            for s in skills:
+                if s.name == "calc-tool":
+                    manifest = s.path / "SKILL.md"
+                    if manifest.is_file():
+                        installed_descriptions.append(manifest.read_text(encoding="utf-8"))
+            return super().install(catalog, skills, workdir)
+
+    with patch(
+        "reach.optimize._setup_runtime",
+        return_value=InspectingRuntime({"calculate something": "calc-tool"}),
+    ):
+        evaluate_candidate(
+            candidate=candidate,
+            target=target,
+            rivals=[],
+            queries=[query],
+            budget=1,
+        )
+
+    assert len(installed_descriptions) == 1
+    assert "Optimized candidate description." in installed_descriptions[0]
+    assert "Original baseline description." not in installed_descriptions[0]
+
+
+@pytest.mark.parametrize("target_type", ["nonexistent", "file"])
+def test_evaluate_candidate_handles_nonexistent_or_file_target_path(
+    tmp_path: Path, target_type: str
+) -> None:
+    """Verify evaluate_candidate handles targets whose path is nonexistent or points to a file."""
+    if target_type == "nonexistent":
+        path = Path("/nonexistent/ghost-tool-path-12345")
+    else:
+        path = tmp_path / "standalone_skill.py"
+        path.write_text("# dummy script", encoding="utf-8")
+
+    target = Skill(
+        name="ghost-tool",
+        description="Baseline description.",
+        path=path,
+    )
+    candidate = OptimizationCandidate(
+        description="Optimized ghost description.",
+        rationale="Fallback test.",
+    )
+    query = Query(
+        id="q1",
+        text="test query",
+        expected_skill="ghost-tool",
+        kind=QueryKind.IMPLICIT,
+    )
+
+    manifest_contents: list[str] = []
+
+    class CapturingRuntime(FakeRuntime):
+        def install(self, catalog, skills, workdir):
+            for s in skills:
+                if s.name == "ghost-tool":
+                    manifest = s.path / "SKILL.md"
+                    if manifest.is_file():
+                        manifest_contents.append(manifest.read_text(encoding="utf-8"))
+            return super().install(catalog, skills, workdir)
+
+    with patch(
+        "reach.optimize._setup_runtime",
+        return_value=CapturingRuntime({"test query": "ghost-tool"}),
+    ):
+        evaluated = evaluate_candidate(
+            candidate=candidate,
+            target=target,
+            rivals=[],
+            queries=[query],
+            budget=1,
+        )
+
+    assert len(manifest_contents) == 1
+    assert "Optimized ghost description." in manifest_contents[0]
+    assert evaluated.recall == 1.0
+
+
+def test_evaluate_candidate_fallback_when_skill_dir_missing(tmp_path: Path) -> None:
+    """Verify backwards-compatible alias for target fallback evaluation."""
+    test_evaluate_candidate_handles_nonexistent_or_file_target_path(tmp_path, "nonexistent")
+
+
 def test_run_candidate_probes_scores_rival_and_out_of_scope_queries(tmp_path: Path) -> None:
     """Verify candidate probe runner rewards correct rival and abstention choices."""
     queries = [

@@ -36,6 +36,8 @@ from reach.registry import (
     RegistryManifest,
     RegistrySkillData,
     ServiceDisabledError,
+    find_adc_path,
+    is_adc_available,
 )
 
 
@@ -512,3 +514,219 @@ def test_registry_cache_concurrent_save_manifest_and_hydrate(tmp_path: Path) -> 
     assert loaded is not None
     assert len(loaded.skills) == 1
     assert loaded.skills[0].identifier == "shared-skill"
+
+
+def test_registry_cache_publisher_scoping_prevents_cache_poisoning(tmp_path: Path) -> None:
+    """Verify publisher-filtered fetches do not poison subsequent unfiltered resolution calls."""
+    all_skills = (
+        RegistrySkillData(
+            name="projects/p/skills/a",
+            displayName="alpha",
+            publisher="pub-a",
+            description="Alpha skill.",
+        ),
+        RegistrySkillData(
+            name="projects/p/skills/b",
+            displayName="bravo",
+            publisher="pub-b",
+            description="Bravo skill.",
+        ),
+    )
+
+    class FakeClient(RegistryClient):
+        def __init__(self) -> None:
+            self.calls: list[str | None] = []
+
+        def fetch_manifest(
+            self, project: str, location: str = "global", publisher: str | None = None
+        ) -> RegistryManifest:
+            self.calls.append(publisher)
+            selected = tuple(s for s in all_skills if not publisher or s.publisher == publisher)
+            return RegistryManifest(
+                project=project,
+                location=location,
+                publisher=publisher,
+                fetched_at=datetime.now(UTC),
+                skills=selected,
+            )
+
+    cache = RegistryCacheManager(cache_root=tmp_path)
+    client = FakeClient()
+
+    # Scoped call caches only pub-a
+    scoped_skills = cache.resolve_skills(project="p", publisher="pub-a", client=client)
+    assert [s.name for s in scoped_skills] == ["alpha"]
+    assert client.calls == ["pub-a"]
+
+    # Unscoped call must NOT return only the cached pub-a subset
+    unscoped_skills = cache.resolve_skills(project="p", client=client)
+    assert sorted(s.name for s in unscoped_skills) == ["alpha", "bravo"]
+    assert client.calls == ["pub-a", None]
+
+
+def test_registry_cache_global_manifest_satisfies_subsequent_filtered_requests(
+    tmp_path: Path,
+) -> None:
+    """Verify fresh unfiltered manifest satisfies publisher-filtered queries without re-fetching."""
+    all_skills = (
+        RegistrySkillData(
+            name="projects/p/skills/a",
+            displayName="alpha",
+            publisher="pub-a",
+            description="Alpha skill.",
+        ),
+        RegistrySkillData(
+            name="projects/p/skills/b",
+            displayName="bravo",
+            publisher="pub-b",
+            description="Bravo skill.",
+        ),
+    )
+
+    class FakeClient(RegistryClient):
+        def __init__(self) -> None:
+            self.calls: list[str | None] = []
+
+        def fetch_manifest(
+            self, project: str, location: str = "global", publisher: str | None = None
+        ) -> RegistryManifest:
+            self.calls.append(publisher)
+            selected = tuple(s for s in all_skills if not publisher or s.publisher == publisher)
+            return RegistryManifest(
+                project=project,
+                location=location,
+                publisher=publisher,
+                fetched_at=datetime.now(UTC),
+                skills=selected,
+            )
+
+    cache = RegistryCacheManager(cache_root=tmp_path)
+    client = FakeClient()
+
+    # Fetch global/unscoped first
+    unscoped_skills = cache.resolve_skills(project="p", client=client)
+    assert len(unscoped_skills) == 2
+    assert client.calls == [None]
+
+    # Filtered call should use cached global manifest (0 extra network calls)
+    scoped_skills = cache.resolve_skills(project="p", publisher="pub-a", client=client)
+    assert [s.name for s in scoped_skills] == ["alpha"]
+    assert client.calls == [None]
+
+
+def test_registry_cache_stale_fallback_respects_publisher_filter(tmp_path: Path) -> None:
+    """Verify stale fallback with max_age=-1 selects only compatible cached manifests."""
+    cache = RegistryCacheManager(cache_root=tmp_path)
+
+    # Save a cached manifest specifically for pub-a
+    manifest_a = RegistryManifest(
+        project="p",
+        location="global",
+        publisher="pub-a",
+        fetched_at=datetime.now(UTC) - timedelta(days=10),
+        skills=(
+            RegistrySkillData(
+                name="projects/p/skills/a",
+                displayName="alpha",
+                publisher="pub-a",
+                description="Alpha skill.",
+            ),
+        ),
+    )
+    cache.save_manifest(manifest_a)
+
+    class FailingClient(RegistryClient):
+        def fetch_manifest(
+            self,
+            project: str,
+            location: str = "global",
+            publisher: str | None = None,
+        ) -> RegistryManifest:
+            del project, location, publisher
+            msg = "Network unavailable"
+            raise RegistryError(msg)
+
+    failing_client = FailingClient()
+
+    # Querying for pub-b must NOT fallback to stale pub-a manifest (must raise RegistryError)
+    with pytest.raises(RegistryError, match="Network unavailable"):
+        cache.resolve_skills(project="p", publisher="pub-b", client=failing_client)
+
+    # Querying for pub-a should successfully fall back to stale pub-a manifest
+    resolved_a = cache.resolve_skills(project="p", publisher="pub-a", client=failing_client)
+    assert [s.name for s in resolved_a] == ["alpha"]
+
+    # Querying for publisher="pub" (substring of pub-a) must NOT match pub-a
+    with pytest.raises(RegistryError, match="Network unavailable"):
+        cache.resolve_skills(project="p", publisher="pub", client=failing_client)
+
+
+def test_registry_cache_publisher_slug_sanitization(tmp_path: Path) -> None:
+    """Verify publisher names with slashes are sanitized into flat filename slugs."""
+    cache = RegistryCacheManager(cache_root=tmp_path)
+    path = cache.manifest_path("my-proj", "global", publisher="publishers/google")
+    assert path.name == ".manifest.publishers_google.json"
+    assert path.parent == cache.location_dir("my-proj", "global")
+
+
+def test_find_adc_path_respects_cloudsdk_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify find_adc_path respects CLOUDSDK_CONFIG directory setting."""
+    monkeypatch.delenv("GOOGLE_APPLICATION_CREDENTIALS", raising=False)
+    cfg_dir = tmp_path / "gcloud_custom"
+    cfg_dir.mkdir(parents=True)
+    adc = cfg_dir / "application_default_credentials.json"
+    adc.write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("CLOUDSDK_CONFIG", str(cfg_dir))
+
+    found = find_adc_path()
+    assert found == adc
+    assert is_adc_available()
+
+
+def test_find_adc_path_finds_windows_appdata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify find_adc_path locates ADC file in Windows APPDATA environment directory."""
+    monkeypatch.delenv("GOOGLE_APPLICATION_CREDENTIALS", raising=False)
+    monkeypatch.delenv("CLOUDSDK_CONFIG", raising=False)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "fake_home")
+    appdata = tmp_path / "AppData" / "Roaming"
+    gcloud = appdata / "gcloud"
+    gcloud.mkdir(parents=True)
+    adc = gcloud / "application_default_credentials.json"
+    adc.write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("APPDATA", str(appdata))
+
+    found = find_adc_path()
+    assert found == adc
+    assert is_adc_available()
+
+
+def test_find_adc_path_none_when_missing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify find_adc_path returns None when no ADC files exist."""
+    monkeypatch.delenv("GOOGLE_APPLICATION_CREDENTIALS", raising=False)
+    monkeypatch.delenv("CLOUDSDK_CONFIG", raising=False)
+    monkeypatch.delenv("APPDATA", raising=False)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "fake_home")
+
+    assert find_adc_path() is None
+    assert not is_adc_available()
+
+
+def test_is_adc_available_detects_windows_adc(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify is_adc_available returns True when credentials exist in Windows AppData."""
+    monkeypatch.delenv("GOOGLE_APPLICATION_CREDENTIALS", raising=False)
+    monkeypatch.delenv("CLOUDSDK_CONFIG", raising=False)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "fake_home")
+    appdata = tmp_path / "AppData" / "Roaming"
+    gcloud = appdata / "gcloud"
+    gcloud.mkdir(parents=True)
+    adc = gcloud / "application_default_credentials.json"
+    adc.write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("APPDATA", str(appdata))
+
+    assert is_adc_available() is True
