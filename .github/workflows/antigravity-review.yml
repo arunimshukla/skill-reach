@@ -167,11 +167,13 @@ jobs:
 
           # 6. Invoke Antigravity CLI via STDIN (Prevents ARG_MAX buffer overflows)
           echo "Executing Antigravity CLI with Gemini 3.8 Flash..."
-          if ! agy -p - \
+          if ! agy \
             --model gemini-3.8-flash \
+            --effort low \
             --disable-slash-commands \
             --sandbox \
             --dangerously-skip-permissions < "$WORK_DIR/prompt.txt" > "$WORK_DIR/raw_review.md" 2> "$WORK_DIR/agy.log"; then
+
               echo "::error::Antigravity CLI execution failed"
               cat "$WORK_DIR/agy.log"
               printf "### 🤖 Antigravity AI Code Review\n*Model: **Gemini 3.8 Flash** | Commit: \`%s\`*\n\n⚠️ **Review Incomplete:** An internal error occurred while generating the automated review. Maintainers have been alerted in CI logs.\n" "${COMMIT_SHA}" > "$WORK_DIR/failure_comment.md"
