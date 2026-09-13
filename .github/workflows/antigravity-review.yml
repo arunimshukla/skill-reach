@@ -104,11 +104,11 @@ jobs:
           gh pr diff "${PR_NUMBER}" > "$WORK_DIR/raw_pr.diff"
 
           # 2. Filter lockfiles, binary files, and build assets using native Python with encoding fallback
-          python3 -c "
-          import sys
+          RAW_DIFF="$WORK_DIR/raw_pr.diff" python3 -c "
+          import os, sys
           excluded = ('uv.lock', '.lock', '.png', '.jpg', '.svg', 'site/', '.build/')
           keep = True
-          for line in open('$WORK_DIR/raw_pr.diff', errors='replace'):
+          for line in open(os.environ['RAW_DIFF'], errors='replace'):
               if line.startswith('diff --git'):
                   keep = not any(x in line for x in excluded)
               if keep:
@@ -129,10 +129,10 @@ jobs:
             exit 0
           fi
 
-          # 4. Fetch PR metadata for context
+          # 4. Fetch PR metadata for context directly to disk
           PR_JSON=$(gh pr view "${PR_NUMBER}" --json title,body)
-          PR_TITLE=$(echo "${PR_JSON}" | jq -r .title)
-          PR_BODY=$(echo "${PR_JSON}" | jq -r .body)
+          echo "${PR_JSON}" | jq -r .title > "$WORK_DIR/pr_title.txt"
+          echo "${PR_JSON}" | jq -r .body > "$WORK_DIR/pr_body.txt"
 
           # 5. Construct prompt with defensive XML boundaries for untrusted content
           cat << 'EOF' > "$WORK_DIR/prompt_header.txt"
@@ -155,10 +155,15 @@ jobs:
 
           {
             cat "$WORK_DIR/prompt_header.txt"
-            printf "\n### PULL REQUEST CONTEXT:\n<untrusted_metadata>\nTitle: %s\nCommit: %s\nDescription:\n%s\n</untrusted_metadata>\n\n<untrusted_diff>\n" "${PR_TITLE}" "${COMMIT_SHA}" "${PR_BODY}"
+            printf "\n### PULL REQUEST CONTEXT:\n<untrusted_metadata>\nTitle: "
+            cat "$WORK_DIR/pr_title.txt"
+            printf "\nCommit: %s\nDescription:\n" "${COMMIT_SHA}"
+            cat "$WORK_DIR/pr_body.txt"
+            printf "\n</untrusted_metadata>\n\n<untrusted_diff>\n"
             cat "$WORK_DIR/pr.diff"
             printf "\n</untrusted_diff>\n"
           } > "$WORK_DIR/prompt.txt"
+
 
           # 6. Invoke Antigravity CLI via STDIN (Prevents ARG_MAX buffer overflows)
           echo "Executing Antigravity CLI with Gemini 3.8 Flash..."
