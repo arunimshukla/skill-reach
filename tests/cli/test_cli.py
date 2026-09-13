@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 import json
-import textwrap
+from collections.abc import Callable
 from enum import Enum
 from importlib import metadata
 from pathlib import Path
@@ -119,78 +119,73 @@ def test_missing_required_flags_are_named(tmp_path: Path) -> None:
 
 
 def test_a_config_file_supplies_everything(
+    write_reach_toml: Callable[..., Path],
     tmp_path: Path,
     skill_repo: Path,
     query_file: Path,
 ) -> None:
     """Verify --config TOML file populates RunConfig options and study paths."""
-    path = tmp_path / "reach.toml"
-    path.write_text(
-        textwrap.dedent(
-            f"""
-            [study]
-            skills = "{skill_repo}"
-            queries = "{query_file}"
-            workdir = "{tmp_path / "work"}"
+    path = write_reach_toml(
+        f"""
+        [study]
+        skills = "{skill_repo}"
+        queries = "{query_file}"
+        workdir = "{tmp_path / "work"}"
 
-            [runtime]
-            agent = "fake"
+        [runtime]
+        agent = "fake"
 
-            [runtime.options]
-            model = "opus"
-            """,
-        ),
-        encoding="utf-8",
+        [runtime.options]
+        model = "opus"
+        """,
     )
     config = configure("eval", "--config", str(path))
     assert config.runtime.options["model"] == "opus"
     assert config.study.skills == skill_repo
 
 
-def test_a_flag_overrides_the_file(tmp_path: Path, skill_repo: Path, query_file: Path) -> None:
+def test_a_flag_overrides_the_file(
+    write_reach_toml: Callable[..., Path],
+    tmp_path: Path,
+    skill_repo: Path,
+    query_file: Path,
+) -> None:
     """Verify explicit CLI flags override values from --config TOML."""
-    path = tmp_path / "reach.toml"
-    path.write_text(
-        textwrap.dedent(
-            f"""
-            [study]
-            skills = "{skill_repo}"
-            queries = "{query_file}"
-            workdir = "{tmp_path / "work"}"
+    path = write_reach_toml(
+        f"""
+        [study]
+        skills = "{skill_repo}"
+        queries = "{query_file}"
+        workdir = "{tmp_path / "work"}"
 
-            [plan]
-            attempts = 9
-            """,
-        ),
-        encoding="utf-8",
+        [plan]
+        attempts = 9
+        """,
     )
     assert configure("eval", "--config", str(path)).plan.attempts == 9
     assert configure("eval", "--config", str(path), "--attempts", "2").plan.attempts == 2
 
 
 def test_an_unpassed_flag_does_not_clobber_the_file(
+    write_reach_toml: Callable[..., Path],
     tmp_path: Path,
     skill_repo: Path,
     query_file: Path,
 ) -> None:
     """Verify unpassed CLI flags do not overwrite values defined in TOML config."""
-    path = tmp_path / "reach.toml"
-    path.write_text(
-        textwrap.dedent(
-            f"""
-            [study]
-            skills = "{skill_repo}"
-            queries = "{query_file}"
-            workdir = "{tmp_path / "work"}"
+    path = write_reach_toml(
+        f"""
+        [study]
+        skills = "{skill_repo}"
+        queries = "{query_file}"
+        workdir = "{tmp_path / "work"}"
 
-            [runtime]
-            timeout_s = 500
+        [runtime]
+        timeout_s = 500
 
-            [runtime.options]
-            executable = "/opt/claude/bin/claude"
-            """,
-        ),
-        encoding="utf-8",
+        [runtime.options]
+        executable = "/opt/claude/bin/claude"
+        """,
     )
     config = configure("eval", "--config", str(path))
     assert config.runtime.timeout_s == 500
@@ -198,29 +193,26 @@ def test_an_unpassed_flag_does_not_clobber_the_file(
 
 
 def test_a_config_file_keeps_the_settings_no_flag_can_reach(
+    write_reach_toml: Callable[..., Path],
     tmp_path: Path,
     skill_repo: Path,
     query_file: Path,
 ) -> None:
     """Verify TOML configuration resolves relative paths against config directory."""
-    (tmp_path / "study").mkdir()
-    path = tmp_path / "study" / "reach.toml"
-    path.write_text(
-        textwrap.dedent(
-            f"""
-            [study]
-            skills = "{skill_repo}"
-            queries = "{query_file}"
-            workdir = "work"
+    path = write_reach_toml(
+        f"""
+        [study]
+        skills = "{skill_repo}"
+        queries = "{query_file}"
+        workdir = "work"
 
-            [runtime]
-            agent = "claude-code"
+        [runtime]
+        agent = "claude-code"
 
-            [runtime.options]
-            executable = "/opt/claude/bin/claude"
-            """,
-        ),
-        encoding="utf-8",
+        [runtime.options]
+        executable = "/opt/claude/bin/claude"
+        """,
+        directory=tmp_path / "study",
     )
     config = configure("eval", "--config", str(path))
     assert config.study.workdir == tmp_path / "study" / "work"
@@ -266,23 +258,27 @@ def test_a_refused_value_is_named_by_the_flag_that_carried_it(
     assert "roomy" in reported
 
 
-def test_a_refused_value_is_explained_in_this_tool_s_own_words(
+LEAK_INDICATORS = (
+    "nullable[",
+    "CatalogFlags",
+    "type=enum",
+    "pydantic.dev",
+    "input_value",
+)
+
+
+@pytest.mark.parametrize("leak", LEAK_INDICATORS)
+def test_a_refused_value_suppresses_internal_schema_dumps(
     base_argv: list[str],
     capsys,
+    leak: str,
 ) -> None:
     """Verify schema error formatting suppresses raw Pydantic validation dumps."""
     assert main([*base_argv, "--mode", "handwritten"]) == 2
     reported = capsys.readouterr().err.replace("\n", " ")
     assert "--mode" in reported
     assert "neighborhood" in reported
-    for leak in (
-        "nullable[",
-        "CatalogFlags",
-        "type=enum",
-        "pydantic.dev",
-        "input_value",
-    ):
-        assert leak not in reported
+    assert leak not in reported
 
 
 def test_explain_handles_empty_loc_model_level_validation_error() -> None:
@@ -457,28 +453,25 @@ def test_an_invalid_opt_value_type_is_refused_with_the_same_clarity(
 
 
 def test_opt_replaces_rather_than_merges_into_a_config_files_options_table(
+    write_reach_toml: Callable[..., Path],
     skill_repo: Path,
     query_file: Path,
     tmp_path: Path,
 ) -> None:
     """Verify -O replaces options dictionary from config file completely."""
-    config_path = tmp_path / "reach.toml"
-    config_path.write_text(
-        textwrap.dedent(
-            f"""
-            [study]
-            skills = "{skill_repo}"
-            queries = "{query_file}"
-            workdir = "{tmp_path / "work"}"
+    config_path = write_reach_toml(
+        f"""
+        [study]
+        skills = "{skill_repo}"
+        queries = "{query_file}"
+        workdir = "{tmp_path / "work"}"
 
-            [runtime]
-            agent = "fake"
+        [runtime]
+        agent = "fake"
 
-            [runtime.options]
-            model = "from-toml"
-            """,
-        ),
-        encoding="utf-8",
+        [runtime.options]
+        model = "from-toml"
+        """,
     )
     config = configure("eval", "--config", str(config_path), "-O", "model=from-opt")
     assert config.runtime.options == {"model": "from-opt"}
@@ -554,34 +547,35 @@ def test_dry_run_says_what_the_depth_can_resolve_before_anything_is_spent(
 
 
 @pytest.fixture
-def cramped_argv(tmp_path: Path, skill_repo: Path, query_file: Path) -> list[str]:
+def cramped_argv(
+    write_reach_toml: Callable[..., Path],
+    tmp_path: Path,
+    skill_repo: Path,
+    query_file: Path,
+) -> list[str]:
     """Generate CLI arguments configuring an overly constrained skill listing budget."""
-    path = tmp_path / "reach.toml"
-    path.write_text(
-        textwrap.dedent(
-            f"""
-            [study]
-            skills = "{skill_repo}"
-            queries = "{query_file}"
-            workdir = "{tmp_path / "work"}"
-            partial = true
+    path = write_reach_toml(
+        f"""
+        [study]
+        skills = "{skill_repo}"
+        queries = "{query_file}"
+        workdir = "{tmp_path / "work"}"
+        partial = true
 
-            [runtime]
-            agent = "claude-code"
+        [runtime]
+        agent = "claude-code"
 
-            [runtime.options]
-            skill_listing_budget_fraction = 0.00001
+        [runtime.options]
+        skill_listing_budget_fraction = 0.00001
 
-            [catalog]
-            mode = "neighborhood"
-            size = 3
-            rivals = 2
+        [catalog]
+        mode = "neighborhood"
+        size = 3
+        rivals = 2
 
-            [plan]
-            attempts = 1
-            """,
-        ),
-        encoding="utf-8",
+        [plan]
+        attempts = 1
+        """,
     )
     return ["eval", "--config", str(path)]
 
@@ -854,6 +848,38 @@ def test_a_comparison_prices_the_delta_against_the_floor(two_arms, capsys) -> No
     assert "Verdict" in out
 
 
+def test_diff_accepts_artifact_json_files(two_arms, tmp_path: Path, capsys) -> None:
+    """Verify diff command accepts .artifact.json files directly without sidecars."""
+    from reach.artifact import write_artifact
+    from reach.diff import load_arm
+
+    control, treatment = two_arms
+    control_art = write_artifact(
+        load_arm(control).artifact,
+        tmp_path / "control.artifact.json",
+    )
+    treatment_art = write_artifact(
+        load_arm(treatment).artifact,
+        tmp_path / "treatment.artifact.json",
+    )
+
+    assert (
+        main(
+            [
+                "diff",
+                str(control_art),
+                str(treatment_art),
+                "--vary",
+                "scope",
+            ],
+        )
+        == 0
+    )
+    out = capsys.readouterr().out
+    assert "noise floor" in out
+    assert "Verdict" in out
+
+
 def test_the_noise_inflation_flag_overrides_the_calibrated_default(two_arms, capsys) -> None:
     """Verify --noise-inflation flag sets over-dispersion multiplier in diff output."""
     control, treatment = two_arms
@@ -881,17 +907,20 @@ def test_a_refused_delta_still_exits_zero(two_arms, capsys) -> None:
     assert "not an improvement" in capsys.readouterr().out
 
 
-def test_diff_cli_respects_config_file(two_arms, tmp_path: Path, capsys) -> None:
+def test_diff_cli_respects_config_file(
+    write_reach_toml: Callable[..., Path],
+    two_arms,
+    tmp_path: Path,
+    capsys,
+) -> None:
     """Verify diff command reads [diff] settings from reach.toml configuration."""
     control, treatment = two_arms
-    cfg_file = tmp_path / "reach.toml"
-    cfg_file.write_text(
+    cfg_file = write_reach_toml(
         """
         [diff]
         noise_inflation = 1.75
         confidence = 0.90
         """,
-        encoding="utf-8",
     )
     assert (
         main(
@@ -1184,34 +1213,38 @@ def test_a_column_the_file_does_not_have_is_named_in_the_refusal(
     assert not destination.exists()
 
 
+@pytest.mark.parametrize(
+    ("source_format", "target_format"),
+    [
+        ("json", "jsonl"),
+        ("jsonl", "csv"),
+        ("csv", "json"),
+    ],
+    ids=["json-to-jsonl", "jsonl-to-csv", "csv-to-json"],
+)
 def test_query_command_converts_between_formats_directly(
+    source_format: str,
+    target_format: str,
     exported: Path,
     tmp_path: Path,
 ) -> None:
     """Verify reach query directly converts query sets between JSON, JSONL, and CSV."""
-    jsonl_out = tmp_path / "queries.jsonl"
-    csv_out = tmp_path / "queries.csv"
-    json_out = tmp_path / "queries_back.json"
+    if source_format == "json":
+        src = exported
+    else:
+        src = tmp_path / f"intermediate.{source_format}"
+        assert main(["query", str(exported), "--out", str(src)]) == 0
 
-    # JSON -> JSONL
-    assert main(["query", str(exported), "--out", str(jsonl_out)]) == 0
-    assert jsonl_out.exists()
-    first_line = json.loads(jsonl_out.read_text(encoding="utf-8").splitlines()[0])
-    assert first_line["id"] == "x-lifecycle"
+    dest = tmp_path / f"converted.{target_format}"
+    assert main(["query", str(src), "--out", str(dest)]) == 0
+    assert dest.exists()
 
-    # JSONL -> CSV
-    assert main(["query", str(jsonl_out), "--out", str(csv_out)]) == 0
-    assert csv_out.exists()
-    assert "x-lifecycle" in csv_out.read_text(encoding="utf-8")
-
-    # CSV -> JSON
-    assert main(["query", str(csv_out), "--out", str(json_out)]) == 0
-    assert json_out.exists()
-    loaded = load_query_set(json_out)
+    loaded = load_query_set(dest)
     assert len(loaded.queries) == 4
+    assert any(q.id == "x-lifecycle" for q in loaded.queries)
 
 
-def test_import_refuses_to_write_over_a_set_that_exists(
+def test_query_import_refuses_to_write_over_an_existing_set(
     tmp_path: Path,
     query_file: Path,
     capsys,
@@ -1219,43 +1252,35 @@ def test_import_refuses_to_write_over_a_set_that_exists(
     """Verify query import refuses to overwrite an existing destination file."""
     theirs = tmp_path / "theirs.csv"
     theirs.write_text("text\nfoo\n", encoding="utf-8")
-    assert (
-        main(
-            [
-                "query",
-                str(theirs),
-                "--out",
-                str(query_file),
-                "--catalog",
-                "all",
-            ],
-        )
-        == 2
-    )
+    argv = [
+        "query",
+        str(theirs),
+        "--out",
+        str(query_file),
+        "--catalog",
+        "all",
+    ]
+    assert main(argv) == 2
     assert "already exists" in capsys.readouterr().err
 
 
-def test_draft_refuses_to_write_over_a_set_that_exists(
-    skill_repo: Path,
+def test_query_draft_refuses_to_write_over_an_existing_set(
     query_file: Path,
+    skill_repo: Path,
     capsys,
 ) -> None:
     """Verify query draft refuses to overwrite an existing destination file."""
-    assert (
-        main(
-            [
-                "query",
-                "draft",
-                "--queries",
-                str(query_file),
-                "--skills",
-                str(skill_repo),
-                "--agent",
-                "fake",
-            ],
-        )
-        == 2
-    )
+    argv = [
+        "query",
+        "draft",
+        "--queries",
+        str(query_file),
+        "--skills",
+        str(skill_repo),
+        "--agent",
+        "fake",
+    ]
+    assert main(argv) == 2
     assert "already exists" in capsys.readouterr().err
 
 
@@ -1350,6 +1375,7 @@ def test_a_draft_that_names_a_mode_drafts_into_the_catalog_it_was_given(
 @pytest.mark.parametrize("source", ["flag", "config"], ids=["a-flag", "a-config"])
 def test_a_draft_stands_in_for_a_workspace_only_when_nobody_supplied_one(
     source: str,
+    write_reach_toml: Callable[..., Path],
     skill_repo: Path,
     tmp_path: Path,
     capsys,
@@ -1367,13 +1393,13 @@ def test_a_draft_stands_in_for_a_workspace_only_when_nobody_supplied_one(
             str(tmp_path / "shared-work"),
         ]
     else:
-        config = tmp_path / "reach.toml"
-        config.write_text(
-            "[study]\n"
-            f'skills = "{skill_repo}"\n'
-            f'queries = "{destination}"\n'
-            f'workdir = "{tmp_path / "shared-work"}"\n',
-            encoding="utf-8",
+        config = write_reach_toml(
+            f"""
+            [study]
+            skills = "{skill_repo}"
+            queries = "{destination}"
+            workdir = "{tmp_path / "shared-work"}"
+            """,
         )
         argv += ["--config", str(config)]
 
@@ -1786,37 +1812,24 @@ def test_an_unknown_verb_names_the_verbs_that_exist(capsys) -> None:
     assert "eval" in reported
 
 
-HELP_ARGV = [
+ALL_HELP_COMMANDS = [
     [],
-    ["overlap"],
-    ["eval"],
-    ["diff"],
-    ["query"],
+    *[[verb] for verb in sorted(registered_verbs())],
     ["query", "draft"],
 ]
+ALL_HELP_IDS = ["reach" if not argv else "-".join(argv) for argv in ALL_HELP_COMMANDS]
 
-HELP_IDS = [
-    "reach",
-    "overlap",
-    "eval",
-    "diff",
-    "query",
-    "query-draft",
-]
+FORMATTED_ARGV = [["overlap"], ["eval"], ["diff"]]
+ALL_VERB_COMMANDS = [argv for argv in ALL_HELP_COMMANDS if argv and argv != ["query"]]
 
 
-@pytest.mark.parametrize("argv", HELP_ARGV, ids=HELP_IDS)
+@pytest.mark.parametrize("argv", ALL_HELP_COMMANDS, ids=ALL_HELP_IDS)
 def test_every_verb_gets_the_styled_help(argv: list[str], capsys) -> None:
     """Verify --help renders with themed console panel styling across all verbs."""
     assert main([*argv, "--help"]) == 0
     out = capsys.readouterr().out
     assert out.startswith("Usage:")
     assert "╭─" in out
-
-
-VERB_ARGV = [argv for argv in HELP_ARGV if argv and argv != ["query"]]
-UNFORMATTED_ARGV = [["query", "draft"]]
-FORMATTED_ARGV = [argv for argv in VERB_ARGV if argv not in UNFORMATTED_ARGV]
 
 
 @pytest.mark.parametrize("argv", FORMATTED_ARGV, ids=" ".join)
@@ -1835,7 +1848,7 @@ def test_a_runtime_that_probes_nothing_is_not_offered_as_though_it_did(
     assert _flag_line(capsys.readouterr().out, "--agent") == snapshot
 
 
-@pytest.mark.parametrize("argv", VERB_ARGV, ids=" ".join)
+@pytest.mark.parametrize("argv", ALL_VERB_COMMANDS, ids=" ".join)
 def test_a_switch_never_states_its_default(argv: list[str], capsys) -> None:
     """Verify boolean switch flags omit redundant default false annotations in help output."""
     assert main([*argv, "--help"]) == 0
@@ -1858,7 +1871,7 @@ def _flag_line(rendered: str, flag: str) -> str:
     return " ".join(part.strip("│ ") for part in row)
 
 
-@pytest.mark.parametrize("argv", HELP_ARGV, ids=HELP_IDS)
+@pytest.mark.parametrize("argv", ALL_HELP_COMMANDS, ids=ALL_HELP_IDS)
 def test_help_answers_on_stdout(argv: list[str], capsys) -> None:
     """Verify --help writes formatted usage text to stdout rather than stderr."""
     assert main([*argv, "--help"]) == 0
@@ -2041,28 +2054,39 @@ def test_mixing_arms_can_be_asked_for_on_the_command_line(
     assert len(out.read_text(encoding="utf-8").splitlines()) == 6
 
 
-def test_global_flag_lint_subcommand_and_top_level(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    """Verify reach lint with --global and -g in both prefix and postfix positions."""
+@pytest.fixture
+def global_skills_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Provide a mock user home directory populated with valid global skills."""
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
-    skill_dir = tmp_path / ".agents" / "skills" / "global-tester"
-    skill_dir.mkdir(parents=True)
-    (skill_dir / "SKILL.md").write_text(
-        "---\nname: global-tester\ndescription: Test global skill for linting.\n---\nBody",
-        encoding="utf-8",
-    )
+    skills = [
+        ("k8s-cluster", "Deploys cloud compute instances and manages cluster lifecycles."),
+        ("db-analyzer", "Analyzes relational database query performance and indexes."),
+        ("net-dns", "Configures DNS records and manages network load balancers."),
+    ]
+    for name, desc in skills:
+        s_dir = tmp_path / ".agents" / "skills" / name
+        s_dir.mkdir(parents=True, exist_ok=True)
+        (s_dir / "SKILL.md").write_text(
+            f"---\nname: {name}\ndescription: {desc}\n---\nBody\n",
+            encoding="utf-8",
+        )
+    return tmp_path
 
-    # Subcommand flag
-    assert main(["lint", "--global"]) == 0
-    assert main(["lint", "-g"]) == 0
 
-    # Top-level option before verb
-    assert main(["--global", "lint"]) == 0
-    assert main(["-g", "lint"]) == 0
+@pytest.mark.parametrize("verb", ["lint", "overlap", "check"])
+@pytest.mark.parametrize("flag", ["--global", "-g"])
+def test_global_flag_prefix_and_postfix(
+    verb: str,
+    flag: str,
+    global_skills_home: Path,
+) -> None:
+    """Verify reach verbs support global flag in both prefix and postfix positions."""
+    assert main([verb, flag]) == 0
+    assert main([flag, verb]) == 0
 
-    # Combined with top-level --agent
+
+def test_global_flag_combined_with_top_level_agent(global_skills_home: Path) -> None:
+    """Verify global flag works when combined with top-level --agent flag."""
     assert main(["--agent", "antigravity-cli", "--global", "lint"]) == 0
     assert main(["--global", "--agent", "antigravity-cli", "lint"]) == 0
 
@@ -2083,54 +2107,21 @@ def test_global_flag_sad_path_empty_home(
     assert "user global" in captured.err or "user global" in captured.out
 
 
-def test_global_flag_overlap(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    """Verify reach overlap works with --global in prefix and postfix positions."""
-    monkeypatch.setattr(Path, "home", lambda: tmp_path)
-    for name in ("skill-alpha", "skill-beta"):
-        s_dir = tmp_path / ".agents" / "skills" / name
-        s_dir.mkdir(parents=True)
-        (s_dir / "SKILL.md").write_text(
-            f"---\nname: {name}\ndescription: Description for {name}.\n---\nBody",
-            encoding="utf-8",
-        )
-
-    assert main(["overlap", "--global"]) == 0
-    assert main(["--global", "overlap"]) == 0
-    assert main(["-g", "overlap"]) == 0
+@pytest.fixture(scope="module")
+def cli_init_content() -> str:
+    """Read reach/cli/__init__.py content once per test module."""
+    root = Path(__file__).resolve().parent.parent.parent
+    return (root / "src" / "reach" / "cli" / "__init__.py").read_text(encoding="utf-8")
 
 
-def test_global_flag_check(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    """Verify reach check works with --global in prefix and postfix positions."""
-    monkeypatch.setattr(Path, "home", lambda: tmp_path)
-    skill_dir = tmp_path / ".agents" / "skills" / "checked-skill"
-    skill_dir.mkdir(parents=True)
-    (skill_dir / "SKILL.md").write_text(
-        "---\nname: checked-skill\ndescription: Skill that passes static lint check.\n---\nBody",
-        encoding="utf-8",
-    )
-
-    # Static check without queries
-    assert main(["check", "--global"]) == 0
-    assert main(["--global", "check"]) == 0
-    assert main(["-g", "check"]) == 0
-
-
-def test_cli_subcommands_all_imported_in_cli_init() -> None:
-    """Verify all registered CLI verbs are explicitly imported in reach.cli.__init__."""
+@pytest.mark.parametrize("verb", registered_verbs())
+def test_cli_subcommand_is_imported_in_cli_init(verb: str, cli_init_content: str) -> None:
+    """Verify registered CLI verb is explicitly imported in reach.cli.__init__."""
     import re
 
-    root = Path(__file__).resolve().parent.parent.parent
-    init_content = (root / "src" / "reach" / "cli" / "__init__.py").read_text(encoding="utf-8")
-    for verb in registered_verbs():
-        assert re.search(rf"\bfrom\s+\.\s+import\s+.*\b{verb}\b", init_content, re.DOTALL), (
-            f"CLI verb {verb!r} is not explicitly imported in reach/cli/__init__.py"
-        )
+    assert re.search(rf"\bfrom\s+\.\s+import\s+.*\b{verb}\b", cli_init_content, re.DOTALL), (
+        f"CLI verb {verb!r} is not explicitly imported in reach/cli/__init__.py"
+    )
 
 
 def test_agent_cli_literal_matches_known_agents() -> None:

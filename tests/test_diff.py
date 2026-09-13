@@ -37,7 +37,7 @@ from reach.diff import (
     survey_runs,
 )
 from reach.models import CatalogMode, Query, QueryKind
-from reach.queries import Origin, QuerySet, QuerySetProvenance
+from reach.queries import Origin, QuerySet, QuerySetProvenance, save_query_set
 from reach.uncertainty import DEFAULT_CONFIDENCE, critical_value
 from reach.views.diff import (
     DIFF_RENDERERS,
@@ -102,6 +102,39 @@ def edited_corpus(skill_repo: Path, tmp_path: Path) -> Path:
         encoding="utf-8",
     )
     return edited
+
+
+def _unsidecar(path: Path) -> None:
+    """Delete sidecar configuration file for given arm path."""
+    Path(f"{path}.config.json").unlink()
+
+
+def _tamper(path: Path) -> None:
+    """Modify sidecar configuration to simulate arm digest mismatch."""
+    sidecar = Path(f"{path}.config.json")
+    document = json.loads(sidecar.read_text(encoding="utf-8"))
+    document["arm"] = "0484b93363ba"
+    sidecar.write_text(json.dumps(document), encoding="utf-8")
+
+
+@pytest.fixture
+def disjoint_query_file(tmp_path: Path) -> Path:
+    """Provide a query set file containing disjoint queries from standard test sets."""
+    return save_query_set(
+        QuerySet(
+            catalog_id="neighborhood:gcs-lifecycle-rules",
+            queries=(
+                Query(
+                    id="q-elsewhere",
+                    text="Tier cold objects after a month.",
+                    kind=QueryKind.IMPLICIT,
+                    expected_skill="gcs-lifecycle-rules",
+                ),
+            ),
+            provenance=QuerySetProvenance(origin=Origin.AUTHORED),
+        ),
+        tmp_path / "other-queries.json",
+    )
 
 
 def test_the_floor_is_the_deviate_the_inflation_and_both_errors() -> None:
@@ -232,16 +265,38 @@ def test_the_text_view_shows_the_inflation_actually_applied(arm) -> None:
     assert "1.00x over-dispersion" in rendered
 
 
-def test_the_confidence_moves_every_interval_and_not_only_the_floor(arm) -> None:
+@pytest.mark.parametrize(
+    ("confidence_arg", "expected_confidence"),
+    [
+        (None, DEFAULT_CONFIDENCE),
+        (0.80, 0.80),
+        (0.99, 0.99),
+    ],
+    ids=["default-confidence", "loose-confidence-80", "strict-confidence-99"],
+)
+def test_the_confidence_moves_every_interval_and_not_only_the_floor(
+    arm,
+    confidence_arg: float | None,
+    expected_confidence: float,
+) -> None:
     """Verify confidence parameter scales headline, skill, and query confidence intervals."""
+    control, treatment = arm("one", DILUTED_CONTROL), arm("two", DILUTED_TREATMENT)
+    comparison = (
+        diff_runs(control, treatment, "description")
+        if confidence_arg is None
+        else diff_runs(control, treatment, "description", confidence=confidence_arg)
+    )
+    quoted = {delta.control_interval.confidence for delta in comparison.skills} | {
+        delta.treatment_interval.confidence for delta in comparison.queries
+    }
+    assert quoted == {expected_confidence}
+
+
+def test_loosening_confidence_narrows_intervals_and_clears_real_threshold(arm) -> None:
+    """Verify loosening confidence narrows query intervals and flips real verdict."""
     control, treatment = arm("one", DILUTED_CONTROL), arm("two", DILUTED_TREATMENT)
     default = diff_runs(control, treatment, "description")
     loose = diff_runs(control, treatment, "description", confidence=0.80)
-    for comparison, expected in ((default, DEFAULT_CONFIDENCE), (loose, 0.80)):
-        quoted = {delta.control_interval.confidence for delta in comparison.skills} | {
-            delta.treatment_interval.confidence for delta in comparison.queries
-        }
-        assert quoted == {expected}
     assert loose.queries[0].control_interval.width < default.queries[0].control_interval.width
     assert loose.headline.real
     assert not default.headline.real
@@ -342,6 +397,17 @@ def test_only_the_three_factors_are_accepted(arm) -> None:
         diff_runs(arm("one", HALF), arm("two", HITS), "attempts")
 
 
+@pytest.mark.parametrize("factor", list(VaryFactor))
+def test_vary_factor_accepts_enum_and_string_identically(arm, factor: VaryFactor) -> None:
+    """Verify diff_runs produces identical comparisons for enum and string factor inputs."""
+    control, treatment = arm("c", HALF), arm("t", BARELY_MORE)
+    from_enum = diff_runs(control, treatment, factor)
+    from_str = diff_runs(control, treatment, factor.value)
+    assert from_enum.factor == from_str.factor == factor
+    assert from_enum.headline.delta == from_str.headline.delta
+    assert from_enum.model_dump() == from_str.model_dump()
+
+
 def test_per_skill_recall_is_judged_by_overlap_and_not_by_the_gap(arm) -> None:
     """Verify per-skill recall differences are evaluated by confidence interval overlap."""
     comparison = diff_runs(arm("one", HALF), arm("two", BARELY_MORE), "description")
@@ -404,14 +470,13 @@ def test_a_query_with_no_kind_still_gets_a_row(
     queries,
 ) -> None:
     """Verify queries with kind=None are preserved and compared cleanly."""
-    unlabeled = tmp_path / "unlabeled.json"
-    unlabeled.write_text(
+    unlabeled = save_query_set(
         QuerySet(
             catalog_id="neighborhood:gcs-lifecycle-rules",
             queries=tuple(query.model_copy(update={"kind": None}) for query in queries),
             provenance=QuerySetProvenance(origin=Origin.AUTHORED),
-        ).model_dump_json(),
-        encoding="utf-8",
+        ),
+        tmp_path / "unlabeled.json",
     )
     both = {"catalog": WIDE, "plan": {"attempts": 5}, "study": {"queries": unlabeled}}
     comparison = diff_runs(
@@ -426,29 +491,12 @@ def test_arms_scored_on_different_queries_are_refused(
     arm,
     make_config,
     record_arm,
-    tmp_path: Path,
-    queries,
+    disjoint_query_file: Path,
 ) -> None:
     """Verify comparing arms evaluated on disjoint query sets raises ValueError."""
-    other = tmp_path / "other-queries.json"
-    other.write_text(
-        QuerySet(
-            catalog_id="neighborhood:gcs-lifecycle-rules",
-            queries=(
-                Query(
-                    id="q-elsewhere",
-                    text="Tier cold objects after a month.",
-                    kind=QueryKind.IMPLICIT,
-                    expected_skill="gcs-lifecycle-rules",
-                ),
-            ),
-            provenance=QuerySetProvenance(origin=Origin.AUTHORED),
-        ).model_dump_json(),
-        encoding="utf-8",
-    )
     elsewhere = record_arm(
         "elsewhere",
-        make_config(catalog=WIDE, plan={"attempts": 5}, study={"queries": other}),
+        make_config(catalog=WIDE, plan={"attempts": 5}, study={"queries": disjoint_query_file}),
         {"q-elsewhere": ("gcs-lifecycle-rules",) * 5},
     )
     with pytest.raises(ValueError, match="scored on different queries"):
@@ -463,8 +511,7 @@ def test_arms_whose_ground_truth_moved_are_refused(
     queries,
 ) -> None:
     """Verify comparing arms with differing ground truth digests raises ValueError."""
-    relabeled = tmp_path / "relabeled.json"
-    relabeled.write_text(
+    relabeled = save_query_set(
         QuerySet(
             catalog_id="neighborhood:gcs-lifecycle-rules",
             queries=tuple(
@@ -474,8 +521,8 @@ def test_arms_whose_ground_truth_moved_are_refused(
                 for query in queries
             ),
             provenance=QuerySetProvenance(origin=Origin.AUTHORED),
-        ).model_dump_json(),
-        encoding="utf-8",
+        ),
+        tmp_path / "relabeled.json",
     )
     moved = record_arm(
         "relabeled",
@@ -493,21 +540,18 @@ def test_an_arm_cannot_be_compared_with_itself(arm) -> None:
         diff_runs(recorded, recorded, "description")
 
 
-def test_a_results_file_with_no_sidecar_cannot_be_read_back(arm, tmp_path: Path) -> None:
+def test_a_results_file_with_no_sidecar_cannot_be_read_back(arm) -> None:
     """Verify load_arm raises FileNotFoundError when sidecar config file is missing."""
-    orphan = tmp_path / "orphan.jsonl"
-    orphan.write_text(Path(arm("kept", HITS)).read_text(encoding="utf-8"))
+    recorded = arm("kept", HITS)
+    _unsidecar(recorded)
     with pytest.raises(FileNotFoundError, match="no sidecar"):
-        load_arm(orphan)
+        load_arm(recorded)
 
 
 def test_a_tampered_sidecar_is_refused_rather_than_misattributed(arm) -> None:
     """Verify load_arm raises ValueError for sidecars whose arm does not match configuration."""
     recorded = arm("tampered", HITS)
-    sidecar = Path(f"{recorded}.config.json")
-    document = json.loads(sidecar.read_text(encoding="utf-8"))
-    document["arm"] = "0484b93363ba"
-    sidecar.write_text(json.dumps(document), encoding="utf-8")
+    _tamper(recorded)
     with pytest.raises(ValueError, match="does not match"):
         load_arm(recorded)
 
@@ -540,7 +584,7 @@ def test_an_arm_whose_query_set_is_nowhere_names_the_path_it_looked_for(
 
 
 def test_an_arm_whose_corpus_has_moved_says_so(arm, tmp_path: Path) -> None:
-    """Name the corpus a recorded arm cannot find, and how to point at it."""
+    """Verify load_arm raises FileNotFoundError when recorded corpus path cannot be found."""
     recorded = arm("shipped", HITS)
     gone = tmp_path / "nowhere"
     with pytest.raises(FileNotFoundError, match="which is not here"):
@@ -578,19 +622,6 @@ def test_two_arms_that_were_scored_on_nothing_are_not_compared(arm, query_file: 
     )
     with pytest.raises(ValueError, match="neither arm was scored on any query"):
         diff_runs(arm("nothing", {}), arm("nothing-either", {}), "description")
-
-
-def _unsidecar(path: Path) -> None:
-    """Delete sidecar configuration file for given arm path."""
-    Path(f"{path}.config.json").unlink()
-
-
-def _tamper(path: Path) -> None:
-    """Modify sidecar configuration to simulate arm digest mismatch."""
-    sidecar = Path(f"{path}.config.json")
-    document = json.loads(sidecar.read_text(encoding="utf-8"))
-    document["arm"] = "0484b93363ba"
-    sidecar.write_text(json.dumps(document), encoding="utf-8")
 
 
 def test_a_pairing_with_nothing_standing_surveys_clear_and_crosses_where_it_stands(
@@ -664,29 +695,12 @@ def test_a_pairing_that_fails_twice_says_both_of_its_reasons(
     arm,
     make_config,
     record_arm,
-    tmp_path: Path,
-    queries,
+    disjoint_query_file: Path,
 ) -> None:
     """Verify survey captures multiple distinct pairing obstruction walls."""
-    other = tmp_path / "other-queries.json"
-    other.write_text(
-        QuerySet(
-            catalog_id="neighborhood:gcs-lifecycle-rules",
-            queries=(
-                Query(
-                    id="q-elsewhere",
-                    text="Tier cold objects after a month.",
-                    kind=QueryKind.IMPLICIT,
-                    expected_skill="gcs-lifecycle-rules",
-                ),
-            ),
-            provenance=QuerySetProvenance(origin=Origin.AUTHORED),
-        ).model_dump_json(),
-        encoding="utf-8",
-    )
     elsewhere = record_arm(
         "elsewhere",
-        make_config(catalog=WIDE, plan={"attempts": 5}, study={"queries": other}),
+        make_config(catalog=WIDE, plan={"attempts": 5}, study={"queries": disjoint_query_file}),
         {"q-elsewhere": ("gcs-lifecycle-rules",) * 5},
     )
 
@@ -864,6 +878,25 @@ def test_an_unknown_format_names_the_ones_that_exist(arm) -> None:
     assert set(DIFF_RENDERERS) == {"csv", "json", "jsonl", "text"}
 
 
+@pytest.mark.parametrize("fmt", sorted(DIFF_RENDERERS))
+def test_all_diff_renderers_produce_valid_non_empty_output(arm, fmt: str) -> None:
+    """Verify all registered diff renderers produce non-empty formatted output."""
+    comparison = diff_runs(arm("one", HALF), arm("two", BARELY_MORE), "description")
+    rendered = render_diff(comparison, fmt)
+    assert rendered
+    if fmt == "json":
+        assert json.loads(rendered)
+    elif fmt == "jsonl":
+        lines = rendered.strip().splitlines()
+        assert lines
+        for line in lines:
+            assert json.loads(line)
+    elif fmt == "csv":
+        assert rendered.startswith("figure,")
+    elif fmt == "text":
+        assert "diff --vary description" in rendered
+
+
 def test_a_rendered_survey_puts_each_reason_under_the_side_it_stands_on(arm) -> None:
     """Verify survey view groups failure reasons by control, treatment, and pairing."""
     control, treatment = arm("control", HALF), arm("treatment", HITS)
@@ -968,3 +1001,51 @@ def test_two_loaded_arms_compare_the_same_as_two_paths(arm) -> None:
     from_paths = diff_runs(control, treatment, "description")
     from_arms = diff_arms(load_arm(control), load_arm(treatment), "description")
     assert from_arms.model_dump() == from_paths.model_dump()
+
+
+def test_load_arm_reads_artifact_json_directly(arm, tmp_path: Path) -> None:
+    """Verify load_arm reads an .artifact.json file directly without requiring a sidecar."""
+    from reach.artifact import write_artifact
+
+    recorded = arm("base", HITS)
+    original_arm = load_arm(recorded)
+    artifact_file = tmp_path / "baseline.artifact.json"
+    write_artifact(original_arm.artifact, artifact_file)
+
+    loaded_arm = load_arm(artifact_file)
+    assert loaded_arm.label == "baseline"
+    assert loaded_arm.artifact.probes == original_arm.artifact.probes
+    assert loaded_arm.artifact.catalog_id == original_arm.artifact.catalog_id
+
+    custom_labeled = load_arm(artifact_file, label="custom-arm")
+    assert custom_labeled.label == "custom-arm"
+
+
+def test_load_arm_raises_file_not_found_for_missing_artifact(tmp_path: Path) -> None:
+    """Verify load_arm raises FileNotFoundError when an artifact file does not exist."""
+    missing = tmp_path / "nonexistent.artifact.json"
+    with pytest.raises(FileNotFoundError):
+        load_arm(missing)
+
+
+def test_diff_runs_accepts_artifact_files_directly(arm, tmp_path: Path) -> None:
+    """Verify diff_runs compares two .artifact.json files directly across a varied factor."""
+    from reach.artifact import write_artifact
+
+    control_path = arm("control", HITS, catalog=NARROW)
+    treatment_path = arm("treatment", HITS, catalog=WIDE)
+
+    control_art = write_artifact(
+        load_arm(control_path).artifact,
+        tmp_path / "control.artifact.json",
+    )
+    treatment_art = write_artifact(
+        load_arm(treatment_path).artifact,
+        tmp_path / "treatment.artifact.json",
+    )
+
+    comparison = diff_runs(control_art, treatment_art, VaryFactor.SCOPE)
+    assert comparison.factor == VaryFactor.SCOPE
+    assert comparison.control.label == "control"
+    assert comparison.treatment.label == "treatment"
+    assert comparison.corroboration.corroborated

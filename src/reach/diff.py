@@ -21,7 +21,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field, computed_field
 
-from reach.artifact import Artifact
+from reach.artifact import ARTIFACT_SUFFIX, Artifact, read_artifact
 from reach.config import DiffSettings, RunConfig, reanchor
 from reach.models import QueryKind
 from reach.run import ConfigSidecar, compose, load_results, read_sidecar, sidecar_path
@@ -373,11 +373,34 @@ def load_arm(
 ) -> Arm:
     """Load results and reconstruct the Artifact model for an experimental arm."""
     path = Path(results_path).expanduser()
+    if not path.exists():
+        msg = f"{path} does not exist"
+        raise FileNotFoundError(msg)
+
+    resolved_label = (
+        label
+        if label is not None
+        else (
+            path.name[: -len(ARTIFACT_SUFFIX)] if path.name.endswith(ARTIFACT_SUFFIX) else path.stem
+        )
+    )
+    if path.name.endswith(ARTIFACT_SUFFIX):
+        return Arm(label=resolved_label, artifact=read_artifact(path))
+
+    if path.suffix == ".json" and not (
+        path.with_name(f"{path.name}.config.json").exists()
+        or path.with_suffix(".config.json").exists()
+    ):
+        try:
+            return Arm(label=resolved_label, artifact=read_artifact(path))
+        except (OSError, ValueError):
+            pass
+
     recorded = _read_valid_sidecar(path)
     config = _resolve_arm_config(path, recorded.config, queries_root, corpus)
     composed = compose(config)
     return Arm(
-        label=label if label is not None else path.stem,
+        label=resolved_label,
         artifact=Artifact.assemble(
             composed,
             load_results(path),
