@@ -17,11 +17,10 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from math import floor
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, override
 
-from reach.config import RuntimeSettings
+from reach.config import RuntimeSettings, resolve_path
 from reach.runtime import (
     FAKE_AGENT,
     AgentOptions,
@@ -30,13 +29,10 @@ from reach.runtime import (
     SelectionOutcome,
     SessionSummary,
     SkillRoot,
+    TrajectoryTracker,
     resolve_options,
 )
-from reach.runtime._fs import (
-    install_skills,
-    resolve_catalog_skills,
-)
-from reach.runtime.profiles import model_profile
+from reach.runtime.generator import BaseTextGenerator
 
 if TYPE_CHECKING:
     from reach.models import Catalog, Skill
@@ -70,7 +66,7 @@ def resolve_fake_options(raw: Mapping[str, Any] | None) -> FakeOptions:
     return FakeOptions.model_validate(dict(raw or {}))
 
 
-class FakeGenerator:
+class FakeGenerator(BaseTextGenerator[FakeOptions]):
     """Scripted text generator test double for query drafting and optimization."""
 
     name: str = FAKE_AGENT
@@ -85,33 +81,23 @@ class FakeGenerator:
         cost_usd: float = 0.0,
         timeout_s: int = 300,
         completion: str = "",
+        options: FakeOptions | None = None,
     ) -> None:
         """Initialize fake generator with canned responses or string completion."""
-        self._model = model
-        self.timeout_s = timeout_s
+        opts = options if options is not None else FakeOptions(model=model)
+        super().__init__(model=opts.model or model, timeout_s=timeout_s, options=opts)
         self._responses = responses
         self._prompt_budget_chars = prompt_budget_chars
         self.cost_usd = cost_usd
         self.completion = completion
-        self.completions = 0
-        self.completion_cost_usd = 0.0
         self.prompts: list[str] = []
 
-    @property
-    def model(self) -> str:
-        """Return configured model identifier."""
-        return self._model
-
+    @override
     def prompt_budget_chars(self) -> int | None:
         """Return configured prompt character budget limit."""
         if self._prompt_budget_chars is not None:
             return self._prompt_budget_chars
-        try:
-            profile = model_profile(self.model)
-            window = profile.completion_window or profile.context_window
-            return floor(window * profile.chars_per_token)
-        except (KeyError, ValueError):
-            return None
+        return super().prompt_budget_chars()
 
     def complete(self, prompt: str) -> str:
         """Record prompt and return scripted completion string."""
@@ -127,7 +113,7 @@ class FakeGenerator:
         return str(self._responses(prompt))
 
 
-class FakeRuntime(AgentRuntime):
+class FakeRuntime(AgentRuntime[FakeOptions]):
     """Implement AgentRuntime using deterministic scripted responses for testing."""
 
     name = FAKE_AGENT
@@ -147,46 +133,28 @@ class FakeRuntime(AgentRuntime):
         settings: RuntimeSettings | None = None,
     ) -> None:
         """Initialize fake runtime with scripted responses, roots, and budgets."""
+        opts = options if options is not None else FakeOptions(model=model, materialize=materialize)
+        super().__init__(settings=settings, options=opts)
         self._responses = responses
         self._default = default
         self._roots = tuple(roots)
         self._fit = fit if fit is not None else CatalogFit()
-        self.options = (
-            options if options is not None else FakeOptions(model=model, materialize=materialize)
-        )
-        self.settings = settings
-        self._model = self.options.model
         self.cost_usd = cost_usd
         self.installs: list[tuple[Catalog, Path]] = []
         self.fittings: list[Catalog] = []
         self.queries: list[str] = []
         self.root_queries: list[Path] = []
-        self._resident: tuple[str, ...] = ()
         self.materialize = materialize or self.options.materialize
-
-    @property
-    @override
-    def model(self) -> str:
-        """Return configured model identifier."""
-        return self._model
-
-    @model.setter
-    @override
-    def model(self, value: str) -> None:
-        """Update configured model identifier."""
-        self._model = value
-        self.options = FakeOptions(model=value)
 
     @override
     def skill_roots(self, workdir: Path) -> tuple[SkillRoot, ...]:
         """Record the queried workspace path and return configured fake skill roots."""
-        target = Path(workdir)
+        target = resolve_path(workdir)
         self.root_queries.append(target)
         if self._roots:
             return self._roots
         if self.materialize:
-            here = self.skills_dir(target)
-            return (SkillRoot(path=here, scope="project", precedence=0),) if here.is_dir() else ()
+            return super().skill_roots(target)
         return ()
 
     @override
@@ -198,18 +166,11 @@ class FakeRuntime(AgentRuntime):
     @override
     def install(self, catalog: Catalog, skills: Iterable[Skill], workdir: Path) -> Path:
         """Validate catalog skills against corpus and record installation request."""
-        target = Path(workdir)
-        by_name = resolve_catalog_skills(catalog, skills)
+        target = resolve_path(workdir)
         self.installs.append((catalog, target))
         if self.materialize:
-            self._resident = install_skills(
-                catalog,
-                by_name,
-                self.skills_dir(target),
-                use_symlinks=self.options.use_symlinks,
-            )
-        else:
-            self._resident = catalog.skills
+            return super().install(catalog, skills, target)
+        self._resident = catalog.skills
         return target
 
     @override
@@ -253,22 +214,18 @@ class FakeRuntime(AgentRuntime):
                 return answer.model_copy(update={"observed_catalog": self._resident})
 
             if isinstance(answer, Sequence) and not isinstance(answer, str):
-                skills_seq = list(answer)
-                early_exit_hit = False
-                truncated: list[str] = []
-                for s in skills_seq:
-                    truncated.append(s)
-                    if self.options.early_exit and target_skill is not None and s == target_skill:
-                        early_exit_hit = True
+                tracker = TrajectoryTracker(
+                    target_skill=target_skill,
+                    max_turns=self.options.max_turns,
+                    early_exit=self.options.early_exit,
+                )
+                for s in answer:
+                    if tracker.observe(s) or len(tracker.invoked_skills) >= self.options.max_turns:
                         break
-                    if len(truncated) >= self.options.max_turns:
-                        early_exit_hit = self.options.early_exit
-                        break
-                invoked_skills = tuple(truncated)
                 return SelectionOutcome(
-                    invoked_skills=invoked_skills,
-                    early_exit=early_exit_hit,
-                    turns_taken=max(1, len(truncated)),
+                    invoked_skills=tuple(tracker.invoked_skills),
+                    early_exit=tracker.early_exit_hit,
+                    turns_taken=tracker.turns_taken,
                     observed_catalog=self._resident,
                     observed_tools=("Skill",),
                     cost_usd=self.cost_usd,
@@ -307,6 +264,7 @@ def register_fake_agent() -> None:
             model=options.model,
             options=options,
             materialize=options.materialize,
+            settings=s,
         )
 
     register_agent(

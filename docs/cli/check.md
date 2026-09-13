@@ -22,6 +22,10 @@ flowchart TD
 1. **Stage 1 (static)**: Fast, offline schema, budget, dependency, and lockfile validation across modified skills without API calls.
 2. **Stage 2 (empirical)**: Probes modified skills against their rivals using a fixed query set, validating classification accuracy, misrouting, and multi-step trajectory metrics (entrypoint accuracy, reachability, step efficiency, skill F1, and redundancy).
 
+> [!WARNING]
+> **CI/CD Runner Safety**
+> Stage 2 empirical probes execute live agent tools on the runner. For automated CI/CD pipelines (GitHub Actions, Cloud Build), ensure workflows run inside isolated runner containers or sandboxes (e.g. [Google Cloud Run sandboxes](../guides/sandboxing.md)), and pass `--yes` (or set `REACH_YES=1`) to prevent non-interactive fail-closed termination.
+
 ---
 
 ## Synopsis
@@ -173,6 +177,7 @@ reach check --format github --step-summary
 | `--quiet`, `-q`  | Flag   | `false`                    | Suppress standard terminal view.                                   |
 | `--format`       | Choice | `auto`                     | Output format: `auto`, `concise`, `github`, `json`, `text`.        |
 | `--step-summary` | Flag   | `true` (in GitHub Actions) | Write GFM Markdown scorecard to `$GITHUB_STEP_SUMMARY`.            |
+| `--yes`, `-y`    | Flag   | `false`                    | Bypass interactive safety confirmation prompts.                    |
 | `--ignore`       | String | -                          | Disable specific lint rule(s) (repeatable).                        |
 | `--error`        | String | -                          | Treat specific lint rule(s) as error (repeatable).                 |
 | `--warn`         | String | -                          | Treat specific lint rule(s) as warning (repeatable).               |

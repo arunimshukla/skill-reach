@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Final, Literal
@@ -23,6 +24,7 @@ from typing import TYPE_CHECKING, Annotated, Final, Literal
 from cyclopts import Parameter
 
 if TYPE_CHECKING:
+    from reach.config import RunConfig
     from reach.optimize import OptimizationReport
     from reach.views import Console
 
@@ -33,7 +35,7 @@ from reach.optimize import (
 )
 
 from .app import LOOP, app
-from .flags import POSITIVE_INT, RATE, SWITCH, AgentName, Global, agent_help_text
+from .flags import POSITIVE_INT, RATE, SWITCH, AgentName, Global, YesFlag, agent_help_text
 
 type OptimizeFormat = Literal["text", "json", "diff"]
 
@@ -42,6 +44,36 @@ DEFAULT_CANDIDATES: Final = 3
 
 #: Default probe budget allocated across candidate evaluations.
 DEFAULT_OPTIMIZE_BUDGET: Final = DEFAULT_BUDGET
+
+
+def _confirm_optimize_safety(
+    console: Console,
+    skills: Path | None,
+    resolved_agent: str,
+    *,
+    yes: bool,
+    run_config: RunConfig | None,
+) -> int:
+    """Prompt for safety confirmation before launching live optimization probes."""
+    from reach.catalog import load_skills
+    from reach.cli.safety import confirm_skill_execution
+
+    roots = [skills] if skills is not None else [Path.cwd()]
+    loaded_skills = 1
+    if roots[0].is_dir():
+        with contextlib.suppress(OSError, ValueError):
+            loaded_skills = len(load_skills(roots[0]))
+
+    trusted = run_config.study.trusted if run_config is not None else False
+    return confirm_skill_execution(
+        console,
+        runtime_name=resolved_agent,
+        skills=loaded_skills,
+        roots=roots,
+        action="optimization",
+        yes=yes,
+        trusted=trusted,
+    )
 
 
 @app.command(name="optimize", group=LOOP)
@@ -142,6 +174,7 @@ def _optimize(
             help="Force apply candidate to SKILL.md even if no empirical improvement is detected",
         ),
     ] = False,
+    yes: YesFlag = False,
     candidate: Annotated[
         int,
         POSITIVE_INT,
@@ -196,6 +229,11 @@ def _optimize(
     if eff_settings.budget < 1:
         console.print("[red]Error:[/] Probe budget must be at least 1")
         return 2
+
+    if code := _confirm_optimize_safety(
+        console, skills, resolved_agent, yes=yes, run_config=run_config
+    ):
+        return code
 
     from contextlib import nullcontext
 

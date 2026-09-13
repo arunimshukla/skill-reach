@@ -10,6 +10,7 @@ Agent execution runtime interfaces, CLI subprocess template drivers, Antigravity
         - agent_default_model
         - AgentOptions
         - AgentRuntime
+        - antigravity_agents
         - AntigravityRuntime
         - build_runtime
         - build_text_generator
@@ -23,6 +24,7 @@ Agent execution runtime interfaces, CLI subprocess template drivers, Antigravity
         - options_model
         - register_agent
         - resolve_options
+        - runtime_class
         - SelectionOutcome
         - SessionStatus
         - SessionSummary

@@ -100,8 +100,8 @@ class QuerySet(BaseModel):
         return self
 
     def for_skill(self, name: str) -> tuple[Query, ...]:
-        """Return queries whose expected skill matches the specified skill name."""
-        return tuple(q for q in self.queries if q.expected_skill == name)
+        """Return queries whose expected skill or truth label matches the specified name."""
+        return tuple(q for q in self.queries if name in (q.expected_skill, q.truth_label))
 
 
 def load_query_set(path: Path | str, *, catalog_id: str = "all") -> QuerySet:

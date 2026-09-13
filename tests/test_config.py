@@ -113,7 +113,34 @@ def test_any_module_may_be_imported_first() -> None:
 def test_shared_config_names_no_runtime_specific_setting() -> None:
     """Verify RuntimeSettings schema defines only common fields."""
     shared = set(RuntimeSettings.model_fields)
-    assert shared == {"agent", "allowed_tools", "early_exit", "max_turns", "options", "timeout_s"}
+    assert shared == {
+        "agent",
+        "allowed_tools",
+        "blocked_env_vars",
+        "early_exit",
+        "max_turns",
+        "options",
+        "timeout_s",
+    }
+
+
+def test_runtime_settings_parses_blocked_env_vars_from_toml(tmp_path: Path) -> None:
+    """Verify blocked_env_vars parses from [runtime] TOML table."""
+    path = write_toml(
+        tmp_path,
+        """
+        [study]
+        skills = "corpus"
+        queries = "q.json"
+        workdir = "work"
+
+        [runtime]
+        agent = "antigravity-cli"
+        blocked_env_vars = ["AWS_SECRET_ACCESS_KEY", "CUSTOM_SECRET"]
+        """,
+    )
+    config = RunConfig.from_toml(path)
+    assert config.runtime.blocked_env_vars == ("AWS_SECRET_ACCESS_KEY", "CUSTOM_SECRET")
 
 
 def test_an_option_the_agent_does_not_know_is_rejected_at_load() -> None:
@@ -752,6 +779,7 @@ def test_the_loader_gained_no_field(variable_config: Path, skill_repo: Path) -> 
         "early_stop",
         "scales",
         "anchor",
+        "trusted",
     }
     assert RunConfig.model_validate(dumped).fingerprint == config.fingerprint
 
@@ -941,7 +969,7 @@ def test_custom_agent_profile_elevates_custom_skills_dir(tmp_path: Path) -> None
             """
             [agents.custom-bot]
             skills_dir = ".custom/skills"
-            """
+            """,
         ),
         encoding="utf-8",
     )
@@ -1296,13 +1324,17 @@ def test_resolve_settings_across_sections() -> None:
     )
 
     diff_res = RunConfig.resolve(
-        DiffSettings, explicit_settings=DiffSettings(confidence=0.99), noise_inflation=1.5
+        DiffSettings,
+        explicit_settings=DiffSettings(confidence=0.99),
+        noise_inflation=1.5,
     )
     assert diff_res.confidence == 0.99
     assert diff_res.noise_inflation == 1.5
 
     opt_res = RunConfig.resolve(
-        OptimizeSettings, explicit_settings=OptimizeSettings(budget=50), temperature=1.2
+        OptimizeSettings,
+        explicit_settings=OptimizeSettings(budget=50),
+        temperature=1.2,
     )
     assert opt_res.budget == 50
     assert opt_res.temperature == 1.2

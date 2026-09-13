@@ -363,6 +363,77 @@ def test_env_configures_isolated_claude_config_dir(
     assert (tmp_path / ".reach_claude_config").is_dir()
 
 
+def test_env_syncs_claude_settings_and_defaults_region(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify build_env syncs settings and defaults CLOUD_ML_REGION to global for Vertex."""
+    claude_home = tmp_path / ".claude"
+    claude_home.mkdir()
+    settings_file = claude_home / "settings.json"
+    settings_file.write_text(
+        json.dumps(
+            {
+                "env": {
+                    "CLAUDE_CODE_USE_VERTEX": "1",
+                    "ANTHROPIC_VERTEX_PROJECT_ID": "auto-proj",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.delenv("CLOUD_ML_REGION", raising=False)
+
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+    rt = ClaudeCodeRuntime()
+    env = rt.build_env(workdir)
+
+    assert env["CLAUDE_CODE_USE_VERTEX"] == "1"
+    assert env["ANTHROPIC_VERTEX_PROJECT_ID"] == "auto-proj"
+    assert env["CLOUD_ML_REGION"] == "global"
+
+
+def test_claude_code_build_env_strips_blocked_vars_from_settings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify build_env filters blocked environment variables from settings.json."""
+    claude_home = tmp_path / ".claude"
+    claude_home.mkdir()
+    settings_file = claude_home / "settings.json"
+    settings_file.write_text(
+        json.dumps(
+            {
+                "env": {
+                    "ALLOWED_VAR": "allowed",
+                    "AWS_SECRET_ACCESS_KEY": "should-be-blocked",
+                    "CUSTOM_SECRET": "should-also-be-blocked",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+
+    # Custom blocked var configured on options
+    options = ClaudeCodeOptions(blocked_env_vars=("CUSTOM_SECRET",))
+    rt = ClaudeCodeRuntime(options=options)
+    env = rt.build_env(workdir)
+    assert env.get("ALLOWED_VAR") == "allowed"
+    assert "CUSTOM_SECRET" not in env
+
+    # Default blocked vars stripped when options have no explicit blocked_env_vars
+    default_rt = ClaudeCodeRuntime()
+    default_env = default_rt.build_env(workdir)
+    assert default_env.get("ALLOWED_VAR") == "allowed"
+    assert "AWS_SECRET_ACCESS_KEY" not in default_env
+
+
 def test_denial_covers_the_replacements_the_runtime_substitutes() -> None:
     """Verify default denied_tools includes Glob and Grep."""
     denied = set(ClaudeCodeOptions().denied_tools)
@@ -949,3 +1020,42 @@ def test_result_event_with_non_numeric_telemetry() -> None:
     assert summary.cost_usd is None
     assert summary.duration_ms is None
     assert summary.result_subtype == "success"
+
+
+def test_claude_generator_build_env_forwards_api_key() -> None:
+    """Verify ClaudeGenerator build_env passes ANTHROPIC_API_KEY when configured in options."""
+    gen = ClaudeGenerator(
+        options=ClaudeCodeOptions(
+            api_key="claude-secret-key",
+        ),
+    )
+    env = gen.build_env()
+    assert env["ANTHROPIC_API_KEY"] == "claude-secret-key"
+
+
+def test_claude_code_build_env_applies_region_and_project_options(
+    tmp_path: Path,
+) -> None:
+    """Verify ClaudeCodeRuntime build_env respects cloud_ml_region and vertex_project_id options."""
+    rt = ClaudeCodeRuntime(
+        options=ClaudeCodeOptions(
+            cloud_ml_region="us-east5",
+            vertex_project_id="custom-proj",
+        )
+    )
+    env = rt.build_env(tmp_path)
+    assert env["CLOUD_ML_REGION"] == "us-east5"
+    assert env["ANTHROPIC_VERTEX_PROJECT_ID"] == "custom-proj"
+
+
+def test_claude_generator_build_env_applies_region_and_project_options() -> None:
+    """Verify ClaudeGenerator build_env respects cloud_ml_region and vertex_project_id options."""
+    gen = ClaudeGenerator(
+        options=ClaudeCodeOptions(
+            cloud_ml_region="europe-west1",
+            vertex_project_id="gen-proj",
+        )
+    )
+    env = gen.build_env()
+    assert env["CLOUD_ML_REGION"] == "europe-west1"
+    assert env["ANTHROPIC_VERTEX_PROJECT_ID"] == "gen-proj"

@@ -97,7 +97,11 @@ def _worst_first(skills: Sequence[SkillScore]) -> list[SkillScore]:
     shown = [s for s in skills if s.probes or s.absorbed]
     return sorted(
         shown,
-        key=lambda s: (s.recall is None, s.recall or 0.0, -s.absorbed, s.skill),
+        key=lambda s: (
+            s.recall if s.recall is not None else 0.0,
+            -s.absorbed,
+            s.skill,
+        ),
     )
 
 
@@ -131,12 +135,13 @@ def _run_figures(artifact: Artifact) -> Text:
         ]
     )
 
+    attempts_label = "attempt" if spread.replicates == 1 else "attempts"
     parts.append(
         (
             (
                 f"\nmacro-F1 {scores.not_headline.macro_f1 * 100:.1f}%"
                 f"  over {len(scores.not_headline.labels)} observed labels"
-                f"  [{spread.replicates} replicates,"
+                f"  [{spread.replicates} {attempts_label},"
                 f" {spread.repeated_queries} repeated queries]"
             ),
             "reach.digest",

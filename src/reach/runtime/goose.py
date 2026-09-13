@@ -18,10 +18,9 @@ from __future__ import annotations
 
 import contextlib
 import json
-import shutil
 import subprocess
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, override
+from typing import TYPE_CHECKING, Any, ClassVar, override
 
 from pydantic import Field
 
@@ -38,6 +37,7 @@ from reach.runtime._env import (
     sync_google_and_gemini_keys,
 )
 from reach.runtime._fs import (
+    ensure_private_directory,
     resolve_skill_from_path,
 )
 from reach.runtime._subprocess import (
@@ -58,6 +58,7 @@ class GooseOptions(CliOptions):
         description="The model identifier to evaluate.",
     )
     home_dir: Path | None = None
+    isolation_dir_field: ClassVar[str | None] = "home_dir"
     no_profile: bool = True
     with_builtin: str = "skills"
 
@@ -245,13 +246,21 @@ class GooseRuntime(CliAgentRuntime[GooseOptions]):
     options: GooseOptions
     api_key_env_var: str | None = None
     _skills_subpath: str = ".agents/skills"
+    isolation_dir_name: ClassVar[str | None] = ".reach_goose"
 
-    def __init__(self, settings: RuntimeSettings | None = None) -> None:
+    def __init__(
+        self,
+        settings: RuntimeSettings | None = None,
+        options: GooseOptions | None = None,
+    ) -> None:
         """Initialize the GooseRuntime with settings or defaults."""
-        effective = settings or RuntimeSettings(agent="goose")
-        self.settings = effective
-        self.options = GooseOptions.model_validate(dict(effective.options or {}))
-        self._resident: tuple[str, ...] = ()
+        if options is None:
+            effective_settings = settings or RuntimeSettings(agent=self.name)
+            options = GooseOptions.model_validate(dict(effective_settings.options or {}))
+        else:
+            opts_dict = options.model_dump(mode="json")
+            effective_settings = settings or RuntimeSettings(agent=self.name, options=opts_dict)
+        super().__init__(settings=effective_settings, options=options)
 
     def build_command(self, query_text: str) -> list[str]:
         """Assemble command-line arguments for running a Goose evaluation probe."""
@@ -335,25 +344,14 @@ class GooseRuntime(CliAgentRuntime[GooseOptions]):
         )
         sync_google_and_gemini_keys(env)
 
-        if workdir is not None and self.options.isolate_config_dir:
-            isolated_dir = (self.options.home_dir or (Path(workdir) / ".reach_goose")).resolve()
-            isolated_dir.mkdir(parents=True, exist_ok=True)
+        if workdir is not None and (iso_dir := self.effective_isolation_dir(workdir)) is not None:
+            isolated_dir = ensure_private_directory(iso_dir)
             env["HOME"] = str(isolated_dir)
             env["XDG_CONFIG_HOME"] = str(isolated_dir / ".config")
             env["XDG_DATA_HOME"] = str(isolated_dir / ".local" / "share")
             env["XDG_STATE_HOME"] = str(isolated_dir / ".local" / "state")
 
         return env
-
-    @override
-    def post_probe(self, workdir: Path) -> None:
-        """Clean session and agent artifacts after probe execution if auto_clean is enabled."""
-        if not self.options.auto_clean:
-            return
-        if self.options.isolate_config_dir:
-            goose_dir = (self.options.home_dir or (Path(workdir) / ".reach_goose")).resolve()
-            if goose_dir.exists():
-                shutil.rmtree(goose_dir, ignore_errors=True)
 
 
 class GooseGenerator(BaseTextGenerator[GooseOptions]):

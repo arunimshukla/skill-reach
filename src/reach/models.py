@@ -52,8 +52,8 @@ NO_SKILL = "(no skill)"
 class QueryKind(StrEnum):
     """Enumerate structural categories of authored/generated evaluation queries."""
 
-    IMPLICIT = "implicit"
     CONTEXTUAL = "contextual"
+    IMPLICIT = "implicit"
     NEIGHBOR_NEGATIVE = "neighbor_negative"
     OUT_OF_SCOPE = "out_of_scope"
 
@@ -61,30 +61,30 @@ class QueryKind(StrEnum):
 class CatalogMode(StrEnum):
     """Enumerate strategies for composing resident skill catalogs."""
 
+    ALL = "all"
     NEIGHBORHOOD = "neighborhood"
     SINGLETON = "singleton"
-    ALL = "all"
     SWEEP = "sweep"
 
 
 class InvocationPattern(StrEnum):
     """Categorize observed probe trajectory invocation behavior."""
 
-    ORACLE_ONLY = "oracle_only"
-    MIXED_ORACLE = "mixed_oracle"
-    DISTRACTOR_HIJACK = "distractor_hijack"
     ABANDONED = "abandoned"
     CORRECT_ABSTENTION = "correct_abstention"
+    DISTRACTOR_HIJACK = "distractor_hijack"
+    MIXED_ORACLE = "mixed_oracle"
+    ORACLE_ONLY = "oracle_only"
     UNWANTED_TRIGGER = "unwanted_trigger"
 
 
 class DisclosureState(StrEnum):
     """Reflect how much of a skill's selection surface reached the model context."""
 
+    ABSENT = "absent"
     FULL = "full"
     NAME_ONLY_ELIDED = "name_only_elided"
     WITHHELD = "withheld"
-    ABSENT = "absent"
 
 
 class Skill(BaseModel):
@@ -117,6 +117,16 @@ class Skill(BaseModel):
         default=True,
         description="Whether the skill allows model invocation.",
     )
+
+    @field_validator("name")
+    @classmethod
+    def _require_name(cls, value: str) -> str:
+        """Validate that the skill name contains non-whitespace text."""
+        clean = value.strip()
+        if not clean:
+            msg = "name must be non-empty"
+            raise ValueError(msg)
+        return clean
 
     @field_validator("description")
     @classmethod

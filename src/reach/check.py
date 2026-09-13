@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, ConfigDict
 
-from reach.catalog import load_skills
+from reach.catalog import deduplicate_skills, load_skills
 from reach.config import (
     CheckSettings,
     RunConfig,
@@ -40,7 +40,7 @@ from reach.runtime import FAKE_AGENT, AgentRuntime, build_runtime
 from reach.runtime.keyword import KeywordRuntime
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+    from collections.abc import Collection, Mapping, Sequence
 
 #: Pattern matching skill directories or files in git diff output.
 _SKILL_PATH_PATTERN = re.compile(
@@ -53,7 +53,6 @@ __all__ = [
     "CheckOutcome",
     "CheckStage",
     "EmpiricalMetrics",
-    "_build_check_assertions",
     "changed_skills",
     "run_check",
 ]
@@ -62,8 +61,8 @@ __all__ = [
 class CheckStage(StrEnum):
     """Enumerate execution stages in the CI quality gate."""
 
-    STATIC = "static"
     EMPIRICAL = "empirical"
+    STATIC = "static"
 
 
 class EmpiricalMetrics(BaseModel):
@@ -119,17 +118,27 @@ class CheckOutcome(BaseModel):
 def changed_skills(
     since: str = "HEAD~1",
     root: Path | str | None = None,
+    *,
+    timeout: float = 30.0,
 ) -> tuple[str, ...]:
     """Identify skill names modified in git repository relative to a reference."""
     work_dir = Path(root).resolve() if root is not None else Path.cwd().resolve()
+    clean_since = since.strip()
+    if clean_since.startswith("-"):
+        msg = f"git reference must not begin with a dash: {since!r}"
+        raise ValueError(msg)
     try:
         completed = subprocess.run(
-            ["git", "diff", "--name-only", since],
+            ["git", "diff", "--name-only", clean_since, "--"],
             capture_output=True,
             text=True,
             cwd=work_dir,
             check=False,
+            timeout=timeout,
         )
+    except subprocess.TimeoutExpired as exc:
+        msg = f"git diff timed out after {timeout}s against ref '{since}'"
+        raise ValueError(msg) from exc
     except OSError:
         return ()
 
@@ -223,7 +232,7 @@ def _setup_runtime(
 
 
 def _load_catalog_skills(resolved_paths: Sequence[Path]) -> list[Skill]:
-    """Load resident skills from resolved candidate paths."""
+    """Load resident skills from resolved candidate paths, deduplicated by name."""
     loaded_skills: list[Skill] = []
     for path in resolved_paths:
         if path.is_dir() and (path / "SKILL.md").exists():
@@ -232,7 +241,7 @@ def _load_catalog_skills(resolved_paths: Sequence[Path]) -> list[Skill]:
             loaded_skills.extend(load_skills(path))
         elif path.is_file() and path.name == "SKILL.md":
             loaded_skills.extend(load_skills(path.parent.parent))
-    return loaded_skills
+    return deduplicate_skills(loaded_skills)
 
 
 def _filter_check_queries(
@@ -403,11 +412,14 @@ def _apply_changed_scope(
     changed: bool,
     since: str,
     budget: int,
+    available: Collection[str] = (),
 ) -> tuple[LintReport, set[str], CheckOutcome | None]:
     """Filter lint report to changed skills or return early clean outcome if none changed."""
     if not changed:
         return lint_report, set(), None
-    modified = set(changed_skills(since=since))
+    # A diff reports deleted and renamed skills too, and those can never be probed
+    # against the current corpus, so scope the gate to skills still on disk.
+    modified = set(changed_skills(since=since)) & set(available)
     if not modified:
         return (
             LintReport(issues=(), skills_checked=0),
@@ -472,7 +484,7 @@ def _check_empty_queries_exit(
     return None
 
 
-def run_check(
+def run_check(  # noqa: PLR0913
     *,
     skills_paths: Sequence[Path | str] | None = None,
     queries_path: Path | str | None = None,
@@ -494,6 +506,7 @@ def run_check(
     rule_overrides: Mapping[str, Severity] | None = None,
     runtime_options: dict[str, Any] | None = None,
     global_scope: bool = False,
+    yes: bool = False,
 ) -> CheckOutcome:
     """Execute two-stage quality gate: static lint pre-flight then empirical assertions."""
     if settings is not None:
@@ -535,8 +548,9 @@ def run_check(
         msg = f"No skill paths specified and no skills found {scope_msg}."
         raise ValueError(msg)
 
+    available = {s.name for s in _load_catalog_skills(resolved_paths)} if changed else set()
     lint_report, modified, early_outcome = _apply_changed_scope(
-        lint_report, changed, check_settings.since, check_settings.budget
+        lint_report, changed, check_settings.since, check_settings.budget, available
     )
     if early_outcome is not None:
         return early_outcome
@@ -560,6 +574,36 @@ def run_check(
     empty_outcome = _check_empty_queries_exit(lint_report, queries_to_run, check_settings.budget)
     if empty_outcome is not None:
         return empty_outcome
+
+    from reach.config import default_agent
+
+    resolved_agent = agent or (config.runtime.agent if config is not None else default_agent())
+    if resolved_agent not in ("keyword", FAKE_AGENT):
+        from reach.cli.safety import confirm_skill_execution
+        from reach.views import build_console
+
+        console = build_console()
+        loaded = _load_catalog_skills(resolved_paths)
+        trusted = config.study.trusted if config is not None else False
+        if code := confirm_skill_execution(
+            console,
+            runtime_name=resolved_agent,
+            skills=loaded,
+            roots=resolved_paths,
+            action="check empirical probes",
+            yes=yes,
+            trusted=trusted,
+        ):
+            return CheckOutcome(
+                lint_report=lint_report,
+                stage_failed=CheckStage.EMPIRICAL,
+                assertions=(),
+                skills_checked=lint_report.skills_checked,
+                queries_probed=0,
+                probes_executed=0,
+                budget=check_settings.budget,
+                exit_code=code,
+            )
 
     report, metrics, probes_executed = _execute_empirical_probes(
         queries_to_run,

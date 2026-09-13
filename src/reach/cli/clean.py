@@ -22,6 +22,7 @@ from typing import Annotated
 
 from cyclopts import Parameter
 
+from reach.artifact import ARTIFACT_SUFFIX
 from reach.config import resolve_path
 from reach.registry import RegistryCacheManager
 from reach.views import build_console
@@ -63,8 +64,8 @@ def clean(
         Parameter(
             name=["--all"],
             help=(
-                "Purge all caches, run artifacts (.reach/eval.json), "
-                "and query sets (.reach/queries.*)"
+                "Purge all caches, run artifacts (.reach/eval.json, .reach/sweep.json, "
+                "*.artifact.json), and query sets (.reach/queries.*)"
             ),
         ),
     ] = False,
@@ -85,7 +86,11 @@ def clean(
     console = build_console(quiet=quiet)
     cache_mgr = RegistryCacheManager()
 
-    total_bytes, paths = cache_mgr.clean(project=project, dry_run=dry_run)
+    try:
+        total_bytes, paths = cache_mgr.clean(project=project, dry_run=dry_run)
+    except ValueError as err:
+        console.print(f"[bold red]Error:[/bold red] {err}")
+        return 1
 
     # If --all is passed, also clean .reach run artifacts
     extra_paths: list[Path] = []
@@ -99,9 +104,12 @@ def clean(
                 "queries.csv",
                 "queries.jsonl",
                 "queries-citations.json",
+                "sweep.json",
             )
-            for fname in target_files:
-                extra = reach_dir / fname
+            # Sidecars carry a reach-owned suffix, so sweep them up wherever they landed.
+            targets = {reach_dir / fname for fname in target_files}
+            targets.update(reach_dir.glob(f"*{ARTIFACT_SUFFIX}"))
+            for extra in sorted(targets):
                 if extra.is_file():
                     with contextlib.suppress(OSError):
                         sz = extra.stat().st_size

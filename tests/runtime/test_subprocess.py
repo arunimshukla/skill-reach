@@ -20,7 +20,11 @@ import subprocess
 import sys
 from typing import TYPE_CHECKING, Any
 
-from reach.runtime._subprocess import _ProcessGroupController, run_subprocess_probe
+from reach.runtime._subprocess import (
+    _ProcessGroupController,
+    _StderrDrainer,
+    run_subprocess_probe,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -81,6 +85,38 @@ def test_run_subprocess_probe_silent_command_timeout(tmp_path: Path) -> None:
 
     assert completed is None
     assert err == "timeout"
+
+
+def test_run_subprocess_probe_large_stderr_does_not_deadlock(tmp_path: Path) -> None:
+    """Verify large stderr volume drains concurrently without pipe deadlock."""
+    script = (
+        "import sys\n"
+        "sys.stderr.write('E' * (2 * 1024 * 1024))\n"
+        "sys.stderr.flush()\n"
+        "sys.stdout.write('probe_completed\\n')\n"
+        "sys.stdout.flush()\n"
+    )
+    cmd = [sys.executable, "-c", script]
+    completed, err = run_subprocess_probe(cmd, tmp_path, timeout_s=4.0)
+
+    assert err is None
+    assert completed is not None
+    assert "probe_completed" in completed.stdout
+    assert len(completed.stderr) == 2 * 1024 * 1024
+
+
+def test_run_subprocess_probe_watchdog_terminates_silent_hang(tmp_path: Path) -> None:
+    """Verify watchdog actively terminates a silent hung command when timeout expires."""
+    import time
+
+    cmd = [sys.executable, "-c", "import time; time.sleep(10)"]
+    start = time.monotonic()
+    completed, err = run_subprocess_probe(cmd, tmp_path, timeout_s=0.2)
+    elapsed = time.monotonic() - start
+
+    assert completed is None
+    assert err == "timeout"
+    assert elapsed < 2.0
 
 
 def test_run_subprocess_probe_real_spawn_failure(tmp_path: Path) -> None:
@@ -175,3 +211,34 @@ def test_process_group_controller_lifecycle(tmp_path: Path) -> None:
             proc.stdout.close()
         if proc.stderr and not proc.stderr.closed:
             proc.stderr.close()
+
+
+def test_stderr_drainer_accumulates_lines() -> None:
+    """Verify StderrDrainer reads and joins lines from an input stream."""
+    stream = iter(["line1\n", "line2\n", "line3"])
+    drainer = _StderrDrainer(stream)
+    result = drainer.join(timeout=1.0)
+    assert result == "line1\nline2\nline3"
+
+
+def test_stderr_drainer_handles_none_stream() -> None:
+    """Verify StderrDrainer handles None stream without error."""
+    drainer = _StderrDrainer(None)
+    result = drainer.join(timeout=1.0)
+    assert result == ""
+
+
+def test_stderr_drainer_thread_safe_concurrent_reads() -> None:
+    """Verify StderrDrainer safely joins while background thread appends chunks."""
+    import time
+
+    def slow_stream() -> Any:
+        for i in range(50):
+            time.sleep(0.001)
+            yield f"line {i}\n"
+
+    drainer = _StderrDrainer(slow_stream())
+    _ = [drainer.join(timeout=0.005) for _ in range(5)]
+    full = drainer.join(timeout=2.0)
+    assert "line 0\n" in full
+    assert "line 49\n" in full

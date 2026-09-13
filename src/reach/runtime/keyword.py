@@ -50,7 +50,7 @@ class KeywordOptions(AgentOptions):
     scope: str = Field(default="user")
 
 
-class KeywordRuntime(AgentRuntime):
+class KeywordRuntime(AgentRuntime[KeywordOptions]):
     """Implement a deterministic keyword matching agent for offline evaluation."""
 
     name = "keyword"
@@ -62,41 +62,37 @@ class KeywordRuntime(AgentRuntime):
         options: KeywordOptions | None = None,
     ) -> None:
         """Initialize keyword heuristic runtime with settings or options."""
-        opts: KeywordOptions
+        resolved_settings: RuntimeSettings | None = None
+        resolved_options: KeywordOptions | None = options
         if isinstance(settings_or_options, KeywordOptions):
-            self.settings = RuntimeSettings(agent="keyword")
-            opts = settings_or_options
+            resolved_options = settings_or_options
         elif isinstance(settings_or_options, RuntimeSettings):
-            self.settings = settings_or_options
-            opts = options or (
-                KeywordOptions.model_validate(dict(settings_or_options.options or {}))
-                if isinstance(settings_or_options.options, dict)
-                else KeywordOptions()
-            )
-        else:
-            self.settings = RuntimeSettings(agent="keyword")
-            opts = options or KeywordOptions()
-        self.options: KeywordOptions = opts
-        self._resident: tuple[str, ...] = ()
+            resolved_settings = settings_or_options
+
+        super().__init__(settings=resolved_settings, options=resolved_options)
         self._pattern: re.Pattern[str] | None = None
         self._term_to_skill: dict[str, str] = {}
 
     def _set_resident(self, resident: Sequence[str]) -> None:
         """Precompute normalized term mapping and compiled regex for fast matching."""
         self._resident = tuple(resident)
-        term_map: dict[str, str] = {}
-        for name in resident:
-            term_map[name.lower()] = name
-            term_map[name.replace("-", " ").lower()] = name
+        self._pattern, self._term_to_skill = _compile_term_matcher(self._resident)
 
-        sorted_terms = sorted(term_map.keys(), key=len, reverse=True)
-        if sorted_terms:
-            escaped = "|".join(re.escape(t) for t in sorted_terms)
-            self._pattern = re.compile(rf"(?<![\w-])({escaped})(?![\w-])", re.IGNORECASE)
-            self._term_to_skill = term_map
+    def match_skill(self, text: str, resident: Sequence[str] = ()) -> str | None:
+        """Find the first matching resident skill mentioned in the given text."""
+        active = tuple(resident) if resident else self._resident
+        if not active:
+            return None
+        pattern: re.Pattern[str] | None
+        if active == self._resident and self._pattern is not None:
+            pattern, term_map = self._pattern, self._term_to_skill
         else:
-            self._pattern = None
-            self._term_to_skill = {}
+            pattern, term_map = _compile_term_matcher(active)
+
+        if pattern is None:
+            return None
+        match = pattern.search(text)
+        return term_map.get(match.group(1).lower()) if match else None
 
     @override
     def _post_install(self, workdir: Path) -> None:
@@ -122,13 +118,7 @@ class KeywordRuntime(AgentRuntime):
             if self._pattern is None and self._resident:
                 self._set_resident(self._resident)
 
-            invoked: str | None = None
-            if self._pattern is not None:
-                match = self._pattern.search(query_text)
-                if match:
-                    matched_term = match.group(1).lower()
-                    invoked = self._term_to_skill.get(matched_term)
-
+            invoked = self.match_skill(query_text)
             invoked_skills = (invoked,) if invoked is not None else ()
             early_exit_hit = bool(
                 self.options.early_exit and invoked is not None and invoked == target_skill,
@@ -154,26 +144,7 @@ class KeywordRuntime(AgentRuntime):
     ) -> SessionSummary:
         """Extract invoked skills mentioned in stream lines."""
         line_list = list(lines)
-        text = "\n".join(line_list)
-        active_resident = resident or self._resident
-        invoked: str | None = None
-
-        if active_resident and active_resident == self._resident and self._pattern is not None:
-            match = self._pattern.search(text)
-            if match:
-                invoked = self._term_to_skill.get(match.group(1).lower())
-        elif active_resident:
-            term_map: dict[str, str] = {}
-            for name in active_resident:
-                term_map[name.lower()] = name
-                term_map[name.replace("-", " ").lower()] = name
-            sorted_terms = sorted(term_map.keys(), key=len, reverse=True)
-            escaped = "|".join(re.escape(t) for t in sorted_terms)
-            pat = re.compile(rf"(?<![\w-])({escaped})(?![\w-])", re.IGNORECASE)
-            match = pat.search(text)
-            if match:
-                invoked = term_map.get(match.group(1).lower())
-
+        invoked = self.match_skill("\n".join(line_list), resident)
         invoked_skills = (invoked,) if invoked is not None else ()
         return SessionSummary(
             invoked_skills=invoked_skills,
@@ -182,10 +153,41 @@ class KeywordRuntime(AgentRuntime):
         )
 
 
-class KeywordGenerator(BaseTextGenerator[None]):
+def _compile_term_matcher(
+    resident: Sequence[str],
+) -> tuple[re.Pattern[str] | None, dict[str, str]]:
+    """Compile a regex pattern and term lookup mapping from a sequence of resident skills."""
+    if not resident:
+        return None, {}
+    term_map: dict[str, str] = {}
+    for name in resident:
+        term_map[name.lower()] = name
+        term_map[name.replace("-", " ").lower()] = name
+
+    sorted_terms = sorted(term_map.keys(), key=len, reverse=True)
+    escaped = "|".join(re.escape(t) for t in sorted_terms)
+    pattern = re.compile(rf"(?<![\w-])({escaped})(?![\w-])", re.IGNORECASE)
+    return pattern, term_map
+
+
+class KeywordGenerator(BaseTextGenerator[KeywordOptions]):
     """Stub text generator for keyword search drivers."""
 
     name: str = "keyword"
+
+    def __init__(
+        self,
+        model: str = "keyword",
+        *,
+        timeout_s: int = 300,
+        options: KeywordOptions | None = None,
+    ) -> None:
+        """Initialize keyword text generator with model, timeout, and options."""
+        super().__init__(
+            model=model,
+            timeout_s=timeout_s,
+            options=options if options is not None else KeywordOptions(model=model),
+        )
 
     @override
     def complete(self, prompt: str) -> str:

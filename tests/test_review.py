@@ -16,10 +16,12 @@
 
 from __future__ import annotations
 
+import email.message
 import json
 import urllib.error
+import urllib.parse
 import urllib.request
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from unittest.mock import patch
 
 import pytest
@@ -38,7 +40,7 @@ from reach.review import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Mapping
     from pathlib import Path
 
 
@@ -252,35 +254,60 @@ def test_launch_query_review_bypasses_when_reach_no_browser_set(
         assert result == qs
 
 
+def _assert_security_headers(resp: Any) -> None:
+    """Verify security headers are present on response."""
+    assert resp.headers.get("X-Content-Type-Options") == "nosniff"
+    assert resp.headers.get("X-Frame-Options") == "DENY"
+    assert (
+        resp.headers.get("Content-Security-Policy")
+        == "default-src 'self' 'unsafe-inline'; connect-src 'self';"
+    )
+
+
 def _assert_review_server_endpoints(url: str) -> None:
     """Exercise GET and POST review endpoints on the running ephemeral HTTP server."""
+    parsed = urllib.parse.urlsplit(url)
+    token = urllib.parse.parse_qs(parsed.query).get("token", [""])[0]
+    base_url = f"{parsed.scheme}://{parsed.netloc}"
+    post_headers: dict[str, str] = {
+        "Content-Type": "application/json",
+        "Origin": base_url,
+    }
+    if token:
+        post_headers["X-Reach-Token"] = token
+
     # 1. Test GET / serves valid HTML with target skill and interactive buttons
     with urllib.request.urlopen(url) as resp:  # noqa: S310
         assert resp.status == 200
-        resp_tree = HTMLParser(resp.read().decode("utf-8"))
+        html_text = resp.read().decode("utf-8")
+        resp_tree = HTMLParser(html_text)
         skill_name = resp_tree.css_first("#skill-name")
         assert skill_name is not None
         assert "t-skill" in skill_name.text()
         assert resp_tree.css_first("#approve-btn") is not None
         assert resp_tree.css_first("#approve-btn-bottom") is not None
+        if token:
+            meta_token = resp_tree.css_first('meta[name="reach-token"]')
+            assert meta_token is not None
+            assert meta_token.attributes.get("content") == token
 
     # 2. Test GET /api/status returns running health check
-    with urllib.request.urlopen(f"{url}/api/status") as resp:  # noqa: S310
+    with urllib.request.urlopen(f"{base_url}/api/status") as resp:  # noqa: S310
         assert resp.status == 200
         status_data = json.loads(resp.read().decode("utf-8"))
         assert status_data == {"status": "running"}
 
     # 3. Test GET /nonexistent returns 404 Not Found
     with pytest.raises(urllib.error.HTTPError) as exc_info:
-        urllib.request.urlopen(f"{url}/nonexistent")  # noqa: S310
+        urllib.request.urlopen(f"{base_url}/nonexistent")  # noqa: S310
     exc_info.value.close()
     assert exc_info.value.code == 404
 
     # 4. Test POST /nonexistent returns 404 Not Found
     post_404 = urllib.request.Request(  # noqa: S310
-        f"{url}/nonexistent",
+        f"{base_url}/nonexistent",
         data=b"{}",
-        headers={"Content-Type": "application/json"},
+        headers=post_headers,
         method="POST",
     )
     with pytest.raises(urllib.error.HTTPError) as exc_info:
@@ -290,9 +317,9 @@ def _assert_review_server_endpoints(url: str) -> None:
 
     # 5. Test POST /api/save with malformed payload (returns 400)
     invalid_req = urllib.request.Request(  # noqa: S310
-        f"{url}/api/save",
+        f"{base_url}/api/save",
         data=b"not valid json",
-        headers={"Content-Type": "application/json"},
+        headers=post_headers,
         method="POST",
     )
     with pytest.raises(urllib.error.HTTPError) as exc_info:
@@ -311,9 +338,9 @@ def _assert_review_server_endpoints(url: str) -> None:
         ],
     }
     req = urllib.request.Request(  # noqa: S310
-        f"{url}/api/save",
+        f"{base_url}/api/save",
         data=json.dumps(post_data).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
+        headers=post_headers,
         method="POST",
     )
     with urllib.request.urlopen(req) as resp:  # noqa: S310
@@ -321,12 +348,20 @@ def _assert_review_server_endpoints(url: str) -> None:
         res = json.loads(resp.read().decode("utf-8"))
         assert res.get("status") == "ok"
         assert res.get("saved") == 3
-        assert resp.headers.get("X-Content-Type-Options") == "nosniff"
-        assert resp.headers.get("X-Frame-Options") == "DENY"
+        _assert_security_headers(resp)
+
+    _assert_review_security_endpoints(url, post_data)
+
+
+def _assert_review_security_endpoints(url: str, post_data: Mapping[str, object]) -> None:
+    """Verify security controls on the running review server (DNS rebinding, CSRF, IPv6)."""
+    parsed = urllib.parse.urlsplit(url)
+    token = urllib.parse.parse_qs(parsed.query).get("token", [""])[0]
+    base_url = f"{parsed.scheme}://{parsed.netloc}"
 
     # 7. Test security: Reject invalid Host header (DNS rebinding protection)
     bad_host_req = urllib.request.Request(  # noqa: S310
-        f"{url}/api/status",
+        f"{base_url}/api/status",
         headers={"Host": "attacker.com"},
     )
     with pytest.raises(urllib.error.HTTPError) as exc_info:
@@ -336,11 +371,12 @@ def _assert_review_server_endpoints(url: str) -> None:
 
     # 8. Test security: Reject cross-origin requests (CSRF protection)
     csrf_req = urllib.request.Request(  # noqa: S310
-        f"{url}/api/save",
+        f"{base_url}/api/save",
         data=json.dumps(post_data).encode("utf-8"),
         headers={
             "Content-Type": "application/json",
             "Origin": "https://malicious-site.example.com",
+            "X-Reach-Token": token,
         },
         method="POST",
     )
@@ -348,6 +384,110 @@ def _assert_review_server_endpoints(url: str) -> None:
         urllib.request.urlopen(csrf_req)  # noqa: S310
     exc_info.value.close()
     assert exc_info.value.code == 403
+
+    # 8b. Test security: Reject Origin: null (sandboxed iframe CSRF protection)
+    null_origin_req = urllib.request.Request(  # noqa: S310
+        f"{base_url}/api/save",
+        data=json.dumps(post_data).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "Origin": "null",
+            "X-Reach-Token": token,
+        },
+        method="POST",
+    )
+    with pytest.raises(urllib.error.HTTPError) as exc_info:
+        urllib.request.urlopen(null_origin_req)  # noqa: S310
+    exc_info.value.close()
+    assert exc_info.value.code == 403
+
+    _assert_review_token_security(base_url, post_data, token)
+
+    port = parsed.port
+
+    # 9. Test security: Accept valid IPv6 Host header
+    ipv6_host_req = urllib.request.Request(  # noqa: S310
+        f"{base_url}/api/status",
+        headers={"Host": f"[::1]:{port}"},
+    )
+    with urllib.request.urlopen(ipv6_host_req) as resp:  # noqa: S310
+        assert resp.status == 200
+
+    # 10. Test security: Accept valid IPv6 Origin header
+    ipv6_headers: dict[str, str] = {
+        "Content-Type": "application/json",
+        "Origin": f"http://[::1]:{port}",
+    }
+    if token:
+        ipv6_headers["X-Reach-Token"] = token
+    ipv6_origin_req = urllib.request.Request(  # noqa: S310
+        f"{base_url}/api/save",
+        data=json.dumps(post_data).encode("utf-8"),
+        headers=ipv6_headers,
+        method="POST",
+    )
+    with urllib.request.urlopen(ipv6_origin_req) as resp:  # noqa: S310
+        assert resp.status == 200
+
+
+def _assert_review_token_security(
+    base_url: str,
+    post_data: Mapping[str, object],
+    token: str,
+) -> None:
+    """Verify session token validation on GET and POST endpoints."""
+    bad_token_req = urllib.request.Request(  # noqa: S310
+        f"{base_url}/api/save",
+        data=json.dumps(post_data).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "Origin": base_url,
+            "X-Reach-Token": "invalid-token",
+        },
+        method="POST",
+    )
+    with pytest.raises(urllib.error.HTTPError) as exc_info:
+        urllib.request.urlopen(bad_token_req)  # noqa: S310
+    exc_info.value.close()
+    assert exc_info.value.code == 403
+
+    if token:
+        query_token_post_req = urllib.request.Request(  # noqa: S310
+            f"{base_url}/api/save?token={token}",
+            data=json.dumps(post_data).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Origin": base_url,
+            },
+            method="POST",
+        )
+        with pytest.raises(urllib.error.HTTPError) as exc_info:
+            urllib.request.urlopen(query_token_post_req)  # noqa: S310
+        exc_info.value.close()
+        assert exc_info.value.code == 403
+
+    unauth_get_req = urllib.request.Request(f"{base_url}/")  # noqa: S310
+    with pytest.raises(urllib.error.HTTPError) as exc_info:
+        urllib.request.urlopen(unauth_get_req)  # noqa: S310
+    exc_info.value.close()
+    assert exc_info.value.code == 403
+
+    unauth_index_req = urllib.request.Request(f"{base_url}/index.html")  # noqa: S310
+    with pytest.raises(urllib.error.HTTPError) as exc_info:
+        urllib.request.urlopen(unauth_index_req)  # noqa: S310
+    exc_info.value.close()
+    assert exc_info.value.code == 403
+
+    bad_token_get_req = urllib.request.Request(f"{base_url}/?token=wrong-token")  # noqa: S310
+    with pytest.raises(urllib.error.HTTPError) as exc_info:
+        urllib.request.urlopen(bad_token_get_req)  # noqa: S310
+    exc_info.value.close()
+    assert exc_info.value.code == 403
+
+    if token:
+        valid_index_req = urllib.request.Request(f"{base_url}/index.html?token={token}")  # noqa: S310
+        with urllib.request.urlopen(valid_index_req) as resp:  # noqa: S310
+            assert resp.status == 200
 
 
 def test_launch_query_review_http_server_saves_and_shuts_down(
@@ -378,11 +518,15 @@ def test_launch_query_review_http_server_saves_and_shuts_down(
     )
 
     server_port: list[int] = []
+    bg_error: list[Exception] = []
 
     def mock_webbrowser_open(url: str) -> bool:
-        port = int(url.rsplit(":", maxsplit=1)[-1])
+        port = urllib.parse.urlsplit(url).port or int(url.rsplit(":", maxsplit=1)[-1])
         server_port.append(port)
-        _assert_review_server_endpoints(url)
+        try:
+            _assert_review_server_endpoints(url)
+        except (urllib.error.URLError, AssertionError, json.JSONDecodeError) as exc:
+            bg_error.append(exc)
         return True
 
     with (
@@ -391,6 +535,9 @@ def test_launch_query_review_http_server_saves_and_shuts_down(
         patch("webbrowser.open", side_effect=mock_webbrowser_open),
     ):
         curated_qs = launch_query_review(qs, target, [rival], timeout=5)
+
+    if bg_error:
+        raise bg_error[0]
 
     assert len(curated_qs.queries) == 3
     q1, q2, q3 = curated_qs.queries
@@ -490,6 +637,7 @@ def test_review_session_isolation() -> None:
     h1 = Message()
     h1["Host"] = "127.0.0.1"
     h1["Origin"] = "http://127.0.0.1:8000"
+    h1["X-Reach-Token"] = session1.auth_token
     handler1.headers = h1
     handler1.server = mock_server
 
@@ -502,7 +650,7 @@ def test_review_session_isolation() -> None:
     handler2.server = mock_server
 
     payload1 = json.dumps({"queries": [{"text": "Query 1", "expected_skill": "skill-1"}]}).encode(
-        "utf-8"
+        "utf-8",
     )
     handler1.rfile = io.BytesIO(payload1)
     handler1.wfile = io.BytesIO()
@@ -547,7 +695,7 @@ def test_review_query_item_empty_string_expected_skill_normalized() -> None:
     from reach.review import _convert_saved_queries, _ReviewPayload
 
     payload = _ReviewPayload.model_validate(
-        {"queries": [{"text": "test query text", "expected_skill": ""}]}
+        {"queries": [{"text": "test query text", "expected_skill": ""}]},
     )
     assert payload.queries[0].expected_skill is None
 
@@ -582,3 +730,56 @@ def test_review_query_item_unrecognized_expected_skill_rejected_with_context() -
         context={"allowed_skills": {"target-skill", "rival-skill"}},
     )
     assert valid_oos.queries[0].expected_skill is None
+
+
+@pytest.mark.parametrize(
+    ("host", "expected"),
+    [
+        ("", True),
+        ("localhost", True),
+        ("localhost:8080", True),
+        ("127.0.0.1", True),
+        ("127.0.0.1:3000", True),
+        ("testserver", True),
+        ("testserver:80", True),
+        ("[::1]", True),
+        ("[::1]:8080", True),
+        ("attacker.com", False),
+        ("attacker.com:8080", False),
+        ("127.0.0.1.attacker.com", False),
+        ("evil.com:127.0.0.1", False),
+    ],
+)
+def test_review_server_handler_is_valid_host(host: str, *, expected: bool) -> None:
+    """Verify Host header validation permits local IPv4/IPv6 and blocks foreign hosts."""
+    handler = object.__new__(ReviewServerHandler)
+    msg = email.message.EmailMessage()
+    if host:
+        msg["Host"] = host
+    handler.headers = msg
+    assert handler._is_valid_host() is expected
+
+
+@pytest.mark.parametrize(
+    ("origin", "expected"),
+    [
+        (None, False),
+        ("", False),
+        ("null", False),
+        ("http://127.0.0.1:8080", True),
+        ("http://localhost:3000", True),
+        ("http://[::1]:8080", True),
+        ("https://localhost:443", True),
+        ("https://attacker.com", False),
+        ("http://127.0.0.1.attacker.com", False),
+        ("javascript:void(0)", False),
+    ],
+)
+def test_review_server_handler_is_valid_origin(origin: str | None, *, expected: bool) -> None:
+    """Verify Origin header validation permits local loopback and blocks cross-origin requests."""
+    handler = object.__new__(ReviewServerHandler)
+    msg = email.message.EmailMessage()
+    if origin is not None:
+        msg["Origin"] = origin
+    handler.headers = msg
+    assert handler._is_valid_origin() is expected

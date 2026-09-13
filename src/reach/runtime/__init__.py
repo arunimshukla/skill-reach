@@ -24,7 +24,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable, Sequence
 from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast, override
+from typing import TYPE_CHECKING, Any, ClassVar, Self, cast, override
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -34,8 +34,17 @@ from reach.config import (
     agent_profiles,
     resolve_path,
 )
-from reach.runtime._env import raise_missing_agent_dependency
-from reach.runtime._fs import install_skills, resolve_catalog_skills
+from reach.runtime._env import (
+    detect_model_provider,
+    raise_missing_agent_dependency,
+    resolve_blocked_env_vars,
+    sanitize_subprocess_env,
+)
+from reach.runtime._fs import (
+    install_skills,
+    resolve_catalog_skills,
+    safe_cleanup_isolated_dir,
+)
 from reach.runtime._subprocess import (
     check_tool_leak,
     process_failure_reason,
@@ -69,6 +78,7 @@ __all__ = [
     "TrajectoryTracker",
     "TwoStageRetrieverRuntime",
     "agent_default_model",
+    "antigravity_agents",
     "build_runtime",
     "build_text_generator",
     "cli_agents",
@@ -77,6 +87,7 @@ __all__ = [
     "options_model",
     "register_agent",
     "resolve_options",
+    "runtime_class",
 ]
 
 
@@ -91,10 +102,31 @@ class AgentOptions(BaseModel):
     max_turns: int = Field(default=3, ge=1)
     early_exit: bool = True
     allowed_tools: tuple[str, ...] | None = None
+    blocked_env_vars: tuple[str, ...] | None = None
     api_key: str | None = None
     use_symlinks: bool = True
     isolate_config_dir: bool = True
     auto_clean: bool = False
+
+    #: Name of the field configuring an explicit isolation directory, if supported.
+    isolation_dir_field: ClassVar[str | None] = None
+
+    @property
+    def custom_isolation_dir(self) -> Path | None:
+        """Return custom isolation directory path configured on this options instance, if any."""
+        if self.isolation_dir_field:
+            val = getattr(self, self.isolation_dir_field, None)
+            return Path(val) if val is not None else None
+        return None
+
+    @model_validator(mode="after")
+    def _validate_isolation_dir_boundary(self) -> Self:
+        """Validate that custom isolation directory does not point to active home or root."""
+        if self.isolation_dir_field and self.custom_isolation_dir is not None:
+            from reach.runtime._fs import validate_isolated_directory
+
+            validate_isolated_directory(self.custom_isolation_dir, self.isolation_dir_field)
+        return self
 
 
 class CliOptions(AgentOptions):
@@ -169,10 +201,10 @@ class ToolCallInfo(BaseModel):
 class SessionStatus(StrEnum):
     """Enumerate canonical terminal execution statuses of an agent session."""
 
-    SUCCESS = "SUCCESS"
-    ERROR = "ERROR"
-    TIMEOUT = "TIMEOUT"
     CANCELLED = "CANCELLED"
+    ERROR = "ERROR"
+    SUCCESS = "SUCCESS"
+    TIMEOUT = "TIMEOUT"
 
 
 class SessionSummary(BaseModel):
@@ -432,6 +464,15 @@ def cli_agents(config_path: Path | str | None = None) -> tuple[str, ...]:
     )
 
 
+def antigravity_agents(config_path: Path | str | None = None) -> tuple[str, ...]:
+    """Return tuple of supported agent runtime names that inherit from AntigravityRuntime."""
+    return tuple(
+        agent
+        for agent in known_agents(config_path)
+        if (cls := runtime_class(agent)) is not None and issubclass(cls, AntigravityRuntime)
+    )
+
+
 def _agent_supported_models(
     agents: dict[object, object],
 ) -> list[tuple[str, list[str]]]:
@@ -479,6 +520,41 @@ class AgentRuntime[OptionsT: AgentOptions](ABC):
     _resident: tuple[str, ...] = ()
     is_dynamic: bool = False
 
+    def __init__(
+        self,
+        settings: RuntimeSettings | None = None,
+        options: OptionsT | None = None,
+    ) -> None:
+        """Initialize agent runtime settings and options."""
+        agent_name = getattr(self, "name", "agent")
+        self.settings = settings
+        if options is not None:
+            self.options = options
+        elif settings is not None:
+            resolved = resolve_options(settings)
+            opt_cls = options_model(agent_name)
+            if opt_cls is not None and issubclass(opt_cls, AgentOptions):
+                self.options = cast(
+                    "OptionsT",
+                    resolved
+                    if isinstance(resolved, opt_cls)
+                    else opt_cls.model_validate(dict(settings.options or {})),
+                )
+            else:
+                self.options = cast(
+                    "OptionsT",
+                    resolved
+                    if isinstance(resolved, AgentOptions)
+                    else AgentOptions.model_validate(dict(settings.options or {})),
+                )
+        else:
+            opt_cls = options_model(agent_name)
+            if opt_cls is not None and issubclass(opt_cls, AgentOptions):
+                self.options = cast("OptionsT", opt_cls())
+            else:
+                self.options = cast("OptionsT", AgentOptions())
+        self._resident = ()
+
     @property
     def timeout_s(self) -> int | None:
         """Return per-probe execution timeout in seconds from settings."""
@@ -499,6 +575,11 @@ class AgentRuntime[OptionsT: AgentOptions](ABC):
     def model(self) -> str:
         """Return the identifier of the model being evaluated."""
         return self.options.model
+
+    @model.setter
+    def model(self, value: str) -> None:
+        """Update the configured model identifier in options."""
+        self.options = self.options.model_copy(update={"model": value})
 
     @property
     def effort(self) -> str | None:
@@ -535,6 +616,11 @@ class AgentRuntime[OptionsT: AgentOptions](ABC):
         )
 
     @property
+    def blocked_env_vars(self) -> tuple[str, ...] | None:
+        """Return explicit blocked environment variables override from options or settings."""
+        return resolve_blocked_env_vars(self.options, self.settings)
+
+    @property
     def use_symlinks(self) -> bool:
         """Return whether symlink installation is enabled on the runtime options."""
         return self.options.use_symlinks
@@ -558,6 +644,16 @@ class AgentRuntime[OptionsT: AgentOptions](ABC):
     def is_cli(self) -> bool:
         """Return True if this runtime executes via a CLI subprocess."""
         return False
+
+    @property
+    def isolation_dir_field(self) -> str | None:
+        """Return the options field name used for custom directory isolation, if supported."""
+        return getattr(self.options, "isolation_dir_field", None)
+
+    @property
+    def custom_isolation_dir(self) -> Path | None:
+        """Return the configured custom isolation directory path, or None."""
+        return getattr(self.options, "custom_isolation_dir", None)
 
     def skills_dir(self, workdir: Path) -> Path:
         """Return standard skill directory path in the workspace."""
@@ -601,7 +697,7 @@ class AgentRuntime[OptionsT: AgentOptions](ABC):
     def build_env(self, workdir: Path | None = None) -> dict[str, str]:
         """Assemble process environment for agent execution."""
         del workdir
-        return dict(os.environ)
+        return sanitize_subprocess_env(dict(os.environ), blocked_env_vars=self.blocked_env_vars)
 
     @abstractmethod
     def select(
@@ -649,7 +745,7 @@ class AgentRuntime[OptionsT: AgentOptions](ABC):
         )
 
 
-class CliAgentRuntime[CliOptionsT: CliOptions](AgentRuntime, ABC):
+class CliAgentRuntime[CliOptionsT: CliOptions](AgentRuntime[CliOptionsT], ABC):
     """Abstract base runtime for command-line interface agent drivers."""
 
     options: CliOptionsT
@@ -661,16 +757,7 @@ class CliAgentRuntime[CliOptionsT: CliOptions](AgentRuntime, ABC):
         options: CliOptionsT | None = None,
     ) -> None:
         """Initialize CLI agent runtime settings and options."""
-        agent_name = getattr(self, "name", "cli")
-        if options is not None:
-            self.options = options
-            dump = options.model_dump()
-            self.settings = settings or RuntimeSettings(agent=agent_name, options=dump)
-        else:
-            self.settings = settings or RuntimeSettings(agent=agent_name)
-            validated = CliOptions.model_validate(dict(self.settings.options))
-            self.options = cast("CliOptionsT", validated)
-        self._resident = ()
+        super().__init__(settings=settings, options=options)
         self.completion_cost_usd = 0.0
         self.completions = 0
 
@@ -715,7 +802,7 @@ class CliAgentRuntime[CliOptionsT: CliOptions](AgentRuntime, ABC):
             env["HOME"] = str(home_dir)
         if (api_key := getattr(self.options, "api_key", None)) is not None and self.api_key_env_var:
             env[self.api_key_env_var] = str(api_key)
-        return env
+        return sanitize_subprocess_env(env, blocked_env_vars=self.blocked_env_vars)
 
     def validate_outcome(
         self,
@@ -728,10 +815,26 @@ class CliAgentRuntime[CliOptionsT: CliOptions](AgentRuntime, ABC):
             return summary.error or f"runtime error: {summary.status}"
         return check_tool_leak(summary.observed_tools, self.allowed_tools)
 
+    isolation_dir_name: ClassVar[str | None] = None
+
+    def effective_isolation_dir(self, workdir: Path) -> Path | None:
+        """Return the effective isolated configuration directory for the given workspace."""
+        if not self.options.isolate_config_dir:
+            return None
+        if self.custom_isolation_dir:
+            return self.custom_isolation_dir
+        if self.isolation_dir_name:
+            return Path(workdir) / self.isolation_dir_name
+        return None
+
     @override
     def post_probe(self, workdir: Path) -> None:
-        """Execute post-probe cleanup actions."""
-        del workdir
+        """Clean isolated configuration directory after probe if auto_clean is enabled."""
+        if not self.options.auto_clean:
+            return
+        iso_dir = self.effective_isolation_dir(workdir)
+        if iso_dir is not None:
+            safe_cleanup_isolated_dir(workdir, iso_dir)
 
     @override
     def select(
@@ -854,14 +957,11 @@ class AntigravityRuntime(AgentRuntime):
     @property
     def effective_model_provider(self) -> str | None:
         """Return configured model_provider or auto-detect 'gemini' when API keys are present."""
-        if (provider := getattr(self.options, "model_provider", None)) is not None:
-            return provider  # type: ignore[no-any-return]
-        has_key = bool(
-            self.options.api_key or "GEMINI_API_KEY" in os.environ or "GOOGLE_API_KEY" in os.environ
+        return detect_model_provider(
+            self.model,
+            getattr(self.options, "model_provider", None),
+            api_key=self.options.api_key,
         )
-        if self.model.lower().startswith("gemini") and has_key:
-            return "gemini"
-        return None
 
     @classmethod
     def selection_schema(cls, resident: Sequence[str]) -> type[SkillSelectionBase]:
@@ -908,6 +1008,18 @@ def options_model(agent: str) -> type[BaseModel] | None:
     return None
 
 
+def runtime_class(agent: str) -> type[AgentRuntime] | None:
+    """Return the runtime implementation class corresponding to the named agent."""
+    if agent in _AGENT_FACTORIES:
+        factory = _AGENT_FACTORIES[agent][0]
+        return factory if isinstance(factory, type) and issubclass(factory, AgentRuntime) else None
+    builtin = _load_builtin_entry(agent)
+    if builtin is not None:
+        rt = builtin[0]
+        return rt if isinstance(rt, type) and issubclass(rt, AgentRuntime) else None
+    return None
+
+
 def resolve_options(settings: RuntimeSettings) -> BaseModel | None:
     """Parse and validate agent-specific options dictionary against its schema."""
     model = options_model(settings.agent)
@@ -917,6 +1029,13 @@ def resolve_options(settings: RuntimeSettings) -> BaseModel | None:
             raw["max_turns"] = settings.max_turns
         if "early_exit" not in raw and getattr(settings, "early_exit", None) is not None:
             raw["early_exit"] = settings.early_exit
+        if "allowed_tools" not in raw and getattr(settings, "allowed_tools", None) is not None:
+            raw["allowed_tools"] = settings.allowed_tools
+        if (
+            "blocked_env_vars" not in raw
+            and getattr(settings, "blocked_env_vars", None) is not None
+        ):
+            raw["blocked_env_vars"] = settings.blocked_env_vars
         return model.model_validate(raw)
     if raw:
         msg = f"{_no_options_reason(settings.agent)}; got {sorted(raw)}"

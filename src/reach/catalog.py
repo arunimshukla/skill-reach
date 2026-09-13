@@ -45,6 +45,7 @@ __all__ = [
     "build_neighborhood_catalogs",
     "build_scaling_catalogs",
     "corpus_digest",
+    "deduplicate_skills",
     "determine_min_scale",
     "find_cluster_medoids",
     "find_skill_manifest",
@@ -61,6 +62,8 @@ __all__ = [
 FRONTMATTER_DELIMITER = "---"
 FRONTMATTER_SPLIT_PARTS: Final = 3
 MIN_NEIGHBORHOOD_SIZE: Final = 2
+BOM: Final = "\ufeff"
+_FRONTMATTER_PATTERN = re.compile(r"^---\s*$", re.MULTILINE)
 
 #: Key in SKILL.md frontmatter indicating exclusion from model tool selection.
 HIDE_FROM_MODEL_KEY: Final = "disable-model-invocation"
@@ -196,10 +199,9 @@ def split_frontmatter(text: str) -> tuple[str, str] | None:
         A tuple of (frontmatter_yaml, markdown_body) if valid delimiter lines are found,
         or None if the file lacks valid frontmatter delimiters.
     """
-    if not text.startswith(FRONTMATTER_DELIMITER):
-        return None
-    parts = text.split(FRONTMATTER_DELIMITER, 2)
-    if len(parts) < FRONTMATTER_SPLIT_PARTS:
+    stripped = text.removeprefix(BOM)
+    parts = _FRONTMATTER_PATTERN.split(stripped, maxsplit=2)
+    if len(parts) < FRONTMATTER_SPLIT_PARTS or parts[0] != "":
         return None
     return parts[1], parts[2]
 
@@ -218,7 +220,10 @@ def parse_frontmatter(text: str, path: Path) -> Skill | None:
     if split is None:
         return None
     frontmatter, _body = split
-    loaded = yaml.safe_load(frontmatter)
+    try:
+        loaded = yaml.safe_load(frontmatter)
+    except yaml.YAMLError:
+        return None
     if not isinstance(loaded, dict):
         return None
     parsed = _SkillFrontmatter.model_validate(loaded)
@@ -524,7 +529,7 @@ def build_scaling_catalogs(
     return catalogs
 
 
-def _deduplicate_skills(skills: Sequence[Skill]) -> list[Skill]:
+def deduplicate_skills(skills: Sequence[Skill]) -> list[Skill]:
     """Filter duplicate skills by name, preserving first insertion order."""
     unique_skills: list[Skill] = []
     seen: set[str] = set()
@@ -533,6 +538,9 @@ def _deduplicate_skills(skills: Sequence[Skill]) -> list[Skill]:
             seen.add(s.name)
             unique_skills.append(s)
     return unique_skills
+
+
+_deduplicate_skills = deduplicate_skills
 
 
 def _compute_cosine_bm25_distance_matrix(

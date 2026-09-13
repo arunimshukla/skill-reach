@@ -18,12 +18,11 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import subprocess
 from collections.abc import Iterable, Mapping, Sequence
 from math import floor
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, override
+from typing import TYPE_CHECKING, Any, ClassVar, override
 
 from pydantic import BaseModel, ConfigDict, Field, model_serializer
 from pydantic import ValidationError as PydanticValidationError
@@ -39,6 +38,8 @@ from reach.runtime import (
     SkillRoot,
     agent_default_model,
 )
+from reach.runtime._env import sync_claude_settings_env
+from reach.runtime._fs import ensure_private_directory
 from reach.runtime._subprocess import (
     iter_json_lines,
     process_failure_reason,
@@ -169,6 +170,10 @@ class ClaudeCodeOptions(CliOptions):
     tools: str | None = "Skill"
     strict_mcp_config: bool = True
     no_session_persistence: bool = True
+    config_dir: Path | None = None
+    cloud_ml_region: str | None = None
+    vertex_project_id: str | None = None
+    isolation_dir_field: ClassVar[str | None] = "config_dir"
 
     @model_serializer(mode="wrap")
     def _omit_unset_listing_controls(
@@ -358,6 +363,7 @@ class ClaudeCodeRuntime(CliAgentRuntime[ClaudeCodeOptions]):
     options: ClaudeCodeOptions
     api_key_env_var: str | None = "ANTHROPIC_API_KEY"
     _skills_subpath = ".claude/skills"
+    isolation_dir_name: ClassVar[str | None] = ".reach_claude_config"
 
     def __init__(
         self,
@@ -523,23 +529,17 @@ class ClaudeCodeRuntime(CliAgentRuntime[ClaudeCodeOptions]):
     def build_env(self, workdir: Path | None = None) -> dict[str, str]:
         """Assemble process environment with API keys and workspace directory."""
         env = super().build_env(workdir)
+        sync_claude_settings_env(env, blocked_env_vars=self.blocked_env_vars)
+        if self.options.cloud_ml_region:
+            env["CLOUD_ML_REGION"] = self.options.cloud_ml_region
+        if self.options.vertex_project_id:
+            env["ANTHROPIC_VERTEX_PROJECT_ID"] = self.options.vertex_project_id
         if self.options.disable_bundled_skills:
             env["CLAUDE_CODE_DISABLE_BUNDLED_SKILLS"] = "1"
-        if workdir is not None and self.options.isolate_config_dir:
-            config_dir = workdir / ".reach_claude_config"
-            config_dir.mkdir(parents=True, exist_ok=True)
+        if workdir is not None and (iso_dir := self.effective_isolation_dir(workdir)) is not None:
+            config_dir = ensure_private_directory(iso_dir)
             env["CLAUDE_CONFIG_DIR"] = str(config_dir)
         return env
-
-    @override
-    def post_probe(self, workdir: Path) -> None:
-        """Clean isolated configuration directory after probe if auto_clean is enabled."""
-        if not self.options.auto_clean:
-            return
-        if self.options.isolate_config_dir:
-            config_dir = Path(workdir) / ".reach_claude_config"
-            if config_dir.exists():
-                shutil.rmtree(config_dir, ignore_errors=True)
 
     @override
     def validate_outcome(
@@ -625,9 +625,15 @@ class ClaudeGenerator(BaseTextGenerator[ClaudeCodeOptions]):
             )
         return reason
 
+    @override
     def build_env(self) -> dict[str, str]:
         """Assemble process environment with API keys for Claude Code completion."""
-        env = dict(os.environ)
+        env = super().build_env()
+        sync_claude_settings_env(env, blocked_env_vars=self.blocked_env_vars)
+        if (cloud_ml_region := getattr(self.options, "cloud_ml_region", None)) is not None:
+            env["CLOUD_ML_REGION"] = str(cloud_ml_region)
+        if (vertex_project_id := getattr(self.options, "vertex_project_id", None)) is not None:
+            env["ANTHROPIC_VERTEX_PROJECT_ID"] = str(vertex_project_id)
         if (api_key := getattr(self.options, "api_key", None)) is not None:
             env["ANTHROPIC_API_KEY"] = str(api_key)
         return env

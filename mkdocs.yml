@@ -101,6 +101,8 @@ nav:
   - Concepts:
       - How Reachability Works: concepts/how-it-works.md
       - Progressive Disclosure: concepts/progressive-disclosure.md
+  - Guides:
+      - Sandboxing & Safety: guides/sandboxing.md
   - CLI Reference:
       - Overview: cli/index.md
       - reach init: cli/init.md

@@ -20,7 +20,7 @@ import contextlib
 import shutil
 import subprocess
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, override
+from typing import TYPE_CHECKING, Any, ClassVar, override
 
 from pydantic import Field
 
@@ -38,6 +38,8 @@ from reach.runtime._env import (
     sync_google_and_gemini_keys,
 )
 from reach.runtime._fs import (
+    ensure_private_directory,
+    probe_slot_dir,
     resolve_skill_from_path,
 )
 from reach.runtime._subprocess import (
@@ -52,6 +54,18 @@ from reach.runtime.generator import BaseTextGenerator
 if TYPE_CHECKING:
     from collections.abc import Iterable, Sequence
 
+#: Workdir-relative root holding one session slot per concurrent probe worker.
+SESSION_DIRNAME = ".reach_pi_sessions"
+
+
+def _newest_transcript(session_dir: Path, exclude: set[Path] | None = None) -> Path | None:
+    """Return the most recently modified session transcript, ignoring excluded files."""
+    skip = exclude or set()
+    candidates = [f for f in session_dir.glob("*.jsonl") if f not in skip]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda f: f.stat().st_mtime)
+
 
 class PiOptions(CliOptions):
     """Hold configuration options for driving the Pi coding agent CLI."""
@@ -65,6 +79,8 @@ class PiOptions(CliOptions):
     thinking: str | None = None
     tools: str = "read"
     no_themes: bool = True
+    agent_dir: Path | None = None
+    isolation_dir_field: ClassVar[str | None] = "agent_dir"
 
 
 def _extract_pi_tool_call(
@@ -163,6 +179,7 @@ class PiRuntime(CliAgentRuntime[PiOptions]):
     options: PiOptions
     api_key_env_var: str | None = None
     _skills_subpath: str = ".pi/skills"
+    isolation_dir_name: ClassVar[str | None] = ".reach_pi_agent"
 
     def __init__(self, settings: RuntimeSettings | None = None) -> None:
         """Initialize the PiRuntime with settings or defaults."""
@@ -190,7 +207,7 @@ class PiRuntime(CliAgentRuntime[PiOptions]):
     def build_command(self, query_text: str, session_dir: Path | None = None) -> list[str]:
         """Assemble command-line arguments for running a single-turn Pi probe."""
         options = self.options
-        effective_session_dir = session_dir or Path(".reach_pi_sessions")
+        effective_session_dir = session_dir or Path(SESSION_DIRNAME)
         cmd = [
             options.executable,
             "-p",
@@ -232,9 +249,8 @@ class PiRuntime(CliAgentRuntime[PiOptions]):
         )
         sync_google_and_gemini_keys(env)
 
-        if workdir is not None and self.options.isolate_config_dir:
-            agent_dir = (Path(workdir) / ".reach_pi_agent").resolve()
-            agent_dir.mkdir(parents=True, exist_ok=True)
+        if workdir is not None and (iso_dir := self.effective_isolation_dir(workdir)) is not None:
+            agent_dir = ensure_private_directory(iso_dir)
             env["PI_CODING_AGENT_DIR"] = str(agent_dir)
 
         return env
@@ -244,13 +260,14 @@ class PiRuntime(CliAgentRuntime[PiOptions]):
         """Clean session and agent artifacts after probe execution if auto_clean is enabled."""
         if not self.options.auto_clean:
             return
-        session_dir = (Path(workdir) / ".reach_pi_sessions").resolve()
-        if session_dir.exists():
-            shutil.rmtree(session_dir, ignore_errors=True)
-        if self.options.isolate_config_dir:
-            agent_dir = (Path(workdir) / ".reach_pi_agent").resolve()
-            if agent_dir.exists():
-                shutil.rmtree(agent_dir, ignore_errors=True)
+        session_root = (Path(workdir) / SESSION_DIRNAME).resolve()
+        slot_dir = probe_slot_dir(session_root)
+        if slot_dir.exists():
+            shutil.rmtree(slot_dir, ignore_errors=True)
+        # Prune the root only once the last concurrent worker has released its slot.
+        with contextlib.suppress(OSError):
+            session_root.rmdir()
+        super().post_probe(workdir)
 
     @override
     def select(
@@ -260,8 +277,8 @@ class PiRuntime(CliAgentRuntime[PiOptions]):
         target_skill: str | None = None,
     ) -> SelectionOutcome:
         """Execute query evaluation probe and return SelectionOutcome."""
-        session_dir = Path(workdir) / ".reach_pi_sessions"
-        session_dir.mkdir(parents=True, exist_ok=True)
+        # Probes run concurrently against one workdir, so each thread owns a session slot.
+        session_dir = ensure_private_directory(probe_slot_dir(Path(workdir) / SESSION_DIRNAME))
 
         existing_files = set(session_dir.glob("*.jsonl"))
 
@@ -281,12 +298,9 @@ class PiRuntime(CliAgentRuntime[PiOptions]):
                     observed_catalog=self._resident,
                 )
 
-            new_files = [f for f in session_dir.glob("*.jsonl") if f not in existing_files]
-            session_file = new_files[-1] if new_files else None
-
+            session_file = _newest_transcript(session_dir, exclude=existing_files)
             if session_file is None:
-                all_files = sorted(session_dir.glob("*.jsonl"), key=lambda f: f.stat().st_mtime)
-                session_file = all_files[-1] if all_files else None
+                session_file = _newest_transcript(session_dir)
 
             if session_file is None:
                 return SelectionOutcome(

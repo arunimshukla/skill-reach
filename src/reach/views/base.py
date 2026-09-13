@@ -84,6 +84,7 @@ __all__ = [
     "print_resuming",
     "print_wrote",
     "probe_progress",
+    "safety_panel",
 ]
 
 if TYPE_CHECKING:
@@ -211,6 +212,17 @@ def error_panel(lines: Sequence[str]) -> Panel:
         border_style="reach.error.border",
         box=box.ROUNDED,
         expand=True,
+    )
+
+
+def safety_panel(lines: Sequence[str]) -> Panel:
+    """Construct a standardized security notice panel for agent probe confirmation."""
+    return Panel(
+        "\n".join(lines),
+        title="[bold yellow]⚠️  Security Notice: Agent Probes[/]",
+        title_align="left",
+        border_style="yellow",
+        box=box.ROUNDED,
     )
 
 

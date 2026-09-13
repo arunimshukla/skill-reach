@@ -19,6 +19,7 @@ While standard evaluation suites measure skill execution after invocation, `skil
 - [Commands](#commands)
 - [Supported Agents](#supported-agents)
 - [Configuration](#configuration)
+- [Security and Sandboxing](#security-and-sandboxing)
 - [Reproducibility and Provenance](#reproducibility-and-provenance)
 - [Development and Testing](#development-and-testing)
 - [Repository Layout](#repository-layout)
@@ -129,6 +130,10 @@ uv run reach overlap path/to/skills --skill my-skill --suggest
 
 > [!TIP]
 > `reach overlap` uses local lexical scoring without API calls. Run it before dispatching LLM evaluation probes to detect skill name collisions and overlapping vocabulary.
+
+> [!CAUTION]
+> **Security Notice: Probing Untrusted Skills**
+> Probing skills with live agent runtimes executes real agent processes with host filesystem and command execution permissions. When evaluating unvetted or third-party skills, **always run Reach inside an isolated sandbox** (such as Docker or [Google Cloud Run sandboxes](docs/guides/sandboxing.md)), or use the safe offline `--agent keyword` driver. Reach prompts for confirmation by default and fails closed in non-interactive CI environments unless `--yes` / `-y` (or `REACH_YES=1`) is supplied.
 
 ### 2. Run a quick evaluation
 
@@ -432,6 +437,10 @@ Reach provides two levels of agent integration:
 
 ### 1. Live Empirical Evaluation (`reach eval`, `reach check`, `reach optimize`)
 
+> [!WARNING]
+> **Host Execution Permissions**
+> Live agent runtimes operate with the user's host permissions. If an untrusted skill includes malicious instructions in its prompt or tool calls, it can attempt unauthorized filesystem access or command execution. When probing untrusted catalogs, use [containerized or cloud-native sandboxing](docs/guides/sandboxing.md) to isolate agent execution.
+
 Live model probing and description optimization are currently supported for:
 
 - **Google Antigravity** (`antigravity-cli`, default; `antigravity-sdk`): Drives the headless `agy` CLI with filesystem sandboxing, or the Python SDK with structured JSON schemas. Default model: `gemini-3.8-flash` (supports `gemini-3.8-flash`, `gemini-3.7-flash`, `gemini-3.6-flash`, `gemini-3.5-flash`, `gemini-3.5-flash-lite`, `gemini-3.1-pro`, `gemini-3.1-pro-preview`, `gemini-2.5-flash`, `gemini-2.5-pro`). Supports authentication via Gemini API keys or Google Cloud Agent Platform.
@@ -514,6 +523,18 @@ attempts = 5
 retries = 2
 backoff_s = 5.0
 ```
+
+## Security and Sandboxing
+
+When evaluating, probing, or optimizing skill catalogs, live agent runtimes execute real tools, file operations, and shell commands on the host machine. Reach provides safety boundaries across three operational tiers:
+
+1. **Interactive Confirmation Gate**: Commands that launch live agent probes (`eval`, `sweep`, `check` Stage 2, `optimize`) display an interactive security panel detailing the target catalog locations, skill count, and active runtime before any probe subprocess is spawned. Non-interactive environments fail closed with exit code `2` unless `--yes` / `-y`, `REACH_YES=1`, or `trusted = true` is configured.
+2. **Deterministic Offline Keyword Driver**: For zero-risk offline evaluation, `--agent keyword` evaluates lexical reachability using compiled regular expressions entirely in Python memory—with zero subprocesses, zero tool calls, zero token spend, and automatic prompt bypass.
+3. **Containerized & Cloud-Native Sandboxing**:
+   - **Docker / Podman**: Mount catalogs read-only into ephemeral containers.
+   - **Google Cloud Run Sandboxes**: Run Reach as a Cloud Run Job or Service with `--sandbox-launcher` (`sandboxLauncher: true`) to leverage instance-local micro-sandboxes via `sandbox do`. Cloud Run sandboxes block outbound network egress by default, restrict filesystem modifications to tmpfs overlays, and completely block access to the Google Cloud metadata server (`http://metadata.google.internal`), preventing credential theft.
+
+For full architecture patterns, Docker Compose configurations, and Cloud Run manifests, see the [Sandboxing & Execution Safety Guide](docs/guides/sandboxing.md).
 
 ## Reproducibility and Provenance
 

@@ -91,8 +91,8 @@ class Severity(StrEnum):
     """Specify the severity level for a lint diagnostic."""
 
     ERROR = "error"
-    WARN = "warn"
     IGNORE = "ignore"
+    WARN = "warn"
 
 
 class RuleDefinition(BaseModel):

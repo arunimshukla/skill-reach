@@ -30,6 +30,7 @@ from reach.cli.doctor import (
     _check_python,
     _check_sdk,
     _check_skills,
+    run_doctor_checks,
 )
 from reach.views import build_console, render_doctor_table
 
@@ -125,6 +126,37 @@ def test_check_google_adc(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> No
     assert "GOOGLE_APPLICATION_CREDENTIALS" in res.detail
 
 
+def test_check_google_adc_detects_windows_appdata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify _check_google_adc locates credentials in Windows APPDATA directory."""
+    monkeypatch.delenv("GOOGLE_APPLICATION_CREDENTIALS", raising=False)
+    monkeypatch.delenv("CLOUDSDK_CONFIG", raising=False)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "fake_home")
+    appdata = tmp_path / "AppData" / "Roaming"
+    gcloud = appdata / "gcloud"
+    gcloud.mkdir(parents=True)
+    adc = gcloud / "application_default_credentials.json"
+    adc.write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("APPDATA", str(appdata))
+
+    res = _check_google_adc()
+    assert res.status == "ok"
+    assert "standard location" in res.detail
+
+
+def test_check_google_adc_missing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify _check_google_adc reports warning when no credentials exist."""
+    monkeypatch.delenv("GOOGLE_APPLICATION_CREDENTIALS", raising=False)
+    monkeypatch.delenv("CLOUDSDK_CONFIG", raising=False)
+    monkeypatch.delenv("APPDATA", raising=False)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "fake_home")
+
+    res = _check_google_adc()
+    assert res.status == "warn"
+    assert res.detail == "not found"
+
+
 @pytest.mark.parametrize(
     ("rel_path", "expected_label"),
     [
@@ -172,6 +204,15 @@ def test_check_config_valid_and_invalid(tmp_path: Path) -> None:
     assert res_err.status == "fail"
 
 
+def test_check_config_warns_with_target_directory(tmp_path: Path) -> None:
+    """Verify _check_config includes the target directory path when not in cwd."""
+    empty_dir = tmp_path / "custom_workdir"
+    empty_dir.mkdir()
+    res = _check_config(empty_dir)
+    assert res.status == "warn"
+    assert f"target directory '{empty_dir}'" in res.detail
+
+
 def test_render_doctor_returns_1_on_failure() -> None:
     """Verify render_doctor exits 1 when any diagnostic failure is recorded."""
     console = build_console(quiet=True)
@@ -179,3 +220,11 @@ def test_render_doctor_returns_1_on_failure() -> None:
         ("Env", "Python", "fail", "Version 3.9 unsupported", "Upgrade Python"),
     ]
     assert render_doctor_table(console, fail_res) == 1
+
+
+def test_run_doctor_checks_includes_google_adc(tmp_path: Path) -> None:
+    """Verify run_doctor_checks includes Google Cloud ADC diagnostic check."""
+    results = run_doctor_checks(tmp_path)
+    adc_checks = [r for r in results if r.name == "Google Cloud ADC"]
+    assert len(adc_checks) == 1
+    assert adc_checks[0].category == "Credentials & Environment"

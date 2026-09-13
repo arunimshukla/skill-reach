@@ -24,8 +24,10 @@ import pytest
 import reach.retrieval
 from reach.models import Skill
 from reach.retrieval import (
+    Bm25Scorer,
     DenseScorer,
     HybridScorer,
+    TextScorer,
     build_scorer,
     compute_rrf,
     cosine_similarity,
@@ -60,6 +62,30 @@ def test_cosine_similarity_zero_vector_returns_zero() -> None:
     v1 = [0.0, 0.0]
     v2 = [1.0, 2.0]
     assert cosine_similarity(v1, v2) == 0.0
+
+
+def test_cosine_similarity_clamps_floating_point_overshoot() -> None:
+    """Verify cosine similarity clamps floating-point rounding errors to [-1.0, 1.0]."""
+    v = [
+        -5.627240503927933,
+        0.10710576206724731,
+        -9.469280606322727,
+        -6.02324698626703,
+        2.997688755590463,
+        0.8988296120643327,
+        -5.591187559186066,
+        1.7853136775181753,
+        6.1886091335565325,
+        -9.87002480643878,
+    ]
+    sim = cosine_similarity(v, v)
+    assert sim <= 1.0
+    assert sim == 1.0
+
+    neg_v = [-x for x in v]
+    neg_sim = cosine_similarity(v, neg_v)
+    assert neg_sim >= -1.0
+    assert neg_sim == -1.0
 
 
 def test_directional_projection_asymmetry() -> None:
@@ -312,3 +338,49 @@ def test_bm25_scorer_declared_in_retrieval() -> None:
     assert len(ranked) == 1
     assert ranked[0][0] == "skill-b"
     assert ranked[0][1] > 0
+
+
+def test_dense_and_hybrid_scorers_conform_to_text_scorer() -> None:
+    """Verify DenseScorer and HybridScorer implement the TextScorer protocol."""
+    dense = DenseScorer(vectors={"s1": [1.0, 0.0]})
+    assert isinstance(dense, TextScorer)
+
+    lexical = Bm25Scorer.from_skills([])
+    hybrid = HybridScorer(lexical=lexical, semantic=dense)
+    assert isinstance(hybrid, TextScorer)
+
+
+def test_dense_scorer_rank_text() -> None:
+    """Verify DenseScorer ranks candidates against text queries."""
+    cand1 = _make_skill("pdf-parser", "Extract tables from PDF files.")
+    cand2 = _make_skill("image-editor", "Crop and rotate images.")
+    vectors = {
+        "pdf-query": [1.0, 0.9, 0.0],
+        "pdf-parser": [0.95, 0.85, 0.0],
+        "image-editor": [0.0, 0.1, 1.0],
+    }
+    scorer = DenseScorer(vectors=vectors)
+    ranked = scorer.rank_text("pdf-query", [cand1, cand2])
+    assert len(ranked) == 2
+    assert ranked[0][0] == "pdf-parser"
+    assert ranked[1][0] == "image-editor"
+    assert ranked[0][1] > ranked[1][1]
+
+
+def test_hybrid_scorer_rank_text() -> None:
+    """Verify HybridScorer fuses lexical and dense scores for text queries."""
+    cand1 = _make_skill("pdf-parser", "Extract tables from PDF files.")
+    cand2 = _make_skill("image-editor", "Crop and rotate images.")
+    vectors = {
+        "pdf": [1.0, 0.9, 0.0],
+        "pdf-parser": [0.95, 0.85, 0.0],
+        "image-editor": [0.0, 0.1, 1.0],
+    }
+    lexical = Bm25Scorer.from_skills([cand1, cand2])
+    dense = DenseScorer(vectors=vectors)
+    hybrid = HybridScorer(lexical=lexical, semantic=dense)
+
+    ranked = hybrid.rank_text("pdf", [cand1, cand2])
+    assert len(ranked) == 2
+    assert ranked[0][0] == "pdf-parser"
+    assert ranked[1][0] == "image-editor"

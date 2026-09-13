@@ -77,8 +77,10 @@ from .flags import (
     RuntimeFlags,
     StudyFlags,
     Verbose,
+    YesFlag,
     build_config,
 )
+from .safety import confirm_skill_execution
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -653,6 +655,7 @@ def _eval(
             help="Display model reasoning / thought traces for misrouted queries",
         ),
     ] = False,
+    yes: YesFlag = False,
     quiet: Quiet = False,
     verbose: Verbose = False,
 ) -> int:
@@ -713,6 +716,18 @@ def _eval(
         )
         if draft_outcome is not None:
             return draft_outcome
+
+        if code := confirm_skill_execution(
+            console,
+            runtime_name=driver.name,
+            skills=skills,
+            roots=roots,
+            action="evaluation",
+            yes=yes,
+            trusted=settings.study.trusted,
+            dry_run=dry_run,
+        ):
+            return code
 
         return _probe_and_record(
             console=console,

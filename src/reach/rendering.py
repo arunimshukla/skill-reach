@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import csv
 import io
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -62,9 +63,42 @@ def _normalize_annotation_level(severity: str) -> str:
     return "notice"
 
 
+def _normalize_annotation_file(
+    file: str | Path | None,
+    root: Path | None = None,
+) -> str | None:
+    """Normalize an annotation file path to a relative path."""
+    if not file:
+        return None
+    file_path = Path(file)
+    if not file_path.is_absolute():
+        return str(file)
+    base = root.resolve() if root is not None else Path.cwd().resolve()
+    try:
+        return str(file_path.resolve().relative_to(base))
+    except ValueError:
+        return str(file)
+
+
+def _escape_annotation_param(value: str) -> str:
+    r"""Escape special characters in GitHub Actions command parameter values.
+
+    Encodes characters per the GitHub Actions workflow commands specification:
+    '%' -> '%25', '\r' -> '%0D', '\n' -> '%0A', ':' -> '%3A', ',' -> '%2C'.
+    """
+    return (
+        value.replace("%", "%25")
+        .replace("\r", "%0D")
+        .replace("\n", "%0A")
+        .replace(":", "%3A")
+        .replace(",", "%2C")
+    )
+
+
 def _build_annotation_params(
     *,
-    file: str | None,
+    file: str | Path | None,
+    root: Path | None = None,
     line: int | None,
     col: int | None,
     end_line: int | None,
@@ -73,8 +107,9 @@ def _build_annotation_params(
 ) -> str:
     """Build key-value parameter string for GitHub Actions command."""
     params: list[str] = []
-    if file:
-        params.append(f"file={file}")
+    normalized_file = _normalize_annotation_file(file, root=root)
+    if normalized_file:
+        params.append(f"file={_escape_annotation_param(normalized_file)}")
     if line is not None:
         params.append(f"line={line}")
     if col is not None:
@@ -84,7 +119,7 @@ def _build_annotation_params(
     if end_col is not None:
         params.append(f"endColumn={end_col}")
     if title:
-        params.append(f"title={title}")
+        params.append(f"title={_escape_annotation_param(title)}")
     return f" {','.join(params)}" if params else ""
 
 
@@ -93,7 +128,8 @@ def format_github_annotation(
     message: str,
     *,
     title: str | None = None,
-    file: str | None = None,
+    file: str | Path | None = None,
+    root: Path | None = None,
     line: int | None = None,
     col: int | None = None,
     end_line: int | None = None,
@@ -107,6 +143,7 @@ def format_github_annotation(
     level = _normalize_annotation_level(severity)
     param_str = _build_annotation_params(
         file=file,
+        root=root,
         line=line,
         col=col,
         end_line=end_line,

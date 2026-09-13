@@ -586,6 +586,31 @@ def test_an_unreached_skill_sorts_above_a_well_served_one(card) -> None:
     assert shown.index("gcs-retention-policy") < shown.index("gcs-lifecycle-rules")
 
 
+def test_an_attractor_skill_sorts_above_a_well_served_one() -> None:
+    """Verify unrequested attractor skills with absorption sort above well-served skills."""
+    from reach.views.scorecard import _worst_first
+
+    attractor = SkillScore(
+        skill="attractor",
+        probes=0,
+        reached=0,
+        recall=None,
+        absorbed=10,
+        precision=0.0,
+    )
+    well_served = SkillScore(
+        skill="well-served",
+        probes=10,
+        reached=10,
+        recall=1.0,
+        absorbed=0,
+        precision=1.0,
+    )
+    sorted_skills = _worst_first([well_served, attractor])
+    assert sorted_skills[0].skill == "attractor"
+    assert sorted_skills[1].skill == "well-served"
+
+
 def test_reach_is_shown_with_its_interval_and_the_counts_behind_it(card) -> None:
     """Verify scorecard displays percentage, confidence interval, and hit ratio."""
     assert re.search(r"1/3\s+33%\s+6-79%", card())

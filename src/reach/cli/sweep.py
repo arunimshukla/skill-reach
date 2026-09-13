@@ -44,8 +44,10 @@ from .flags import (
     Format,
     Global,
     RegistryFlags,
+    YesFlag,
     agent_help_text,
 )
+from .safety import confirm_skill_execution
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -253,6 +255,7 @@ def _sweep(
             help="Working directory for probe execution",
         ),
     ] = None,
+    yes: YesFlag = False,
     config: ConfigFlag = None,
 ) -> int:
     """Execute multi-scale catalog evaluation sweeps to measure reachability decay."""
@@ -290,6 +293,16 @@ def _sweep(
     )
     if format == "text":
         console.print(f"[dim]Using benchmark queries from:[/] [cyan]{resolved_queries}[/]\n")
+
+    if code := confirm_skill_execution(
+        console,
+        runtime_name=driver.name,
+        skills=found,
+        action="scaling sweep",
+        yes=yes,
+        trusted=effective_config.study.trusted,
+    ):
+        return code
 
     try:
         study = run_scaling_sweep(

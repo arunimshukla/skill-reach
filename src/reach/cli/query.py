@@ -201,7 +201,13 @@ def _render_query_view(
     if discovered is not None:
         print_discovery(console, discovered)
     if not found:
-        raise _no_skills(skills, global_scope=global_scope)
+        if skills is not None:
+            raise _no_skills(skills, global_scope=global_scope)
+        ranks = {}
+        flags = None
+    else:
+        ranks = lexical_ranks(query_set.queries, found)
+        flags = leaks(query_set.queries, found, background=found) if show_leaks else None
 
     trail = None
     if show_citations:
@@ -221,8 +227,8 @@ def _render_query_view(
     print_query_view(
         console,
         query_set,
-        ranks=lexical_ranks(query_set.queries, found),
-        flags=leaks(query_set.queries, found, background=found) if show_leaks else None,
+        ranks=ranks,
+        flags=flags,
         citations=trail,
     )
     return 0

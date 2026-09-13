@@ -58,6 +58,7 @@ tag = ""
 # early_stop = true
 # scales = [10, 25, 50, 100]
 # anchor = "all"
+# trusted = false
 
 [catalog]
 # Synthetic catalog generation and neighborhood sampling settings.
@@ -146,6 +147,8 @@ agent = "antigravity-cli"
 timeout_s = 200
 max_turns = 3
 early_exit = true
+# Explicit list of environment variables stripped from agent subprocesses (overrides defaults):
+# blocked_env_vars = ["AWS_SECRET_ACCESS_KEY", "GITHUB_TOKEN"]
 
 [query]
 # Query generation and adversarial drafting parameters.

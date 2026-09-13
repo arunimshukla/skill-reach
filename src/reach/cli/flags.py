@@ -53,6 +53,16 @@ type AgentName = Literal[
 #: Standard boolean switch configuration for CLI parameters.
 SWITCH = Parameter(negative=(), show_default=False)
 
+#: Universal confirmation bypass switch for CI and automated scripts.
+YesFlag = Annotated[
+    bool,
+    SWITCH,
+    Parameter(
+        name=["--yes", "-y"],
+        help="Bypass interactive safety confirmation prompts (recommended for CI and scripts)",
+    ),
+]
+
 #: Standard repeatable list parameter configuration.
 LIST = Parameter(negative=(), show_default=False)
 

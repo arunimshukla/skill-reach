@@ -66,8 +66,8 @@ _NOT_PROSE = (
 class Verdict(StrEnum):
     """Categorize the recommended action for a skill's description."""
 
-    REWORD = "reword"
     CONTESTED = "contested"
+    REWORD = "reword"
     UNRIVALED = "unrivaled"
 
 

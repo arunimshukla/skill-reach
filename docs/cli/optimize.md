@@ -4,6 +4,10 @@ Optimize a skill's description using automated candidate synthesis and empirical
 
 When two skills collide (for example, `gcp-cloud-run` and `docker-deploy`), adjusting the wording of their descriptions can eliminate misroutes without reducing legitimate activations.
 
+> [!WARNING]
+> **Closed-Loop Probe Safety**
+> Description optimization runs fast-path empirical probes against candidate descriptions using real agent processes. Pass `--yes` / `-y` (or set `REACH_YES=1`) to bypass interactive confirmation prompts. When testing candidate descriptions against untrusted skills, execute Reach inside an isolated sandbox (e.g. Docker or [Google Cloud Run sandboxes](../guides/sandboxing.md)). Note that `--force` / `-f` remains exclusively dedicated to force-applying candidate descriptions when recall does not strictly increase.
+
 ---
 
 ## The Optimization Loop
@@ -107,6 +111,7 @@ reach optimize cloud-run-deploy --format diff
 | `--global`, `-g`     | Flag    | `false`           | Discover and inspect skills from user global configuration (`~/`).                                                             |
 | `--auto-apply`       | Flag    | `false`           | Automatically write the highest-ranking candidate description to `SKILL.md` if it improves reachability.                       |
 | `--force`, `-f`      | Flag    | `false`           | Force apply candidate to `SKILL.md` even if no empirical improvement is detected.                                              |
+| `--yes`, `-y`        | Flag    | `false`           | Bypass interactive safety confirmation prompts.                                                                                |
 | `--candidate`, `-c`  | Integer | `1`               | 1-based candidate rank to inspect diff or apply.                                                                               |
 | `--format`           | Choice  | `text`            | Output format: `text`, `json`, `diff`.                                                                                         |
 | `--config`           | Path    | -                 | Path to `reach.toml` configuration file.                                                                                       |

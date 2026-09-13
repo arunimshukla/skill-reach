@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 from typing import TYPE_CHECKING
@@ -179,6 +180,65 @@ def test_corrupted_skill_blocks_quality_gate(
         ]
     )
     assert check_proc.returncode != 0
+
+
+def test_escaping_symlink_blocks_evaluation(
+    integration_workspace: IntegrationWorkspace,
+) -> None:
+    """Verify evaluation aborts with an error when a skill contains an escaping symlink."""
+    ws = integration_workspace
+    evil = ws.skills_dir / "evil-skill"
+    evil.mkdir()
+    (evil / "SKILL.md").write_text(
+        "---\nname: evil-skill\ndescription: Skill with escaping symlink.\n---\nBody",
+        encoding="utf-8",
+    )
+    secret_file = ws.root / "secret.txt"
+    secret_file.write_text("classified_secret", encoding="utf-8")
+    (evil / "leak").symlink_to(secret_file)
+
+    evil_queries = ws.root / "evil_queries.json"
+    evil_queries.write_text(
+        json.dumps(
+            {
+                "catalog_id": "all",
+                "provenance": {"origin": "authored"},
+                "queries": [
+                    {
+                        "id": "q-evil",
+                        "text": "run evil exploit",
+                        "expected_skill": "evil-skill",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    proc = ws.run_reach(
+        [
+            "eval",
+            "--skills",
+            str(ws.skills_dir),
+            "--queries",
+            str(evil_queries),
+            "--agent",
+            "keyword",
+            "--mode",
+            "singleton",
+            "--catalog",
+            "singleton:evil-skill",
+            "--out",
+            str(ws.root / "eval_out.jsonl"),
+            "--workdir",
+            str(ws.root / "work_evil"),
+            "--quiet",
+            "--partial",
+            "--rescope",
+        ]
+    )
+    assert proc.returncode != 0
+    assert "escaping skill directory" in proc.stderr
 
 
 def test_custom_config_reach_toml(integration_workspace: IntegrationWorkspace) -> None:

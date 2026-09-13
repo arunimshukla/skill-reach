@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 from typing import TYPE_CHECKING
 from unittest.mock import patch
@@ -31,6 +32,7 @@ from reach.check import (
     run_check,
 )
 from reach.config import CheckSettings, RunConfig
+from reach.models import Query
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -229,6 +231,34 @@ def test_changed_skills_git_error_raises_value_error() -> None:
             changed_skills(since="bad-ref")
 
 
+def test_changed_skills_rejects_flag_injection() -> None:
+    """Verify changed_skills raises ValueError when since starts with a dash."""
+    with pytest.raises(ValueError, match="git reference must not begin with a dash"):
+        changed_skills(since="--output=/tmp/pwned")
+
+
+def test_changed_skills_passes_double_dash_delimiter() -> None:
+    """Verify changed_skills passes double dash to git diff to delimit revisions."""
+    with patch("subprocess.run") as mock_run:
+        mock_run.return_value.returncode = 0
+        mock_run.return_value.stdout = ""
+        changed_skills(since="HEAD~1")
+        mock_run.assert_called_once()
+        args = mock_run.call_args[0][0]
+        assert args == ["git", "diff", "--name-only", "HEAD~1", "--"]
+
+
+def test_changed_skills_default_since_is_head_minus_one() -> None:
+    """Verify changed_skills defaults to HEAD~1 when since is omitted."""
+    with patch("subprocess.run") as mock_run:
+        mock_run.return_value.returncode = 0
+        mock_run.return_value.stdout = ""
+        changed_skills()
+        mock_run.assert_called_once()
+        args = mock_run.call_args[0][0]
+        assert args == ["git", "diff", "--name-only", "HEAD~1", "--"]
+
+
 @pytest.mark.parametrize(
     "stderr_msg",
     [
@@ -253,10 +283,20 @@ def test_changed_skills_missing_git_returns_empty_tuple() -> None:
         assert changed_skills(since="HEAD~1") == ()
 
 
+def test_changed_skills_timeout_raises_value_error() -> None:
+    """Verify changed_skills raises ValueError with timeout hint when git diff hangs."""
+    with (
+        patch(
+            "subprocess.run",
+            side_effect=subprocess.TimeoutExpired(cmd=["git", "diff"], timeout=30.0),
+        ),
+        pytest.raises(ValueError, match=r"git diff timed out after 30\.0s"),
+    ):
+        changed_skills(since="HEAD~1")
+
+
 def test_run_check_non_existent_path_raises_value_error() -> None:
     """Verify run_check raises ValueError on missing skill paths."""
-    from pathlib import Path
-
     with pytest.raises(ValueError, match="skill path does not exist"):
         run_check(skills_paths=[Path("/non/existent/path")])
 
@@ -291,6 +331,65 @@ def test_run_check_changed_no_modified_skills_passes_instantly(
         assert outcome.skills_checked == 0
         assert outcome.probes_executed == 0
         assert outcome.exit_code == 0
+
+
+def test_run_check_changed_scope_drops_skills_deleted_from_disk(
+    write_skill: Callable[..., Path],
+    write_queries: Callable[..., Path],
+) -> None:
+    """Verify a skill removed by the diff is excluded from the empirical scope."""
+    skill_dir = write_skill(
+        name="valid-skill",
+        description="Valid description with sufficient length.",
+    )
+    queries_file = write_queries(
+        queries=[
+            Query(id="q-live", text="Sample query for valid-skill", expected_skill="valid-skill"),
+            Query(
+                id="q-gone",
+                text="Sample query for deleted tool",
+                expected_skill="deleted-skill",
+            ),
+        ],
+    )
+
+    with patch("reach.check.changed_skills", return_value=("deleted-skill", "valid-skill")):
+        outcome = run_check(
+            skills_paths=[skill_dir],
+            queries_path=queries_file,
+            changed=True,
+            agent="keyword",
+            strict=False,
+        )
+
+    assert outcome.skills_checked == 1
+    assert outcome.queries_probed == 1
+
+
+def test_run_check_changed_scope_with_only_deletions_passes_instantly(
+    write_skill: Callable[..., Path],
+    write_queries: Callable[..., Path],
+) -> None:
+    """Verify a deletion-only diff passes rather than gating on unreachable queries."""
+    skill_dir = write_skill(
+        name="valid-skill",
+        description="Valid description with sufficient length.",
+    )
+    queries_file = write_queries(target="deleted-skill", count=2)
+
+    with patch("reach.check.changed_skills", return_value=("deleted-skill",)):
+        outcome = run_check(
+            skills_paths=[skill_dir],
+            queries_path=queries_file,
+            changed=True,
+            agent="keyword",
+            strict=False,
+        )
+
+    assert outcome.passed
+    assert outcome.skills_checked == 0
+    assert outcome.probes_executed == 0
+    assert outcome.exit_code == 0
 
 
 def test_build_check_assertions_trajectory_metrics_pass() -> None:
@@ -369,7 +468,7 @@ def test_build_check_assertions_trajectory_metrics_fail(
             "min_accuracy": 0.80,
             "max_misroute": 0.10,
             **metric_kwarg,
-        }
+        },
     )
     assertions = _build_check_assertions(metrics, settings)
     matching = [a for a in assertions if a.name == metric_name]
@@ -451,3 +550,28 @@ def test_run_config_resolve_check_settings() -> None:
     assert resolved.min_recall == 0.90
     assert resolved.min_accuracy == 0.80
     assert resolved.budget == 25
+
+
+def test_load_catalog_skills_deduplicates_overlapping_paths(
+    write_skill: Callable[..., Path],
+) -> None:
+    """Verify _load_catalog_skills deduplicates duplicate skills across candidate paths."""
+    from reach.check import _load_catalog_skills
+    from reach.models import Catalog, CatalogMode
+
+    skill_path = write_skill(
+        name="duplicate-tool",
+        description="A distinct description for testing duplicate skill loading.",
+    )
+    # Provide both the skills parent directory and the skill path itself (overlapping)
+    skills_root = skill_path.parent
+    loaded = _load_catalog_skills([skills_root, skill_path])
+
+    names = [s.name for s in loaded]
+    assert names == ["duplicate-tool"]
+    catalog = Catalog(
+        id="check-catalog",
+        skills=tuple(names),
+        mode=CatalogMode.ALL,
+    )
+    assert catalog.skills == ("duplicate-tool",)

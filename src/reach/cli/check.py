@@ -54,6 +54,7 @@ from .flags import (
     Quiet,
     RegistryFlags,
     RuleOverrideFlags,
+    YesFlag,
     agent_help_text,
 )
 
@@ -252,6 +253,7 @@ def _check(
     global_: Global = False,
     rules: Annotated[RuleOverrideFlags | None, Parameter(group=RULES_GROUP)] = None,
     registry: Annotated[RegistryFlags | None, Parameter(group=REGISTRY_GROUP)] = None,
+    yes: YesFlag = False,
     config: ConfigFlag = None,
     quiet: Quiet = False,
 ) -> int:
@@ -337,6 +339,7 @@ def _check(
         config=run_config,
         rule_overrides=rule_overrides or None,
         global_scope=global_,
+        yes=yes,
     )
 
     _render_check_output(console, outcome, format, step_summary)

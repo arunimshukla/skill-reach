@@ -36,6 +36,11 @@ from reach.registry import (
     RegistryManifest,
     RegistrySkillData,
     ServiceDisabledError,
+    _matches_publisher,
+    _safe_resolve_subpath,
+    find_adc_path,
+    get_access_token,
+    is_adc_available,
 )
 
 
@@ -270,6 +275,61 @@ def test_cache_manager_manifest_ttl(tmp_path: Path) -> None:
     assert stale is not None
 
 
+@pytest.mark.parametrize(
+    ("actual", "requested", "expected"),
+    [
+        (None, None, True),
+        ("google", None, True),
+        (None, "google", False),
+        ("google", "google", True),
+        ("projects/p/locations/l/publishers/google", "google", True),
+        ("google", "projects/p/locations/l/publishers/google", True),
+        ("publishers/google/", "google", True),
+        ("google", "publishers/google", True),
+        ("my-google", "google", False),
+        ("google", "my-google", False),
+        ("google", "other", False),
+    ],
+)
+def test_matches_publisher_cases(actual: str | None, requested: str | None, expected: bool) -> None:
+    """Verify publisher matching supports bidirectional and normalized identifiers."""
+    assert _matches_publisher(actual, requested) is expected
+
+
+def test_get_cached_manifest_filters_unscoped_fallback_by_publisher(tmp_path: Path) -> None:
+    """Verify unscoped fallback manifest is filtered by publisher without leaking others."""
+    cache = RegistryCacheManager(cache_root=tmp_path)
+    unscoped_manifest = RegistryManifest(
+        project="proj-a",
+        location="global",
+        publisher=None,
+        fetched_at=datetime.now(UTC),
+        skills=(
+            RegistrySkillData(
+                name="projects/proj-a/locations/global/skills/s1",
+                displayName="s1",
+                description="desc 1",
+                publisher="google",
+            ),
+            RegistrySkillData(
+                name="projects/proj-a/locations/global/skills/s2",
+                displayName="s2",
+                description="desc 2",
+                publisher="acme-corp",
+            ),
+        ),
+    )
+    cache.save_manifest(unscoped_manifest)
+
+    # Scoped query should hit unscoped fallback but ONLY return matching skills
+    loaded = cache.get_cached_manifest("proj-a", "global", publisher="google", max_age_seconds=60)
+    assert loaded is not None
+    assert loaded.publisher == "google"
+    assert len(loaded.skills) == 1
+    assert loaded.skills[0].display_name == "s1"
+    assert loaded.skills[0].publisher == "google"
+
+
 def test_cache_manager_hydration_and_resolve(tmp_path: Path) -> None:
     """Verify cache manager creates physical SKILL.md and returns valid Skill models."""
     cache = RegistryCacheManager(cache_root=tmp_path)
@@ -327,6 +387,114 @@ def test_cache_manager_clean(tmp_path: Path) -> None:
     assert bytes_cleaned > 0
     assert paths_cleaned
     assert not tmp_path.exists() or not any(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize(
+    "malicious_project",
+    [
+        "/etc",
+        "/var/target",
+        "../../escape",
+        "..",
+        ".",
+        "nested/path",
+        "nested\\winpath",
+    ],
+)
+def test_cache_manager_clean_rejects_path_traversal(
+    malicious_project: str,
+    tmp_path: Path,
+) -> None:
+    """Verify clean raises ValueError and refuses to delete paths that attempt directory escape."""
+    cache = RegistryCacheManager(cache_root=tmp_path / "cache")
+    sensitive_outside_dir = tmp_path / "outside"
+    sensitive_outside_dir.mkdir()
+    canary = sensitive_outside_dir / "canary.txt"
+    canary.write_text("protected")
+
+    with pytest.raises(ValueError, match="escapes cache directory"):
+        cache.clean(project=malicious_project)
+
+    assert canary.is_file()
+    assert canary.read_text() == "protected"
+
+
+@pytest.mark.parametrize("bad_id", ["..", ".", "  "])
+def test_cache_manager_location_dir_rejects_empty_or_dot(bad_id: str, tmp_path: Path) -> None:
+    """Verify location_dir raises ValueError when project or location resolves to dot."""
+    cache = RegistryCacheManager(cache_root=tmp_path)
+    with pytest.raises(ValueError, match="Invalid project identifier"):
+        cache.location_dir(bad_id, "global")
+    with pytest.raises(ValueError, match="Invalid location identifier"):
+        cache.location_dir("proj", bad_id)
+
+
+def test_cache_manager_skill_dir_sanitizes_path_traversal(tmp_path: Path) -> None:
+    """Verify skill_dir sanitizes remote skill names and ensures directory is within location."""
+    cache = RegistryCacheManager(cache_root=tmp_path)
+    loc_dir = cache.location_dir("proj", "global")
+    skill_path = cache.skill_dir("proj", "global", "../../malicious_name", "../../rev")
+    assert skill_path.is_relative_to(loc_dir)
+    assert not any(part == ".." for part in skill_path.parts)
+
+
+@pytest.mark.parametrize(
+    ("segments", "disallow_separators", "fallbacks", "expected_rel"),
+    [
+        (
+            [("my-proj", "project"), ("us-central1", "location")],
+            False,
+            None,
+            "my-proj/us-central1",
+        ),
+        (
+            [("skill@1", "skill"), ("..", "revision")],
+            False,
+            {"revision": "default"},
+            "skill_1/default",
+        ),
+    ],
+)
+def test_safe_resolve_subpath_valid(
+    tmp_path: Path,
+    segments: list[tuple[str, str]],
+    disallow_separators: bool,
+    fallbacks: dict[str, str] | None,
+    expected_rel: str,
+) -> None:
+    """Verify _safe_resolve_subpath resolves valid components strictly within root."""
+    resolved = _safe_resolve_subpath(
+        tmp_path,
+        *segments,
+        disallow_separators=disallow_separators,
+        fallbacks=fallbacks,
+    )
+    assert resolved == (tmp_path / expected_rel).resolve()
+    assert resolved.is_relative_to(tmp_path.resolve())
+
+
+@pytest.mark.parametrize(
+    ("segments", "disallow_separators", "error_match"),
+    [
+        ([("/etc/passwd", "project")], True, "escapes cache directory"),
+        ([("nested/dir", "project")], True, "escapes cache directory"),
+        ([("..", "project")], False, "Invalid project identifier"),
+        ([("   ", "location")], False, "Invalid location identifier"),
+    ],
+)
+def test_safe_resolve_subpath_invalid(
+    tmp_path: Path,
+    segments: list[tuple[str, str]],
+    disallow_separators: bool,
+    error_match: str,
+) -> None:
+    """Verify _safe_resolve_subpath raises ValueError on traversal or invalid segments."""
+    with pytest.raises(ValueError, match=error_match):
+        _safe_resolve_subpath(
+            tmp_path,
+            *segments,
+            disallow_separators=disallow_separators,
+        )
 
 
 def test_client_get_skill() -> None:
@@ -512,3 +680,394 @@ def test_registry_cache_concurrent_save_manifest_and_hydrate(tmp_path: Path) -> 
     assert loaded is not None
     assert len(loaded.skills) == 1
     assert loaded.skills[0].identifier == "shared-skill"
+
+
+def test_registry_cache_publisher_scoping_prevents_cache_poisoning(tmp_path: Path) -> None:
+    """Verify publisher-filtered fetches do not poison subsequent unfiltered resolution calls."""
+    all_skills = (
+        RegistrySkillData(
+            name="projects/p/skills/a",
+            displayName="alpha",
+            publisher="pub-a",
+            description="Alpha skill.",
+        ),
+        RegistrySkillData(
+            name="projects/p/skills/b",
+            displayName="bravo",
+            publisher="pub-b",
+            description="Bravo skill.",
+        ),
+    )
+
+    class FakeClient(RegistryClient):
+        def __init__(self) -> None:
+            self.calls: list[str | None] = []
+
+        def fetch_manifest(
+            self, project: str, location: str = "global", publisher: str | None = None
+        ) -> RegistryManifest:
+            self.calls.append(publisher)
+            selected = tuple(s for s in all_skills if not publisher or s.publisher == publisher)
+            return RegistryManifest(
+                project=project,
+                location=location,
+                publisher=publisher,
+                fetched_at=datetime.now(UTC),
+                skills=selected,
+            )
+
+    cache = RegistryCacheManager(cache_root=tmp_path)
+    client = FakeClient()
+
+    # Scoped call caches only pub-a
+    scoped_skills = cache.resolve_skills(project="p", publisher="pub-a", client=client)
+    assert [s.name for s in scoped_skills] == ["alpha"]
+    assert client.calls == ["pub-a"]
+
+    # Unscoped call must NOT return only the cached pub-a subset
+    unscoped_skills = cache.resolve_skills(project="p", client=client)
+    assert sorted(s.name for s in unscoped_skills) == ["alpha", "bravo"]
+    assert client.calls == ["pub-a", None]
+
+
+def test_registry_cache_global_manifest_satisfies_subsequent_filtered_requests(
+    tmp_path: Path,
+) -> None:
+    """Verify fresh unfiltered manifest satisfies publisher-filtered queries without re-fetching."""
+    all_skills = (
+        RegistrySkillData(
+            name="projects/p/skills/a",
+            displayName="alpha",
+            publisher="pub-a",
+            description="Alpha skill.",
+        ),
+        RegistrySkillData(
+            name="projects/p/skills/b",
+            displayName="bravo",
+            publisher="pub-b",
+            description="Bravo skill.",
+        ),
+    )
+
+    class FakeClient(RegistryClient):
+        def __init__(self) -> None:
+            self.calls: list[str | None] = []
+
+        def fetch_manifest(
+            self, project: str, location: str = "global", publisher: str | None = None
+        ) -> RegistryManifest:
+            self.calls.append(publisher)
+            selected = tuple(s for s in all_skills if not publisher or s.publisher == publisher)
+            return RegistryManifest(
+                project=project,
+                location=location,
+                publisher=publisher,
+                fetched_at=datetime.now(UTC),
+                skills=selected,
+            )
+
+    cache = RegistryCacheManager(cache_root=tmp_path)
+    client = FakeClient()
+
+    # Fetch global/unscoped first
+    unscoped_skills = cache.resolve_skills(project="p", client=client)
+    assert len(unscoped_skills) == 2
+    assert client.calls == [None]
+
+    # Filtered call should use cached global manifest (0 extra network calls)
+    scoped_skills = cache.resolve_skills(project="p", publisher="pub-a", client=client)
+    assert [s.name for s in scoped_skills] == ["alpha"]
+    assert client.calls == [None]
+
+
+def test_registry_cache_stale_fallback_respects_publisher_filter(tmp_path: Path) -> None:
+    """Verify stale fallback with max_age=-1 selects only compatible cached manifests."""
+    cache = RegistryCacheManager(cache_root=tmp_path)
+
+    # Save a cached manifest specifically for pub-a
+    manifest_a = RegistryManifest(
+        project="p",
+        location="global",
+        publisher="pub-a",
+        fetched_at=datetime.now(UTC) - timedelta(days=10),
+        skills=(
+            RegistrySkillData(
+                name="projects/p/skills/a",
+                displayName="alpha",
+                publisher="pub-a",
+                description="Alpha skill.",
+            ),
+        ),
+    )
+    cache.save_manifest(manifest_a)
+
+    class FailingClient(RegistryClient):
+        def fetch_manifest(
+            self,
+            project: str,
+            location: str = "global",
+            publisher: str | None = None,
+        ) -> RegistryManifest:
+            del project, location, publisher
+            msg = "Network unavailable"
+            raise RegistryError(msg)
+
+    failing_client = FailingClient()
+
+    # Querying for pub-b must NOT fallback to stale pub-a manifest (must raise RegistryError)
+    with pytest.raises(RegistryError, match="Network unavailable"):
+        cache.resolve_skills(project="p", publisher="pub-b", client=failing_client)
+
+    # Querying for pub-a should successfully fall back to stale pub-a manifest
+    resolved_a = cache.resolve_skills(project="p", publisher="pub-a", client=failing_client)
+    assert [s.name for s in resolved_a] == ["alpha"]
+
+    # Querying for publisher="pub" (substring of pub-a) must NOT match pub-a
+    with pytest.raises(RegistryError, match="Network unavailable"):
+        cache.resolve_skills(project="p", publisher="pub", client=failing_client)
+
+
+def test_registry_cache_publisher_slug_sanitization(tmp_path: Path) -> None:
+    """Verify publisher names with slashes are sanitized into flat filename slugs."""
+    cache = RegistryCacheManager(cache_root=tmp_path)
+    path = cache.manifest_path("my-proj", "global", publisher="publishers/google")
+    assert path.name == ".manifest.publishers_google.json"
+    assert path.parent == cache.location_dir("my-proj", "global")
+
+
+def test_find_adc_path_respects_cloudsdk_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify find_adc_path respects CLOUDSDK_CONFIG directory setting."""
+    monkeypatch.delenv("GOOGLE_APPLICATION_CREDENTIALS", raising=False)
+    cfg_dir = tmp_path / "gcloud_custom"
+    cfg_dir.mkdir(parents=True)
+    adc = cfg_dir / "application_default_credentials.json"
+    adc.write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("CLOUDSDK_CONFIG", str(cfg_dir))
+
+    found = find_adc_path()
+    assert found == adc
+    assert is_adc_available()
+
+
+def test_find_adc_path_finds_windows_appdata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify find_adc_path locates ADC file in Windows APPDATA environment directory."""
+    monkeypatch.delenv("GOOGLE_APPLICATION_CREDENTIALS", raising=False)
+    monkeypatch.delenv("CLOUDSDK_CONFIG", raising=False)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "fake_home")
+    appdata = tmp_path / "AppData" / "Roaming"
+    gcloud = appdata / "gcloud"
+    gcloud.mkdir(parents=True)
+    adc = gcloud / "application_default_credentials.json"
+    adc.write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("APPDATA", str(appdata))
+
+    found = find_adc_path()
+    assert found == adc
+    assert is_adc_available()
+
+
+def test_find_adc_path_none_when_missing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify find_adc_path returns None when no ADC files exist."""
+    monkeypatch.delenv("GOOGLE_APPLICATION_CREDENTIALS", raising=False)
+    monkeypatch.delenv("CLOUDSDK_CONFIG", raising=False)
+    monkeypatch.delenv("APPDATA", raising=False)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "fake_home")
+
+    assert find_adc_path() is None
+    assert not is_adc_available()
+
+
+def test_is_adc_available_detects_windows_adc(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify is_adc_available returns True when credentials exist in Windows AppData."""
+    monkeypatch.delenv("GOOGLE_APPLICATION_CREDENTIALS", raising=False)
+    monkeypatch.delenv("CLOUDSDK_CONFIG", raising=False)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "fake_home")
+    appdata = tmp_path / "AppData" / "Roaming"
+    gcloud = appdata / "gcloud"
+    gcloud.mkdir(parents=True)
+    adc = gcloud / "application_default_credentials.json"
+    adc.write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("APPDATA", str(appdata))
+
+    assert is_adc_available() is True
+
+
+def test_get_access_token_uses_cloud_platform_scope() -> None:
+    """Verify get_access_token requests the cloud-platform scope from google-auth."""
+    mock_creds = MagicMock(token="ya29.scope_test_token")  # noqa: S106
+    with patch("google.auth.default", return_value=(mock_creds, "mock-proj")) as mock_default:
+        token = get_access_token()
+        assert token == "ya29.scope_test_token"  # noqa: S105
+        mock_default.assert_called_once_with(
+            scopes=["https://www.googleapis.com/auth/cloud-platform"],
+        )
+
+
+def test_get_access_token_fails_if_gcloud_not_found(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify get_access_token raises AuthenticationError when gcloud CLI is not in PATH."""
+    monkeypatch.setattr("shutil.which", lambda _cmd: None)
+
+    # Ensure google.auth throws so it falls back to gcloud
+    with (
+        patch("google.auth.default", side_effect=Exception("No google-auth")),
+        pytest.raises(AuthenticationError, match="gcloud CLI not found in PATH"),
+    ):
+        get_access_token()
+
+
+def test_get_access_token_parses_multiline_stdout_with_warnings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify get_access_token extracts the ya29 token line amidst CLI warnings."""
+    monkeypatch.setattr("shutil.which", lambda _cmd: "/usr/bin/gcloud")
+
+    multiline_stdout = (
+        "WARNING: Your active project does not match your quota project.\n"
+        "WARNING: A new gcloud release is available.\n"
+        "\n"
+        "ya29.c.b0Aaekm12345_mocked_token\n"
+    )
+
+    fake_proc = MagicMock(stdout=multiline_stdout, returncode=0)
+    with (
+        patch("google.auth.default", side_effect=Exception("No google-auth")),
+        patch("subprocess.run", return_value=fake_proc),
+    ):
+        token = get_access_token()
+        assert token == "ya29.c.b0Aaekm12345_mocked_token"  # noqa: S105
+
+
+def test_get_access_token_accepts_non_ya29_token_format(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify get_access_token accepts valid bearer token formats without hardcoded ya29 prefix."""
+    monkeypatch.setattr("shutil.which", lambda _cmd: "/usr/bin/gcloud")
+    multiline_stdout = (
+        "WARNING: A new gcloud release is available.\n"
+        "\n"
+        "eyJhbGciOiJSUzI1NiIsImtpZCI6IjEyMzQ1In0.payload.signature\n"
+    )
+    fake_proc = MagicMock(stdout=multiline_stdout, returncode=0)
+    with (
+        patch("google.auth.default", side_effect=Exception("No google-auth")),
+        patch("subprocess.run", return_value=fake_proc),
+    ):
+        token = get_access_token()
+        assert token == "eyJhbGciOiJSUzI1NiIsImtpZCI6IjEyMzQ1In0.payload.signature"  # noqa: S105
+
+
+@pytest.mark.parametrize(
+    "bad_stdout",
+    [
+        "",
+        "   \n  \n",
+        "ERROR: (gcloud.auth.application-default.print-access-token) Credentials expired.",
+        "WARNING: Just warnings without a token\nAnother warning line",
+        "ya29.token has whitespace in the middle",
+    ],
+)
+def test_get_access_token_rejects_malformed_token_output(
+    bad_stdout: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify get_access_token raises AuthenticationError if output lacks a ya29 token."""
+    monkeypatch.setattr("shutil.which", lambda _cmd: "/usr/bin/gcloud")
+    fake_proc = MagicMock(stdout=bad_stdout, returncode=0)
+
+    with (
+        patch("google.auth.default", side_effect=Exception("No google-auth")),
+        patch("subprocess.run", return_value=fake_proc),
+        pytest.raises(AuthenticationError, match="Unexpected or invalid token format"),
+    ):
+        get_access_token()
+
+
+def test_registry_client_caches_token_across_requests() -> None:
+    """Verify RegistryClient reuses cached token across calls to prevent process churn."""
+    client = RegistryClient(base_url="http://127.0.0.1:8080")
+
+    with patch("reach.registry.get_access_token", return_value="ya29.cached_token") as mock_get:
+        tok1 = client._get_token()
+        tok2 = client._get_token()
+        tok3 = client._get_token()
+
+        assert tok1 == "ya29.cached_token"
+        assert tok2 == "ya29.cached_token"
+        assert tok3 == "ya29.cached_token"
+        assert mock_get.call_count == 1
+
+
+def test_registry_client_token_cache_refreshes_after_expiry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify RegistryClient refreshes token after token_ttl_seconds expires."""
+    client = RegistryClient(base_url="http://127.0.0.1:8080", token_ttl_seconds=60.0)
+
+    current_time = 1000.0
+    monkeypatch.setattr("time.time", lambda: current_time)
+
+    with patch("reach.registry.get_access_token", side_effect=["ya29.token_one", "ya29.token_two"]):
+        assert client._get_token() == "ya29.token_one"
+        assert client._get_token() == "ya29.token_one"
+
+        # Advance time past TTL
+        current_time += 65.0
+
+        assert client._get_token() == "ya29.token_two"
+
+
+def test_registry_client_clears_token_cache_on_401() -> None:
+    """Verify RegistryClient invalidates cached token when receiving HTTP 401 Unauthorized."""
+    client = RegistryClient(base_url="http://127.0.0.1:8080")
+    expired_token: str | None = "ya29.expired_token"  # noqa: S105
+    client._cached_token = expired_token
+    client._cached_token_expiry = 9999999999.0
+
+    with pytest.raises(AuthenticationError):
+        client._handle_http_error(401, "Unauthorized", "projects/p/skills")
+
+    assert client._cached_token is None
+    assert client._cached_token_expiry == 0.0
+
+
+@pytest.mark.parametrize(
+    "valid_url",
+    [
+        "https://agentregistry.googleapis.com/v1alpha",
+        "https://custom-region.googleapis.com/v1",
+        "https://agentregistry.google.com/v1alpha",
+        "http://127.0.0.1:8080",
+        "http://localhost:8000/v1",
+        "http://[::1]:9000",
+    ],
+)
+def test_registry_client_accepts_valid_base_urls(valid_url: str) -> None:
+    """Verify RegistryClient accepts HTTPS Google API domains and loopback URLs."""
+    client = RegistryClient(base_url=valid_url, token="ya29.mock")  # noqa: S106
+    assert client.base_url == valid_url.rstrip("/")
+
+
+@pytest.mark.parametrize(
+    ("invalid_url", "expected_err"),
+    [
+        ("http://agentregistry.googleapis.com", "must use HTTPS for non-local endpoints"),
+        ("http://insecure-remote.com/api", "must use HTTPS for non-local endpoints"),
+        ("https://evil-exfiltration.com/api", "must be a Google API domain or loopback"),
+        ("ftp://agentregistry.googleapis.com", "must use HTTP or HTTPS scheme"),
+        ("", "Invalid Agent Registry base_url"),
+        ("invalid-url-no-scheme", "Invalid Agent Registry base_url"),
+    ],
+)
+def test_registry_client_rejects_insecure_or_untrusted_base_urls(
+    invalid_url: str,
+    expected_err: str,
+) -> None:
+    """Verify RegistryClient rejects non-HTTPS URLs, untrusted domains, or invalid schemes."""
+    with pytest.raises(ValueError, match=expected_err):
+        RegistryClient(base_url=invalid_url, token="ya29.mock")  # noqa: S106

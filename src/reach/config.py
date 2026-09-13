@@ -411,6 +411,7 @@ class RuntimeSettings(BaseModel):
 
     agent: str = Field(default_factory=default_agent)
     allowed_tools: tuple[str, ...] | None = None
+    blocked_env_vars: tuple[str, ...] | None = None
     options: dict[str, object] = Field(default_factory=dict)
     timeout_s: int = Field(default=200, gt=0)
     max_turns: int = Field(default=3, ge=1)
@@ -622,6 +623,7 @@ class StudySettings(BaseModel):
     early_stop: bool = True
     scales: tuple[int, ...] | None = None
     anchor: int | tuple[str, ...] | str | None = None
+    trusted: bool = False
 
     @field_validator("anchor", mode="before")
     @classmethod
@@ -901,7 +903,7 @@ def digest_material(material: dict[str, Any]) -> Digests:
     fingerprint["study"] = {
         k: v
         for k, v in fingerprint.get("study", {}).items()
-        if k not in {"out", "workdir", "skills", "queries", "tag"}
+        if k not in {"out", "workdir", "skills", "queries", "tag", "trusted"}
     }
 
     arm = deepcopy(material)

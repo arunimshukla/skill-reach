@@ -2,6 +2,10 @@
 
 Measure whether a catalog's skills are reachable when resident alongside their rivals. If no labeled query set exists, `reach eval` automatically drafts one.
 
+> [!WARNING]
+> **Agent Execution Safety**
+> `reach eval` executes live agent subprocesses that can run tools and shell commands on the host system. When testing third-party or untrusted skills, execute inside an isolated container sandbox (e.g. Docker or [Google Cloud Run sandboxes](../guides/sandboxing.md)) or use `--agent keyword`. Automated non-interactive environments must explicitly pass `--yes` / `-y` or set `REACH_YES=1` to bypass the safety confirmation gate.
+
 ---
 
 ## Synopsis
@@ -119,6 +123,8 @@ reach eval cloud-deploy --concurrency 4
 | Option                             | Type    | Default                  | Description                                                                                    |
 | :--------------------------------- | :------ | :----------------------- | :--------------------------------------------------------------------------------------------- |
 | `--agent`                          | Choice  | `from reach.toml`        | Target runtime: `antigravity-cli`, `antigravity-sdk`, `claude-code`, `goose`, `keyword`, `pi`. |
+| `--model`, `-m`                    | String  | Default model            | Target model identifier.                                                                       |
+| `--effort`, `-e`                   | String  | Default effort           | Reasoning effort level (e.g. `low`, `medium`, `high`).                                         |
 | `--timeout`                        | Integer | -                        | Seconds allowed per probe attempt.                                                             |
 | `--max-turns`, `-T`                | Integer | `3`                      | Maximum conversation turns to execute and evaluate.                                            |
 | `--early-exit` / `--no-early-exit` | Flag    | `true`                   | Terminate multi-turn probe immediately when target skill is invoked.                           |
@@ -133,11 +139,13 @@ reach eval cloud-deploy --concurrency 4
 | `--no-resume`                      | Flag    | `false`                  | Re-probe everything, ignoring results already in output.                                       |
 | `--append-across-arms`             | Flag    | `false`                  | Add probes to an `--out` recorded under a different configuration.                             |
 | `--allow-truncation`               | Flag    | `false`                  | Probe a catalog too wide for the runtime's skill listing without error.                        |
+| `--yes`, `-y`                      | Flag    | `false`                  | Bypass interactive safety confirmation prompts.                                                |
 
 ### Query Generation
 
 | Option                | Type    | Default            | Description                                                                  |
 | :-------------------- | :------ | :----------------- | :--------------------------------------------------------------------------- |
+| `--skill`             | String  | All                | Specific skill name(s) to draft queries for (repeatable).                    |
 | `--count`             | Integer | `3`                | Number of queries to draft per target skill.                                 |
 | `--generator-model`   | String  | `gemini-3.8-flash` | Model used to draft synthetic queries.                                       |
 | `--generator-arm`     | String  | `content`          | Which generation prompt to use (`content`, `behavioral`, etc.).              |

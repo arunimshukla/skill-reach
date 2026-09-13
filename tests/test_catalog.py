@@ -20,6 +20,7 @@ import hashlib
 from typing import TYPE_CHECKING, cast
 
 import pytest
+from pydantic import ValidationError
 
 from reach.catalog import (
     _compute_cosine_bm25_distance_matrix,
@@ -97,6 +98,62 @@ def test_split_frontmatter_only_consumes_the_first_two_delimiters() -> None:
     split = split_frontmatter("---\nname: x\n---\nfirst\n---\nsecond\n")
     assert split is not None
     assert split[1] == "\nfirst\n---\nsecond\n"
+
+
+def test_split_frontmatter_handles_unicode_bom() -> None:
+    """Verify split_frontmatter strips leading Unicode BOM marker before parsing."""
+    raw = "\ufeff---\nname: x\n---\nbody text\n"
+    assert split_frontmatter(raw) == (
+        "\nname: x\n",
+        "\nbody text\n",
+    )
+
+
+def test_parse_frontmatter_handles_unicode_bom(tmp_path: Path) -> None:
+    """Verify parse_frontmatter loads Skill from markdown starting with a Unicode BOM."""
+    raw = "\ufeff---\nname: bom-skill\ndescription: A skill with a BOM\n---\nBody content\n"
+    skill = parse_frontmatter(raw, tmp_path / "SKILL.md")
+    assert skill is not None
+    assert skill.name == "bom-skill"
+    assert skill.description == "A skill with a BOM"
+
+
+def test_split_frontmatter_handles_em_dash_in_description() -> None:
+    """Verify split_frontmatter does not split on em-dash substrings in frontmatter values."""
+    raw = '---\nname: em-skill\ndescription: "Automate---specifically Cloud Run"\n---\nBody\n'
+    split = split_frontmatter(raw)
+    assert split is not None
+    assert 'description: "Automate---specifically Cloud Run"' in split[0]
+    assert split[1] == "\nBody\n"
+
+
+def test_parse_frontmatter_handles_em_dash_in_description(tmp_path: Path) -> None:
+    """Verify parse_frontmatter correctly parses a description containing an em-dash."""
+    raw = '---\nname: em-skill\ndescription: "Automate---specifically Cloud Run"\n---\nBody\n'
+    skill = parse_frontmatter(raw, tmp_path / "SKILL.md")
+    assert skill is not None
+    assert skill.name == "em-skill"
+    assert skill.description == "Automate---specifically Cloud Run"
+
+
+def test_parse_frontmatter_handles_malformed_yaml(tmp_path: Path) -> None:
+    """Verify parse_frontmatter returns None on malformed YAML instead of raising ScannerError."""
+    raw = "---\nname: [unclosed list\n---\nBody\n"
+    assert parse_frontmatter(raw, tmp_path / "SKILL.md") is None
+
+
+def test_load_skills_handles_unicode_bom(tmp_path: Path) -> None:
+    """Verify load_skills discovers and loads files encoded with a UTF-8 BOM."""
+    skill_dir = tmp_path / "bom-skill"
+    skill_dir.mkdir(parents=True)
+    manifest = skill_dir / "SKILL.md"
+    manifest.write_text(
+        "\ufeff---\nname: bom-skill\ndescription: Saved with UTF-8 BOM\n---\nContent\n",
+        encoding="utf-8",
+    )
+    skills = load_skills(tmp_path)
+    assert len(skills) == 1
+    assert skills[0].name == "bom-skill"
 
 
 def test_a_file_that_is_not_a_skill_is_walked_past_not_stumbled_over(
@@ -957,3 +1014,34 @@ def test_build_corpus_scaling_queries_with_anchors() -> None:
         anchor_skills=None,
     )
     assert len(res_all.queries) == 3
+
+
+@pytest.mark.parametrize("empty_name", ["", "   ", "\t\n"])
+def test_skill_name_requires_non_empty(empty_name: str, tmp_path: Path) -> None:
+    """Verify Skill model raises ValidationError when name is empty or whitespace."""
+    with pytest.raises(ValidationError):
+        Skill(
+            name=empty_name,
+            description="A valid description.",
+            path=tmp_path,
+        )
+
+
+@pytest.mark.parametrize(
+    "valid_name",
+    [
+        "code-review",
+        "pdf-processing",
+        "++",
+        "my_skill",
+        "SkillWithCamelCase",
+    ],
+)
+def test_skill_name_accepts_non_empty(valid_name: str, tmp_path: Path) -> None:
+    """Verify Skill model accepts non-empty names across naming conventions."""
+    skill = Skill(
+        name=valid_name,
+        description="A valid description.",
+        path=tmp_path,
+    )
+    assert skill.name == valid_name
