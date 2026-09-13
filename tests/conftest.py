@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Provide shared test fixtures and mock models for the test suite."""
+"""Provide shared test fixtures, synthetic factories, and mock servers for the test suite."""
 
 from __future__ import annotations
 
@@ -24,6 +24,7 @@ import re
 import shutil
 import subprocess
 import sys
+import textwrap
 import threading
 import warnings
 from collections.abc import Callable, Generator, Mapping, Sequence
@@ -31,7 +32,7 @@ from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from importlib import metadata
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, ClassVar, Self, cast
+from typing import Any, ClassVar, Self, cast
 from urllib.parse import parse_qs, urlparse
 
 import bm25s  # type: ignore[import-untyped]
@@ -67,8 +68,9 @@ from reach.run import Composition, append_result, compose, write_sidecar
 from reach.runtime.fake import FakeGenerator, FakeRuntime, register_fake_agent
 from reach.views import build_console
 
-if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+# ==============================================================================
+# 1. Environment & Global Test Setup
+# ==============================================================================
 
 register_fake_agent()
 
@@ -79,83 +81,6 @@ os.environ.setdefault("HF_HUB_OFFLINE", "1")
 def clean_browser_env() -> dict[str, str]:
     """Provide an environment mapping stripped of CI and browser bypass flags."""
     return {k: v for k, v in os.environ.items() if k not in ("CI", "REACH_NO_BROWSER")}
-
-
-@pytest.fixture(scope="session")
-def bm25s_reference() -> Callable[
-    [Sequence[Skill]],
-    Callable[[Sequence[str]], list[float]],
-]:
-    """Provide a factory creating bm25s query scorers for a given skill corpus."""
-
-    def _for_corpus(skills: Sequence[Skill]) -> Callable[[Sequence[str]], list[float]]:
-        engine = bm25s.BM25(k1=K1, b=B, method="lucene")
-        engine.index([tokenize(skill_text(s)) for s in skills])
-        return lambda query: list(engine.get_scores(list(query)))
-
-    return _for_corpus
-
-
-@pytest.fixture(scope="session")
-def matches_sklearn() -> Callable[..., None]:
-    """Provide a helper verifying Reach metrics against scikit-learn implementations."""
-
-    def _assert(results: Any, queries: Any, labels: Any = None) -> None:
-        y_true, y_pred = labeled_pairs(results, queries)
-        report = classification_report(results, queries, labels=labels)
-        universe = list(labels) if labels else sorted(set(y_true) | set(y_pred))
-        kwargs: dict[str, Any] = {
-            "labels": universe,
-            "average": "macro",
-            "zero_division": 0,
-        }
-
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", UserWarning)
-            warnings.simplefilter("ignore", UndefinedMetricWarning)
-            accuracy = accuracy_score(y_true, y_pred)
-            macro = (
-                precision_score(y_true, y_pred, **kwargs),
-                recall_score(y_true, y_pred, **kwargs),
-                f1_score(y_true, y_pred, **kwargs),
-            )
-            precisions, recalls, f1s, supports = cast(
-                "tuple[Sequence[float], Sequence[float], Sequence[float], Sequence[int]]",
-                precision_recall_fscore_support(
-                    y_true,
-                    y_pred,
-                    labels=universe,
-                    average=None,
-                    zero_division=0,
-                ),
-            )
-            matrix = confusion_matrix(y_true, y_pred, labels=universe)
-
-        assert report.top1_accuracy == pytest.approx(accuracy)
-        assert report.macro_precision == pytest.approx(macro[0])
-        assert report.macro_recall == pytest.approx(macro[1])
-        assert report.macro_f1 == pytest.approx(macro[2])
-
-        for entry, p, r, f, s in zip(
-            report.per_class,
-            precisions,
-            recalls,
-            f1s,
-            supports,
-            strict=True,
-        ):
-            assert entry.precision == pytest.approx(p), entry.label
-            assert entry.recall == pytest.approx(r), entry.label
-            assert entry.f1 == pytest.approx(f), entry.label
-            assert entry.support == s, entry.label
-
-        ours = confusion(results, queries)
-        for i, truth in enumerate(universe):
-            for j, predicted in enumerate(universe):
-                key = (truth, None if predicted == NO_SKILL else predicted)
-                assert ours[key] == matrix[i][j], f"{truth} -> {predicted}"
-
-    return _assert
 
 
 class _DummyModel2Vec:
@@ -172,33 +97,78 @@ class _DummyModel2Vec:
         return embeddings
 
 
-retrieval._load_model2vec_model = lambda _name: _DummyModel2Vec()  # type: ignore  # noqa: PGH003
+cast(Any, retrieval)._load_model2vec_model = lambda _name: _DummyModel2Vec()
 
 
-#: Regular expression matching terminal escape sequences.
-ESCAPES = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]")
-
-#: Regular expression matching un-sandboxed external URLs or remote assets.
-EXTERNAL_REFERENCE_PATTERN = re.compile(r"https?://|<link[ >]|<script[^>]+src=")
+# ==============================================================================
+# 2. Pytest Hooks & Session Lifecycle
+# ==============================================================================
 
 
-@pytest.fixture(scope="session")
-def external_reference_re() -> re.Pattern[str]:
-    """Provide regex pattern matching external network references and scripts."""
-    return EXTERNAL_REFERENCE_PATTERN
+def pytest_addoption(parser: pytest.Parser) -> None:
+    """Register custom CLI options for integration tests."""
+    parser.addoption(
+        "--integration",
+        action="store_true",
+        default=False,
+        help="Run integration tests marked with @pytest.mark.integration",
+    )
 
 
-SKILL_TEMPLATE = """\
----
-name: {name}
-metadata:
-  category: {category}
-description: >-
-  {description}
----
+def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    """Conditionally skip integration tests unless explicitly requested."""
+    if config.getoption("--integration"):
+        return
 
-# {name}
-"""
+    markexpr = config.getoption("markexpr", "")
+    if "integration" in markexpr:
+        return
+
+    args = config.args or []
+    if any("integration" in arg for arg in args):
+        return
+
+    skip_integration = pytest.mark.skip(
+        reason="Integration test: use --integration, -m integration, or target file to run",
+    )
+    for item in items:
+        if "integration" in item.keywords:
+            item.add_marker(skip_integration)
+
+
+def _clean_repo_reach_dir(session: pytest.Session) -> None:
+    """Clean any .reach directory from the repository root for the controller process."""
+    if not hasattr(session.config, "workerinput"):
+        reach = Path(getattr(session.config, "rootpath", Path.cwd())) / ".reach"
+        if reach.exists():
+            shutil.rmtree(reach, ignore_errors=True)
+
+
+def pytest_sessionstart(session: pytest.Session) -> None:
+    """Clean any existing .reach directory before test execution begins."""
+    _clean_repo_reach_dir(session)
+
+
+def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
+    """Ensure no .reach directory leaks into the repository root after tests complete."""
+    _clean_repo_reach_dir(session)
+
+
+# ==============================================================================
+# 3. Skill & Corpus Fixtures
+# ==============================================================================
+
+
+def format_skill_markdown(
+    name: str,
+    description: str,
+    body: str | None = None,
+    category: str | None = None,
+) -> str:
+    """Format standard SKILL.md markdown text with YAML frontmatter."""
+    meta_line = f"metadata:\n  category: {category}\n" if category else ""
+    body_content = f"\n{body}\n" if body is not None else f"\n# {name}\n"
+    return f"---\nname: {name}\n{meta_line}description: >-\n  {description}\n---\n{body_content}"
 
 
 @pytest.fixture
@@ -214,11 +184,7 @@ def skill_repo(tmp_path: Path) -> Path:
         directory = root / category.lower() / name
         directory.mkdir(parents=True)
         (directory / "SKILL.md").write_text(
-            SKILL_TEMPLATE.format(
-                name=name,
-                category=category,
-                description=description,
-            ),
+            format_skill_markdown(name=name, category=category, description=description),
             encoding="utf-8",
         )
     return root
@@ -234,11 +200,7 @@ def make_skill_root(tmp_path: Path) -> Callable[[str, Mapping[str, str]], Path]:
             directory = root / name
             directory.mkdir(parents=True, exist_ok=True)
             (directory / "SKILL.md").write_text(
-                SKILL_TEMPLATE.format(
-                    name=name,
-                    category="Storage",
-                    description=description,
-                ),
+                format_skill_markdown(name=name, category="Storage", description=description),
                 encoding="utf-8",
             )
         root.mkdir(parents=True, exist_ok=True)
@@ -254,6 +216,7 @@ def make_skill() -> Callable[..., Skill]:
     def build(
         name: str,
         description: str,
+        *,
         model_invocable: bool = True,
         path: Path | None = None,
     ) -> Skill:
@@ -287,7 +250,7 @@ def write_skill(tmp_path: Path) -> Callable[..., Path]:
             manifest.write_text(raw_yaml, encoding="utf-8")
         else:
             manifest.write_text(
-                f"---\nname: {name}\ndescription: >-\n  {description}\n---\n\n{body}\n",
+                format_skill_markdown(name=name, description=description, body=body),
                 encoding="utf-8",
             )
         return skill_dir
@@ -307,6 +270,7 @@ def write_skill_model(write_skill: Callable[..., Path]) -> Callable[..., Skill]:
         raw_yaml: str | None = None,
         dir_name: str | None = None,
         path: Path | None = None,
+        *,
         model_invocable: bool = True,
     ) -> Skill:
         skill_dir = write_skill(
@@ -326,103 +290,6 @@ def write_skill_model(write_skill: Callable[..., Path]) -> Callable[..., Skill]:
         )
 
     return _create
-
-
-@pytest.fixture
-def write_queries(tmp_path: Path) -> Callable[..., Path]:
-    """Write a synthetic query dataset to disk and return its path."""
-
-    def _create(
-        target: str = "test-skill",
-        count: int = 4,
-        filename: str = "queries.json",
-        root: Path | None = None,
-        catalog_id: str = "test-cat",
-        queries: Sequence[Query | dict[str, Any]] | None = None,
-    ) -> Path:
-        q_dir = root or tmp_path
-        q_dir.mkdir(parents=True, exist_ok=True)
-        path = q_dir / filename
-        if queries is not None:
-            if queries and isinstance(queries[0], dict):
-                path.write_text(
-                    json.dumps(
-                        {
-                            "catalog_id": catalog_id,
-                            "queries": queries,
-                            "provenance": {"origin": "authored"},
-                        }
-                    ),
-                    encoding="utf-8",
-                )
-            else:
-                qs = QuerySet(
-                    catalog_id=catalog_id,
-                    queries=tuple(queries),  # type: ignore[arg-type]
-                    provenance=QuerySetProvenance(origin=Origin.AUTHORED),
-                )
-                path.write_text(qs.model_dump_json(indent=2), encoding="utf-8")
-        else:
-            q_list = [
-                Query(id=f"q-{i}", text=f"Sample query {i} for {target}", expected_skill=target)
-                for i in range(count)
-            ]
-            qs = QuerySet(
-                catalog_id=catalog_id,
-                queries=tuple(q_list),
-                provenance=QuerySetProvenance(origin=Origin.AUTHORED),
-            )
-            path.write_text(qs.model_dump_json(indent=2), encoding="utf-8")
-        return path
-
-    return _create
-
-
-@pytest.fixture
-def mock_subprocess(
-    monkeypatch: pytest.MonkeyPatch,
-) -> Callable[..., Callable[..., subprocess.CompletedProcess[str]]]:
-    """Mock subprocess.run with canned stdout, stderr, return codes, or handlers."""
-
-    def _mock(
-        stdout: str = "",
-        stderr: str = "",
-        returncode: int = 0,
-        side_effect: Exception | None = None,
-        handler: Callable[..., subprocess.CompletedProcess[str]] | None = None,
-        lines: Sequence[str] | None = None,
-    ) -> Callable[..., subprocess.CompletedProcess[str]]:
-        out = "\n".join(lines) if lines is not None else stdout
-
-        def _run(cmd: Any, *args: Any, **kwargs: Any) -> subprocess.CompletedProcess[str]:
-            if side_effect is not None:
-                raise side_effect
-            if handler is not None:
-                return handler(cmd, *args, **kwargs)
-            return subprocess.CompletedProcess(
-                args=cmd,
-                returncode=returncode,
-                stdout=out,
-                stderr=stderr,
-            )
-
-        monkeypatch.setattr(subprocess, "run", _run)
-        return _run
-
-    return _mock
-
-
-BODIED_SKILL_TEMPLATE = """\
----
-name: {name}
-description: >-
-  {description}
----
-
-# {name}
-
-{body}
-"""
 
 
 @dataclass(slots=True)
@@ -478,12 +345,9 @@ class SyntheticCorpusBuilder:
         for q in self._queued:
             directory = root / q.name if q.path is None else q.path
             directory.mkdir(parents=True, exist_ok=True)
+            body = f"# {q.name}\n\n{q.body}".rstrip() if q.body else f"# {q.name}"
             text = (
-                BODIED_SKILL_TEMPLATE.format(
-                    name=q.name,
-                    description=q.description,
-                    body=q.body,
-                )
+                format_skill_markdown(name=q.name, description=q.description, body=body)
                 if q.text is None
                 else q.text
             )
@@ -500,6 +364,79 @@ def corpus_builder() -> type[SyntheticCorpusBuilder]:
     """Return the SyntheticCorpusBuilder class as a test fixture."""
     return SyntheticCorpusBuilder
 
+
+@pytest.fixture
+def corpus(skill_repo: Path) -> list[Skill]:
+    """Load skill models from synthetic skill repository."""
+    return load_skills(skill_repo)
+
+
+@pytest.fixture
+def resident_names() -> tuple[str, ...]:
+    """Provide a canonical resident skills name list for runtime parser tests."""
+    return ("cloud-deploy", "pizza-calculator", "database-migrate")
+
+
+@pytest.fixture
+def synthetic_skills_repo(tmp_path: Path) -> Path:
+    """Build a self-contained synthetic skill catalog for end-to-end CLI testing."""
+    builder = SyntheticCorpusBuilder()
+    builder.add(
+        "cloud-run-basics",
+        "Deploy and scale containerized web applications and microservices on Cloud Run.",
+        body=(
+            "Use Cloud Run to run stateless HTTP containers.\n"
+            "Configure CPU, memory, concurrency limits, and environment variables.\n"
+            "Integrate with Cloud Build for automatic continuous deployment."
+        ),
+    )
+    builder.add(
+        "cloud-sql-basics",
+        "Manage relational databases using Cloud SQL including Postgres and MySQL.",
+        body=(
+            "Provision managed database instances, configure automated backups,\n"
+            "and establish secure private IP connectivity for relational workloads."
+        ),
+    )
+    builder.add(
+        "gke-basics",
+        "Deploy, manage, and scale containerized workloads on Google Kubernetes Engine.",
+        body=(
+            "Manage Kubernetes clusters, configure node pools, deployments, and pods.\n"
+            "Monitor container resource utilization and cluster autoscaling."
+        ),
+    )
+    builder.add(
+        "gke-networking",
+        "Configure GKE cluster networking, Gateway API, Ingress, and service routing.",
+        body=(
+            "Set up Gateway resources, HTTPRoute rules, load balancer attachments,\n"
+            "and Private Service Connect for multi-cluster networking."
+        ),
+    )
+    builder.add(
+        "cloud-storage-basics",
+        "Store and retrieve unstructured files and objects in Cloud Storage buckets.",
+        body=(
+            "Create buckets, manage object lifecycle rules, configure retention locks,\n"
+            "and generate signed URLs for secure temporary file downloads."
+        ),
+    )
+    builder.add(
+        "cloud-storage-fuse",
+        "Mount Cloud Storage buckets as local file systems using Cloud Storage FUSE.",
+        body=(
+            "Mount GCS buckets to local directory mount points on Linux and GKE nodes\n"
+            "for POSIX-like file access to object storage."
+        ),
+    )
+    root = tmp_path / "synthetic_skills"
+    return builder.build_disk(root)
+
+
+# ==============================================================================
+# 4. Query & Dataset Fixtures
+# ==============================================================================
 
 _DEFAULT_QUERIES: tuple[Query, ...] = (
     Query(
@@ -521,6 +458,21 @@ _DEFAULT_QUERIES: tuple[Query, ...] = (
 def queries() -> list[Query]:
     """Return labeled queries covering implicit and neighbor negative cases."""
     return list(_DEFAULT_QUERIES)
+
+
+@pytest.fixture
+def query_file(
+    tmp_path: Path,
+    queries: list[Query],
+    write_queries: Callable[..., Path],
+) -> Path:
+    """Write synthetic query set to temporary file and return path."""
+    return write_queries(
+        root=tmp_path,
+        catalog_id="neighborhood:gcs-lifecycle-rules",
+        queries=queries,
+        filename="queries.json",
+    )
 
 
 _DEFAULT_EXCHANGE_QUERIES: tuple[Query, ...] = (
@@ -564,6 +516,116 @@ def exchange_set(exchange_queries: tuple[Query, ...]) -> QuerySet:
         queries=exchange_queries,
         provenance=QuerySetProvenance(origin=Origin.AUTHORED),
     )
+
+
+@pytest.fixture
+def write_queries(tmp_path: Path) -> Callable[..., Path]:
+    """Write a synthetic query dataset to disk and return its path."""
+
+    def _create(
+        target: str = "test-skill",
+        count: int = 4,
+        filename: str = "queries.json",
+        root: Path | None = None,
+        catalog_id: str = "test-cat",
+        queries: Sequence[Query | dict[str, Any]] | None = None,
+        notes: str = "",
+        tool_version: str = "",
+    ) -> Path:
+        q_dir = root or tmp_path
+        q_dir.mkdir(parents=True, exist_ok=True)
+        path = q_dir / filename
+
+        if queries is not None and queries and isinstance(queries[0], dict):
+            payload = json.dumps(
+                {
+                    "catalog_id": catalog_id,
+                    "queries": queries,
+                    "provenance": {"origin": "authored"},
+                },
+            )
+            path.write_text(payload, encoding="utf-8")
+        else:
+            q_list = (
+                tuple(queries)  # type: ignore[arg-type]
+                if queries is not None
+                else tuple(
+                    Query(
+                        id=f"q-{i}",
+                        text=f"Sample query {i} for {target}",
+                        expected_skill=target,
+                    )
+                    for i in range(count)
+                )
+            )
+            qs = QuerySet(
+                catalog_id=catalog_id,
+                notes=notes,
+                queries=q_list,
+                provenance=QuerySetProvenance(
+                    origin=Origin.AUTHORED,
+                    tool_version=tool_version,
+                ),
+            )
+            save_query_set(qs, path)
+
+        return path
+
+    return _create
+
+
+@pytest.fixture
+def synthetic_query_file(tmp_path: Path, write_queries: Callable[..., Path]) -> Path:
+    """Write a synthetic query set targeting skills in synthetic_skills_repo."""
+    queries = (
+        Query(
+            id="q-run-1",
+            text="How do I deploy a containerized service to Cloud Run?",
+            expected_skill="cloud-run-basics",
+        ),
+        Query(
+            id="q-run-2",
+            text="Can I set concurrency limits on my Cloud Run service?",
+            expected_skill="cloud-run-basics",
+        ),
+    )
+    return write_queries(
+        root=tmp_path,
+        catalog_id="neighborhood:cloud-run-basics",
+        notes="Self-contained synthetic query set",
+        queries=queries,
+        tool_version=metadata.version("skill-reach"),
+        filename="synthetic_queries.json",
+    )
+
+
+@pytest.fixture
+def synthetic_citations_file(synthetic_query_file: Path) -> Path:
+    """Write a companion citations trail file for synthetic_query_file."""
+    from reach.generate import Citation, CitationTrail, citations_path
+
+    cpath = citations_path(synthetic_query_file)
+    trail = CitationTrail(
+        root=(
+            Citation(
+                skill="cloud-run-basics",
+                text="How do I deploy a containerized service to Cloud Run?",
+                citation="Use Cloud Run to run stateless HTTP containers.",
+            ),
+            Citation(
+                skill="cloud-run-basics",
+                text="Can I set concurrency limits on my Cloud Run service?",
+                citation="Configure CPU, memory, concurrency limits, and environment variables.",
+            ),
+        ),
+    )
+    cpath.write_text(trail.model_dump_json(indent=2), encoding="utf-8")
+    return cpath
+
+
+# ==============================================================================
+# 5. Runtime & Stream Simulation Fixtures
+# ==============================================================================
 
 
 def stream_lines(
@@ -619,15 +681,16 @@ def stream_lines(
 
 
 @pytest.fixture
-def resident_names() -> tuple[str, ...]:
-    """Provide a canonical resident skills name list for runtime parser tests."""
-    return ("cloud-deploy", "pizza-calculator", "database-migrate")
-
-
-@pytest.fixture
 def make_stream() -> Callable[..., list[str]]:
     """Return factory function generating mock stream lines."""
     return stream_lines
+
+
+@pytest.fixture
+def real_stream() -> list[str]:
+    """Return recorded real stream lines from test fixture file."""
+    path = Path(__file__).parent / "fixtures" / "real_stream.jsonl"
+    return path.read_text(encoding="utf-8").splitlines()
 
 
 @pytest.fixture
@@ -637,15 +700,195 @@ def make_runtime() -> type[FakeRuntime]:
 
 
 @pytest.fixture
+def fake_runtime() -> FakeRuntime:
+    """Provide a fresh FakeRuntime test fixture."""
+    return FakeRuntime()
+
+
+@pytest.fixture
+def fake_generator() -> FakeGenerator:
+    """Provide a fresh FakeGenerator test fixture."""
+    return FakeGenerator()
+
+
+@pytest.fixture
 def answering_runtime(queries: list[Query]) -> FakeRuntime:
     """Return FakeRuntime pre-configured to answer expected skill for each query."""
     return FakeRuntime({q.text: q.expected_skill for q in queries})
 
 
 @pytest.fixture
-def corpus(skill_repo: Path) -> list[Skill]:
-    """Load skill models from synthetic skill repository."""
-    return load_skills(skill_repo)
+def mock_subprocess(
+    monkeypatch: pytest.MonkeyPatch,
+) -> Callable[..., Callable[..., subprocess.CompletedProcess[str]]]:
+    """Mock subprocess.run with canned stdout, stderr, return codes, or handlers."""
+
+    def _mock(
+        stdout: str = "",
+        stderr: str = "",
+        returncode: int = 0,
+        side_effect: Exception | None = None,
+        handler: Callable[..., subprocess.CompletedProcess[str]] | None = None,
+        lines: Sequence[str] | None = None,
+    ) -> Callable[..., subprocess.CompletedProcess[str]]:
+        out = "\n".join(lines) if lines is not None else stdout
+
+        def _run(cmd: Any, *args: Any, **kwargs: Any) -> subprocess.CompletedProcess[str]:
+            if side_effect is not None:
+                raise side_effect
+            if handler is not None:
+                return handler(cmd, *args, **kwargs)
+            return subprocess.CompletedProcess(
+                args=cmd,
+                returncode=returncode,
+                stdout=out,
+                stderr=stderr,
+            )
+
+        monkeypatch.setattr(subprocess, "run", _run)
+        return _run
+
+    return _mock
+
+
+# ==============================================================================
+# 6. Evaluation, Artifact & Metric Verification Fixtures
+# ==============================================================================
+
+
+@pytest.fixture
+def make_result() -> Callable[..., ProbeResult]:
+    """Return factory function creating ProbeResult models with default catalog parameters."""
+
+    def _make(
+        query_id: str,
+        invoked: str | None,
+        attempt: int = 1,
+        error: str | None = None,
+        fingerprint: str = "",
+        condition: str = "",
+        queries: str = "",
+        reasoning: tuple[str, ...] = (),
+        runtime: str = "fake",
+    ) -> ProbeResult:
+        return ProbeResult(
+            query_id=query_id,
+            catalog_id="fixture",
+            catalog_mode=CatalogMode.ALL,
+            catalog_size=4,
+            model="sonnet",
+            runtime=runtime,
+            attempt=attempt,
+            invoked_skills=(invoked,) if invoked is not None else (),
+            error=error,
+            config_fingerprint=fingerprint,
+            condition_digest=condition,
+            queries_digest=queries,
+            reasoning=reasoning,
+        )
+
+    return _make
+
+
+@pytest.fixture
+def make_paired_results() -> Callable[
+    ...,
+    tuple[list[ProbeResult], list[ProbeResult], list[Query]],
+]:
+    """Provide a factory creating paired baseline and scaled ProbeResult sequences."""
+
+    def _make_paired(
+        both_pass: int = 0,
+        both_fail: int = 0,
+        ctx_loss: int = 0,
+        shd_loss: int = 0,
+        attempts: int = 1,
+    ) -> tuple[list[ProbeResult], list[ProbeResult], list[Query]]:
+        baseline_results: list[ProbeResult] = []
+        scaled_results: list[ProbeResult] = []
+        queries: list[Query] = []
+
+        categories = (
+            (
+                both_pass,
+                "pass",
+                "Both pass query",
+                ("skill-a",),
+                InvocationPattern.ORACLE_ONLY,
+                ("skill-a",),
+                InvocationPattern.ORACLE_ONLY,
+            ),
+            (
+                both_fail,
+                "fail",
+                "Both fail query",
+                (),
+                InvocationPattern.ABANDONED,
+                (),
+                InvocationPattern.ABANDONED,
+            ),
+            (
+                ctx_loss,
+                "ctx",
+                "Context loss query",
+                ("skill-a",),
+                InvocationPattern.ORACLE_ONLY,
+                (),
+                InvocationPattern.ABANDONED,
+            ),
+            (
+                shd_loss,
+                "shd",
+                "Shadowing loss query",
+                ("skill-a",),
+                InvocationPattern.ORACLE_ONLY,
+                ("distractor",),
+                InvocationPattern.DISTRACTOR_HIJACK,
+            ),
+        )
+
+        for count, prefix, label, base_inv, base_pat, scaled_inv, scaled_pat in categories:
+            for i in range(count):
+                qid = f"q-{prefix}-{i}"
+                queries.append(
+                    Query(
+                        id=qid,
+                        text=f"{label} {i}",
+                        kind=QueryKind.IMPLICIT,
+                        expected_skill="skill-a",
+                    ),
+                )
+                for a in range(1, attempts + 1):
+                    baseline_results.append(
+                        ProbeResult(
+                            query_id=qid,
+                            catalog_id="baseline",
+                            catalog_mode=CatalogMode.SINGLETON,
+                            catalog_size=1,
+                            model="mock-model",
+                            runtime="fake",
+                            attempt=a,
+                            invoked_skills=base_inv,
+                            invocation_pattern=base_pat,
+                        ),
+                    )
+                    scaled_results.append(
+                        ProbeResult(
+                            query_id=qid,
+                            catalog_id="scaled",
+                            catalog_mode=CatalogMode.SWEEP,
+                            catalog_size=10,
+                            model="mock-model",
+                            runtime="fake",
+                            attempt=a,
+                            invoked_skills=scaled_inv,
+                            invocation_pattern=scaled_pat,
+                        ),
+                    )
+
+        return baseline_results, scaled_results, queries
+
+    return _make_paired
 
 
 @pytest.fixture
@@ -703,119 +946,6 @@ def artifact(
         ),
         whole_catalog_results,
     )
-
-
-@pytest.fixture
-def query_file(tmp_path: Path, queries: list[Query]) -> Path:
-    """Write synthetic query set to temporary file and return path."""
-    path = tmp_path / "queries.json"
-    payload = QuerySet(
-        catalog_id="neighborhood:gcs-lifecycle-rules",
-        queries=tuple(queries),
-        provenance=QuerySetProvenance(origin=Origin.AUTHORED),
-    )
-    path.write_text(payload.model_dump_json(), encoding="utf-8")
-    return path
-
-
-@pytest.fixture
-def make_config(skill_repo: Path, query_file: Path, tmp_path: Path):
-    """Return factory function generating test RunConfig instances."""
-
-    def _make(**overrides) -> RunConfig:
-        study = {
-            "skills": skill_repo,
-            "queries": query_file,
-            "workdir": tmp_path / "work",
-            "partial": True,
-            **overrides.pop("study", {}),
-        }
-        runtime = {"agent": "fake", **overrides.pop("runtime", {})}
-        catalog = {"size": 3, "rivals": 2, **overrides.pop("catalog", {})}
-        plan = {"attempts": 1, "backoff_s": 0.0, **overrides.pop("plan", {})}
-        return RunConfig.model_validate(
-            {
-                "study": study,
-                "runtime": runtime,
-                "catalog": catalog,
-                "plan": plan,
-                **overrides,
-            },
-        )
-
-    return _make
-
-
-@pytest.fixture
-def make_console() -> Callable[..., tuple[object, io.StringIO]]:
-    """Return factory function generating Console instances writing to StringIO buffers."""
-
-    def _make(
-        *,
-        terminal: bool = True,
-        quiet: bool = False,
-        width: int = 100,
-    ) -> tuple[object, io.StringIO]:
-        buffer = io.StringIO()
-        console = build_console(
-            file=buffer,
-            width=width,
-            force_terminal=terminal,
-            quiet=quiet,
-        )
-        return console, buffer
-
-    return _make
-
-
-@pytest.fixture
-def wide(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Set terminal width environment variable to 200 columns for test consistency."""
-    monkeypatch.setenv("COLUMNS", "200")
-
-
-@pytest.fixture
-def rendered() -> Callable[[io.StringIO], str]:
-    """Return helper function stripping ANSI escape sequences from buffer text."""
-
-    def _rendered(buffer: io.StringIO) -> str:
-        return ESCAPES.sub("", buffer.getvalue())
-
-    return _rendered
-
-
-@pytest.fixture
-def make_result() -> Callable[..., ProbeResult]:
-    """Return factory function creating ProbeResult models with default catalog parameters."""
-
-    def _make(
-        query_id: str,
-        invoked: str | None,
-        attempt: int = 1,
-        error: str | None = None,
-        fingerprint: str = "",
-        condition: str = "",
-        queries: str = "",
-        reasoning: tuple[str, ...] = (),
-        runtime: str = "fake",
-    ) -> ProbeResult:
-        return ProbeResult(
-            query_id=query_id,
-            catalog_id="fixture",
-            catalog_mode=CatalogMode.ALL,
-            catalog_size=4,
-            model="sonnet",
-            runtime=runtime,
-            attempt=attempt,
-            invoked_skills=(invoked,) if invoked is not None else (),
-            error=error,
-            config_fingerprint=fingerprint,
-            condition_digest=condition,
-            queries_digest=queries,
-            reasoning=reasoning,
-        )
-
-    return _make
 
 
 #: Ground truth query specifications for standard metric verification tests.
@@ -915,120 +1045,133 @@ def record_arm(
     return _record
 
 
-@pytest.fixture
-def real_stream() -> list[str]:
-    """Return recorded real stream lines from test fixture file."""
-    path = Path(__file__).parent / "fixtures" / "real_stream.jsonl"
-    return path.read_text(encoding="utf-8").splitlines()
+@pytest.fixture(scope="session")
+def matches_sklearn() -> Callable[..., None]:
+    """Provide a helper verifying Reach metrics against scikit-learn implementations."""
+
+    def _assert(results: Any, queries: Any, labels: Any = None) -> None:
+        y_true, y_pred = labeled_pairs(results, queries)
+        report = classification_report(results, queries, labels=labels)
+        universe = list(labels) if labels else sorted(set(y_true) | set(y_pred))
+        kwargs: dict[str, Any] = {
+            "labels": universe,
+            "average": "macro",
+            "zero_division": 0,
+        }
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            warnings.simplefilter("ignore", UndefinedMetricWarning)
+            accuracy = accuracy_score(y_true, y_pred)
+            macro = (
+                precision_score(y_true, y_pred, **kwargs),
+                recall_score(y_true, y_pred, **kwargs),
+                f1_score(y_true, y_pred, **kwargs),
+            )
+            precisions, recalls, f1s, supports = cast(
+                "tuple[Sequence[float], Sequence[float], Sequence[float], Sequence[int]]",
+                precision_recall_fscore_support(
+                    y_true,
+                    y_pred,
+                    labels=universe,
+                    average=None,
+                    zero_division=0,
+                ),
+            )
+            matrix = confusion_matrix(y_true, y_pred, labels=universe)
+
+        assert report.top1_accuracy == pytest.approx(accuracy)
+        assert report.macro_precision == pytest.approx(macro[0])
+        assert report.macro_recall == pytest.approx(macro[1])
+        assert report.macro_f1 == pytest.approx(macro[2])
+
+        for entry, p, r, f, s in zip(
+            report.per_class,
+            precisions,
+            recalls,
+            f1s,
+            supports,
+            strict=True,
+        ):
+            assert entry.precision == pytest.approx(p), entry.label
+            assert entry.recall == pytest.approx(r), entry.label
+            assert entry.f1 == pytest.approx(f), entry.label
+            assert entry.support == s, entry.label
+
+        ours = confusion(results, queries)
+        for i, truth in enumerate(universe):
+            for j, predicted in enumerate(universe):
+                key = (truth, None if predicted == NO_SKILL else predicted)
+                assert ours[key] == matrix[i][j], f"{truth} -> {predicted}"
+
+    return _assert
+
+
+@pytest.fixture(scope="session")
+def bm25s_reference() -> Callable[
+    [Sequence[Skill]],
+    Callable[[Sequence[str]], list[float]],
+]:
+    """Provide a factory creating bm25s query scorers for a given skill corpus."""
+
+    def _for_corpus(skills: Sequence[Skill]) -> Callable[[Sequence[str]], list[float]]:
+        engine = bm25s.BM25(k1=K1, b=B, method="lucene")
+        engine.index([tokenize(skill_text(s)) for s in skills])
+        return lambda query: list(engine.get_scores(list(query)))
+
+    return _for_corpus
+
+
+# ==============================================================================
+# 7. Configuration & Workspace Fixtures
+# ==============================================================================
 
 
 @pytest.fixture
-def synthetic_skills_repo(tmp_path: Path) -> Path:
-    """Build a self-contained synthetic skill catalog for end-to-end CLI testing."""
-    builder = SyntheticCorpusBuilder()
-    builder.add(
-        "cloud-run-basics",
-        "Deploy and scale containerized web applications and microservices on Cloud Run.",
-        body=(
-            "Use Cloud Run to run stateless HTTP containers.\n"
-            "Configure CPU, memory, concurrency limits, and environment variables.\n"
-            "Integrate with Cloud Build for automatic continuous deployment."
-        ),
-    )
-    builder.add(
-        "cloud-sql-basics",
-        "Manage relational databases using Cloud SQL including Postgres and MySQL.",
-        body=(
-            "Provision managed database instances, configure automated backups,\n"
-            "and establish secure private IP connectivity for relational workloads."
-        ),
-    )
-    builder.add(
-        "gke-basics",
-        "Deploy, manage, and scale containerized workloads on Google Kubernetes Engine.",
-        body=(
-            "Manage Kubernetes clusters, configure node pools, deployments, and pods.\n"
-            "Monitor container resource utilization and cluster autoscaling."
-        ),
-    )
-    builder.add(
-        "gke-networking",
-        "Configure GKE cluster networking, Gateway API, Ingress, and service routing.",
-        body=(
-            "Set up Gateway resources, HTTPRoute rules, load balancer attachments,\n"
-            "and Private Service Connect for multi-cluster networking."
-        ),
-    )
-    builder.add(
-        "cloud-storage-basics",
-        "Store and retrieve unstructured files and objects in Cloud Storage buckets.",
-        body=(
-            "Create buckets, manage object lifecycle rules, configure retention locks,\n"
-            "and generate signed URLs for secure temporary file downloads."
-        ),
-    )
-    builder.add(
-        "cloud-storage-fuse",
-        "Mount Cloud Storage buckets as local file systems using Cloud Storage FUSE.",
-        body=(
-            "Mount GCS buckets to local directory mount points on Linux and GKE nodes\n"
-            "for POSIX-like file access to object storage."
-        ),
-    )
-    root = tmp_path / "synthetic_skills"
-    return builder.build_disk(root)
+def make_config(skill_repo: Path, query_file: Path, tmp_path: Path) -> Callable[..., RunConfig]:
+    """Return factory function generating test RunConfig instances."""
+
+    def _make(**overrides: Any) -> RunConfig:
+        study = {
+            "skills": skill_repo,
+            "queries": query_file,
+            "workdir": tmp_path / "work",
+            "partial": True,
+            **overrides.pop("study", {}),
+        }
+        runtime = {"agent": "fake", **overrides.pop("runtime", {})}
+        catalog = {"size": 3, "rivals": 2, **overrides.pop("catalog", {})}
+        plan = {"attempts": 1, "backoff_s": 0.0, **overrides.pop("plan", {})}
+        return RunConfig.model_validate(
+            {
+                "study": study,
+                "runtime": runtime,
+                "catalog": catalog,
+                "plan": plan,
+                **overrides,
+            },
+        )
+
+    return _make
 
 
 @pytest.fixture
-def synthetic_query_file(tmp_path: Path) -> Path:
-    """Write a synthetic query set targeting skills in synthetic_skills_repo."""
-    path = tmp_path / "synthetic_queries.json"
-    dataset = QuerySet(
-        catalog_id="neighborhood:cloud-run-basics",
-        notes="Self-contained synthetic query set",
-        provenance=QuerySetProvenance(
-            origin=Origin.AUTHORED,
-            tool_version=metadata.version("skill-reach"),
-        ),
-        queries=(
-            Query(
-                id="q-run-1",
-                text="How do I deploy a containerized service to Cloud Run?",
-                expected_skill="cloud-run-basics",
-            ),
-            Query(
-                id="q-run-2",
-                text="Can I set concurrency limits on my Cloud Run service?",
-                expected_skill="cloud-run-basics",
-            ),
-        ),
-    )
-    save_query_set(dataset, path)
-    return path
+def write_reach_toml(tmp_path: Path) -> Callable[..., Path]:
+    """Write a custom reach.toml configuration file in tmp_path or a target directory."""
 
+    def _write(
+        content: str,
+        filename: str = "reach.toml",
+        *,
+        directory: Path | None = None,
+    ) -> Path:
+        target_dir = tmp_path if directory is None else directory
+        path = target_dir / filename
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(textwrap.dedent(content), encoding="utf-8")
+        return path
 
-@pytest.fixture
-def synthetic_citations_file(synthetic_query_file: Path) -> Path:
-    """Write a companion citations trail file for synthetic_query_file."""
-    from reach.generate import Citation, CitationTrail, citations_path
-
-    cpath = citations_path(synthetic_query_file)
-    trail = CitationTrail(
-        root=(
-            Citation(
-                skill="cloud-run-basics",
-                text="How do I deploy a containerized service to Cloud Run?",
-                citation="Use Cloud Run to run stateless HTTP containers.",
-            ),
-            Citation(
-                skill="cloud-run-basics",
-                text="Can I set concurrency limits on my Cloud Run service?",
-                citation=("Configure CPU, memory, concurrency limits, and environment variables."),
-            ),
-        ),
-    )
-    cpath.write_text(trail.model_dump_json(indent=2), encoding="utf-8")
-    return cpath
+    return _write
 
 
 FAKE_REGISTRY_TOML = """\
@@ -1063,161 +1206,6 @@ def fake_registry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     config_file.write_text(FAKE_REGISTRY_TOML, encoding="utf-8")
     monkeypatch.chdir(tmp_path)
     return config_file
-
-
-@pytest.fixture
-def fake_runtime() -> FakeRuntime:
-    """Provide a fresh FakeRuntime test fixture."""
-    return FakeRuntime()
-
-
-@pytest.fixture
-def fake_generator() -> FakeGenerator:
-    """Provide a fresh FakeGenerator test fixture."""
-    return FakeGenerator()
-
-
-@pytest.fixture
-def write_reach_toml(tmp_path: Path) -> Callable[[str], Path]:
-    """Write a custom reach.toml configuration file in tmp_path."""
-
-    def _write(content: str, filename: str = "reach.toml") -> Path:
-        path = tmp_path / filename
-        path.write_text(content, encoding="utf-8")
-        return path
-
-    return _write
-
-
-@pytest.fixture
-def make_paired_results() -> Callable[
-    ..., tuple[list[ProbeResult], list[ProbeResult], list[Query]]
-]:
-    """Provide a factory creating paired baseline and scaled ProbeResult sequences."""
-
-    def _make_paired(
-        both_pass: int = 0,
-        both_fail: int = 0,
-        ctx_loss: int = 0,
-        shd_loss: int = 0,
-        attempts: int = 1,
-    ) -> tuple[list[ProbeResult], list[ProbeResult], list[Query]]:
-        baseline_results: list[ProbeResult] = []
-        scaled_results: list[ProbeResult] = []
-        queries: list[Query] = []
-
-        categories = (
-            (
-                both_pass,
-                "pass",
-                "Both pass query",
-                ("skill-a",),
-                InvocationPattern.ORACLE_ONLY,
-                ("skill-a",),
-                InvocationPattern.ORACLE_ONLY,
-            ),
-            (
-                both_fail,
-                "fail",
-                "Both fail query",
-                (),
-                InvocationPattern.ABANDONED,
-                (),
-                InvocationPattern.ABANDONED,
-            ),
-            (
-                ctx_loss,
-                "ctx",
-                "Context loss query",
-                ("skill-a",),
-                InvocationPattern.ORACLE_ONLY,
-                (),
-                InvocationPattern.ABANDONED,
-            ),
-            (
-                shd_loss,
-                "shd",
-                "Shadowing loss query",
-                ("skill-a",),
-                InvocationPattern.ORACLE_ONLY,
-                ("distractor",),
-                InvocationPattern.DISTRACTOR_HIJACK,
-            ),
-        )
-
-        for count, prefix, label, base_inv, base_pat, scaled_inv, scaled_pat in categories:
-            for i in range(count):
-                qid = f"q-{prefix}-{i}"
-                queries.append(
-                    Query(
-                        id=qid,
-                        text=f"{label} {i}",
-                        kind=QueryKind.IMPLICIT,
-                        expected_skill="skill-a",
-                    )
-                )
-                for a in range(1, attempts + 1):
-                    baseline_results.append(
-                        ProbeResult(
-                            query_id=qid,
-                            catalog_id="baseline",
-                            catalog_mode=CatalogMode.SINGLETON,
-                            catalog_size=1,
-                            model="mock-model",
-                            runtime="fake",
-                            attempt=a,
-                            invoked_skills=base_inv,
-                            invocation_pattern=base_pat,
-                        )
-                    )
-                    scaled_results.append(
-                        ProbeResult(
-                            query_id=qid,
-                            catalog_id="scaled",
-                            catalog_mode=CatalogMode.SWEEP,
-                            catalog_size=10,
-                            model="mock-model",
-                            runtime="fake",
-                            attempt=a,
-                            invoked_skills=scaled_inv,
-                            invocation_pattern=scaled_pat,
-                        )
-                    )
-
-        return baseline_results, scaled_results, queries
-
-    return _make_paired
-
-
-def pytest_addoption(parser: pytest.Parser) -> None:
-    """Register custom CLI options for integration tests."""
-    parser.addoption(
-        "--integration",
-        action="store_true",
-        default=False,
-        help="Run integration tests marked with @pytest.mark.integration",
-    )
-
-
-def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
-    """Conditionally skip integration tests unless explicitly requested."""
-    if config.getoption("--integration"):
-        return
-
-    markexpr = config.getoption("markexpr", "")
-    if "integration" in markexpr:
-        return
-
-    args = config.args or []
-    if any("integration" in arg for arg in args):
-        return
-
-    skip_integration = pytest.mark.skip(
-        reason="Integration test: use --integration, -m integration, or target file to run"
-    )
-    for item in items:
-        if "integration" in item.keywords:
-            item.add_marker(skip_integration)
 
 
 @dataclass(frozen=True)
@@ -1267,49 +1255,37 @@ def integration_workspace(tmp_path: Path) -> IntegrationWorkspace:
     skills_dir = root / "skills"
     skills_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1. Base skill: file-copier
-    (skills_dir / "file-copier").mkdir()
-    (skills_dir / "file-copier" / "SKILL.md").write_text(
-        "---\n"
-        "name: file-copier\n"
-        "description: Copy and synchronize files and directories across local paths.\n"
-        "metadata:\n"
-        "  category: filesystem\n"
-        "---\n\n"
-        "# File Copier\n"
-        "Instructions for copying files and directory structures.\n",
-        encoding="utf-8",
+    base_skills = (
+        (
+            "file-copier",
+            "Copy and synchronize files and directories across local paths.",
+            "# File Copier\nInstructions for copying files and directory structures.",
+        ),
+        (
+            "file-compressor",
+            "Compress and archive files into zip and tar formats.",
+            "# File Compressor\nInstructions for compressing and archiving files.",
+        ),
+        (
+            "file-deleter",
+            "Securely remove and shred files and directories from storage.",
+            "# File Deleter\nInstructions for deleting and shredding filesystem items.",
+        ),
     )
+    for name, desc, body in base_skills:
+        skill_dir = skills_dir / name
+        skill_dir.mkdir(parents=True, exist_ok=True)
+        (skill_dir / "SKILL.md").write_text(
+            format_skill_markdown(
+                name=name,
+                description=desc,
+                category="filesystem",
+                body=body,
+            ),
+            encoding="utf-8",
+        )
 
-    # 2. Base skill: file-compressor
-    (skills_dir / "file-compressor").mkdir()
-    (skills_dir / "file-compressor" / "SKILL.md").write_text(
-        "---\n"
-        "name: file-compressor\n"
-        "description: Compress and archive files into zip and tar formats.\n"
-        "metadata:\n"
-        "  category: filesystem\n"
-        "---\n\n"
-        "# File Compressor\n"
-        "Instructions for compressing and archiving files.\n",
-        encoding="utf-8",
-    )
-
-    # 3. Base skill: file-deleter
-    (skills_dir / "file-deleter").mkdir()
-    (skills_dir / "file-deleter" / "SKILL.md").write_text(
-        "---\n"
-        "name: file-deleter\n"
-        "description: Securely remove and shred files and directories from storage.\n"
-        "metadata:\n"
-        "  category: filesystem\n"
-        "---\n\n"
-        "# File Deleter\n"
-        "Instructions for deleting and shredding filesystem items.\n",
-        encoding="utf-8",
-    )
-
-    # 4. Companion queries.json dataset
+    # 2. Companion queries.json dataset
     queries_file = root / "queries.json"
     dataset = QuerySet(
         catalog_id="all",
@@ -1333,7 +1309,7 @@ def integration_workspace(tmp_path: Path) -> IntegrationWorkspace:
     )
     save_query_set(dataset, queries_file)
 
-    # 5. Hermetic reach.toml
+    # 3. Hermetic reach.toml
     config_file = root / "reach.toml"
     config_file.write_text(
         "[general]\n"
@@ -1367,6 +1343,66 @@ def empty_integration_workspace(tmp_path: Path) -> IntegrationWorkspace:
         queries_file=root / "queries.json",
         config_file=root / "reach.toml",
     )
+
+
+# ==============================================================================
+# 8. Console & Rendering Fixtures
+# ==============================================================================
+
+#: Regular expression matching terminal escape sequences.
+ESCAPES = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]")
+
+#: Regular expression matching un-sandboxed external URLs or remote assets.
+EXTERNAL_REFERENCE_PATTERN = re.compile(r"https?://|<link[ >]|<script[^>]+src=")
+
+
+@pytest.fixture(scope="session")
+def external_reference_re() -> re.Pattern[str]:
+    """Provide regex pattern matching external network references and scripts."""
+    return EXTERNAL_REFERENCE_PATTERN
+
+
+@pytest.fixture
+def make_console() -> Callable[..., tuple[object, io.StringIO]]:
+    """Return factory function generating Console instances writing to StringIO buffers."""
+
+    def _make(
+        *,
+        terminal: bool = True,
+        quiet: bool = False,
+        width: int = 100,
+    ) -> tuple[object, io.StringIO]:
+        buffer = io.StringIO()
+        console = build_console(
+            file=buffer,
+            width=width,
+            force_terminal=terminal,
+            quiet=quiet,
+        )
+        return console, buffer
+
+    return _make
+
+
+@pytest.fixture
+def wide(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Set terminal width environment variable to 200 columns for test consistency."""
+    monkeypatch.setenv("COLUMNS", "200")
+
+
+@pytest.fixture
+def rendered() -> Callable[[io.StringIO], str]:
+    """Return helper function stripping ANSI escape sequences from buffer text."""
+
+    def _rendered(buffer: io.StringIO) -> str:
+        return ESCAPES.sub("", buffer.getvalue())
+
+    return _rendered
+
+
+# ==============================================================================
+# 9. Remote Registry Mock Server Fixtures
+# ==============================================================================
 
 
 class MockRegistryHandler(BaseHTTPRequestHandler):
@@ -1404,7 +1440,7 @@ class MockRegistryHandler(BaseHTTPRequestHandler):
                         "message": "Service disabled",
                         "code": 403,
                         "details": [{"reason": "SERVICE_DISABLED"}],
-                    }
+                    },
                 },
             )
             return
@@ -1422,7 +1458,7 @@ class MockRegistryHandler(BaseHTTPRequestHandler):
         MockRegistryHandler.captured_params = params
         next_page = params.get("pageToken", [None])[0]
 
-        data: dict[str, Any]
+        data: dict[str, object]
         if next_page == "page-2":
             data = {
                 "skills": [
@@ -1431,8 +1467,8 @@ class MockRegistryHandler(BaseHTTPRequestHandler):
                         "displayName": "cloud-sql",
                         "description": "Manage database instances with Cloud SQL.",
                         "state": "STATE_ACTIVE",
-                    }
-                ]
+                    },
+                ],
             }
         elif "/paginated" in self.path:
             data = {
@@ -1442,7 +1478,7 @@ class MockRegistryHandler(BaseHTTPRequestHandler):
                         "displayName": "cloud-run",
                         "description": "Deploy containerized services with Cloud Run.",
                         "state": "STATE_ACTIVE",
-                    }
+                    },
                 ],
                 "nextPageToken": "page-2",
             }
@@ -1455,13 +1491,13 @@ class MockRegistryHandler(BaseHTTPRequestHandler):
                         "description": "Store files and objects in Cloud Storage.",
                         "state": "STATE_ACTIVE",
                         "skillId": "urn:skill:cloud.google.com:storage:basics",
-                    }
-                ]
+                    },
+                ],
             }
 
         self._send_json(200, data)
 
-    def _send_json(self, status: int, payload: Any) -> None:
+    def _send_json(self, status: int, payload: object) -> None:
         """Serialize and send JSON response."""
         content = json.dumps(payload).encode("utf-8")
         self.send_response(status)
@@ -1494,19 +1530,3 @@ def local_registry_server() -> Generator[str]:
 def registry_handler() -> type[MockRegistryHandler]:
     """Return the MockRegistryHandler class for inspecting captured requests."""
     return MockRegistryHandler
-
-
-def pytest_sessionstart(session: pytest.Session) -> None:
-    """Clean any existing .reach directory before test execution begins."""
-    if not hasattr(session.config, "workerinput"):
-        reach = Path.cwd() / ".reach"
-        if reach.exists():
-            shutil.rmtree(reach, ignore_errors=True)
-
-
-def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
-    """Ensure no .reach directory leaks into the repository root after tests complete."""
-    if not hasattr(session.config, "workerinput"):
-        reach = Path.cwd() / ".reach"
-        if reach.exists():
-            shutil.rmtree(reach, ignore_errors=True)

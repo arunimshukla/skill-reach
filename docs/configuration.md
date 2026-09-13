@@ -258,9 +258,17 @@ effort = "low"
 
 ### `[general]`
 
-| Key             | Type   | Default             | Description                                                       |
-| :-------------- | :----- | :------------------ | :---------------------------------------------------------------- |
-| `default_agent` | String | `"antigravity-cli"` | Default agent driver when `--agent` is omitted from CLI commands. |
+| Key             | Type   | Default             | Description                                                                                                                                       |
+| :-------------- | :----- | :------------------ | :------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `default_agent` | String | `"antigravity-cli"` | Default agent driver when `--agent` is omitted from CLI commands (`antigravity-cli`, `antigravity-sdk`, `claude-code`, `goose`, `pi`, `keyword`). |
+
+### `[discovery]`
+
+Controls directory and client skill store search precedence for auto-discovering skills.
+
+| Key          | Type            | Default                                                                               | Description                                            |
+| :----------- | :-------------- | :------------------------------------------------------------------------------------ | :----------------------------------------------------- |
+| `precedence` | Array of String | `[".", "skills", ".agents/skills", "claude-code", "cursor", "github", "pi", "goose"]` | Ordered search locations when resolving skill corpora. |
 
 ### `[study]`
 
@@ -326,14 +334,19 @@ Controls static frontmatter and budget thresholds.
 
 Default thresholds enforced by `reach check` in continuous integration.
 
-| Key            | Type    | Default    | Description                                                                  |
-| :------------- | :------ | :--------- | :--------------------------------------------------------------------------- |
-| `min_recall`   | Float   | `0.80`     | Fail gate if target skill recall drops below this threshold.                 |
-| `min_accuracy` | Float   | `0.80`     | Fail gate if overall routing accuracy drops below this threshold.            |
-| `max_misroute` | Float   | `0.10`     | Fail gate if queries misroute to competitor skills above this fraction.      |
-| `budget`       | Integer | `50`       | Maximum empirical probes executed during CI evaluations.                     |
-| `strict`       | Boolean | `true`     | When true, Stage 1 static lint warnings cause the check to exit with code 1. |
-| `since`        | String  | `"HEAD~1"` | Default git revision comparison target when `--changed` is passed.           |
+| Key                | Type    | Default    | Description                                                                  |
+| :----------------- | :------ | :--------- | :--------------------------------------------------------------------------- |
+| `min_recall`       | Float   | `0.80`     | Fail gate if target skill recall drops below this threshold.                 |
+| `min_accuracy`     | Float   | `0.80`     | Fail gate if overall routing accuracy drops below this threshold.            |
+| `max_misroute`     | Float   | `0.10`     | Fail gate if queries misroute to competitor skills above this fraction.      |
+| `min_entrypoint`   | Float   | `None`     | Fail gate if observed entrypoint accuracy drops below this threshold.        |
+| `min_reachability` | Float   | `None`     | Fail gate if observed trajectory reachability drops below this threshold.    |
+| `min_efficiency`   | Float   | `None`     | Fail gate if observed step efficiency MRR drops below this threshold.        |
+| `min_f1`           | Float   | `None`     | Fail gate if observed skill selection F1 score drops below this threshold.   |
+| `max_redundancy`   | Float   | `None`     | Fail gate if skill redundancy exceeds this fraction (excess calls).          |
+| `budget`           | Integer | `50`       | Maximum empirical probes executed during CI evaluations.                     |
+| `strict`           | Boolean | `true`     | When true, Stage 1 static lint warnings cause the check to exit with code 1. |
+| `since`            | String  | `"HEAD~1"` | Default git revision comparison target when `--changed` is passed.           |
 
 ### `[retrieval]`
 
@@ -381,7 +394,7 @@ Parameters for synthetic query drafting and leakage detection.
 | `top_rivals`            | Integer | `3`        | Maximum competitor skills injected into synthesis prompts.                |
 | `distinctive_idf_floor` | Float   | `0.693147` | Minimum IDF threshold ($\ln(2)$) for distinctive terms in leak detection. |
 
-### [optimize]
+### `[optimize]`
 
 Parameters for closed-loop skill description optimization.
 
@@ -398,7 +411,7 @@ Parameters for closed-loop skill description optimization.
 | `seed`              | Integer | `42`    | Pseudo-random seed for train/test query splitting and reproducible runs.      |
 | `review_timeout`    | Float   | `600.0` | Maximum timeout in seconds waiting for interactive browser query review.      |
 
-### [registry]
+### `[registry]`
 
 Parameters for Google Cloud Agent Registry integration.
 
@@ -416,19 +429,17 @@ Parameters for Google Cloud Agent Registry integration.
 Settings resolve in the following order (highest precedence wins):
 
 1. **Explicit CLI flags** (e.g. `--min-recall 0.90`)
-2. **Environment variables** (e.g. `REACH_MIN_RECALL=0.90`)
-3. **Project-local `reach.toml`** (in the current working directory, or specified by `--config`)
-4. **Bundled default `reach.toml`**
+2. **Project-local `reach.toml`** (in the current working directory, or specified by `--config`)
+3. **Bundled default `reach.toml`**
+
+Configuration values in `reach.toml` can also interpolate environment variables dynamically using `${VAR}` syntax (e.g. `skills = "${REACH_SKILL_ROOT}"`).
 
 ---
 
 ## Environment Variables
 
-| Variable      | Description                                                                                                   |
-| :------------ | :------------------------------------------------------------------------------------------------------------ |
-| `REACH_AGENT` | Default agent runtime to use (`claude-code`, `antigravity-cli`, `antigravity-sdk`, `goose`, `pi`, `keyword`). |
-
-| `REACH_SKILLS` | Default path to the local skills directory. |
-| `REACH_BUDGET` | Default empirical probe budget limit. |
+| Variable              | Description                                                                                       |
+| :-------------------- | :------------------------------------------------------------------------------------------------ |
+| `REACH_NO_BROWSER`    | Set to `"1"` or `"true"` to bypass interactive browser review for drafted queries.                |
 | `GITHUB_STEP_SUMMARY` | When set (in GitHub Actions), `reach check` automatically writes markdown summaries to this file. |
-| `NO_MKDOCS_2_WARNING` | Set to `"1"` to suppress upstream MkDocs 2.0 console notices during documentation builds. |
+| `NO_MKDOCS_2_WARNING` | Set to `"1"` to suppress upstream MkDocs 2.0 console notices during documentation builds.         |

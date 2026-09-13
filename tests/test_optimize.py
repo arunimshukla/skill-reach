@@ -1424,10 +1424,12 @@ def test_iteration_record_iteration_ge_1() -> None:
     """Verify IterationRecord requires iteration >= 1."""
     cand = OptimizationCandidate(description="Candidate")
     with pytest.raises(ValidationError):
-        IterationRecord(
-            iteration=0,
-            candidates=(cand,),
-            best_candidate=cand,
+        IterationRecord.model_validate(
+            {
+                "iteration": 0,
+                "candidates": (cand,),
+                "best_candidate": cand,
+            }
         )
 
     rec = IterationRecord(

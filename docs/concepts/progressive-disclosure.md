@@ -39,13 +39,13 @@ graph TD
 
 Because the Level 1 selection surface lives inside the system prompt, agent runtimes bound the total context allocated to catalog listings.
 
-| Runtime                                                       | Per-Description Guidance               | Whole-Catalog Budget                             | Exceeded Budget Behavior                                                    |
-| :------------------------------------------------------------ | :------------------------------------- | :----------------------------------------------- | :-------------------------------------------------------------------------- |
-| **Claude Code** (`claude-code`)                               | 1,024 characters (recommended ceiling) | ~30,000 column listing budget (1% of 1M context) | Drops descriptions entirely, listing only bare skill names (`- <name>`)     |
-| **Google Antigravity** (`antigravity-cli`, `antigravity-sdk`) | 1,024 characters                       | System prompt skill listing budget               | Truncates lower-ranked skills or rejects oversized system prompt extensions |
-| **Goose** (`goose`)                                           | 1,024 characters                       | Extension declaration context window             | Truncates tool/extension listing surface                                    |
-| **Pi** (`pi`)                                                 | 1,024 characters                       | Context window allocation                        | Omits descriptions of overflow skills                                       |
-| **Offline Runtime** (`keyword`)                               | Configurable via `reach.toml`          | Configurable via `--budget`                      | Simulates prompt truncation or catalog elision for deterministic testing    |
+| Runtime                                                       | Per-Description Guidance                 | Whole-Catalog Budget                             | Exceeded Budget Behavior                                                    |
+| :------------------------------------------------------------ | :--------------------------------------- | :----------------------------------------------- | :-------------------------------------------------------------------------- |
+| **Claude Code** (`claude-code`)                               | 1,024 characters (recommended ceiling)   | ~30,000 column listing budget (1% of 1M context) | Drops descriptions entirely, listing only bare skill names (`- <name>`)     |
+| **Google Antigravity** (`antigravity-cli`, `antigravity-sdk`) | 1,024 characters                         | System prompt skill listing budget               | Truncates lower-ranked skills or rejects oversized system prompt extensions |
+| **Goose** (`goose`)                                           | 1,024 characters                         | Extension declaration context window             | Truncates tool/extension listing surface                                    |
+| **Pi** (`pi`)                                                 | 1,024 characters                         | Context window allocation                        | Omits descriptions of overflow skills                                       |
+| **Offline Runtime** (`keyword`)                               | Configurable via `reach.toml` (`[lint]`) | Unconstrained catalog fit                        | Evaluates all resident skills without catalog elision                       |
 
 ### Why This Matters for Skill Developers
 

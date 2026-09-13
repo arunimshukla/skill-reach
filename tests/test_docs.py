@@ -16,16 +16,22 @@
 
 from __future__ import annotations
 
+import ast
 import importlib
+import inspect
 import pkgutil
 import re
+import shlex
+import tomllib
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import pytest
 from mkdocs.config import load_config
-from mkdocs.config.defaults import MkDocsConfig
-from pydantic import BaseModel
+
+if TYPE_CHECKING:
+    from mkdocs.config.defaults import MkDocsConfig
+    from pydantic import BaseModel
 
 import reach
 import reach.cli
@@ -66,6 +72,31 @@ def mkdocs_config() -> MkDocsConfig:
     return load_config(str(_MKDOCS_FILE))
 
 
+@pytest.fixture(scope="module")
+def config_doc_text() -> str:
+    """Provide text content of docs/configuration.md."""
+    return (_DOCS_DIR / "configuration.md").read_text(encoding="utf-8")
+
+
+@pytest.fixture(scope="module")
+def readme_text() -> str:
+    """Provide text content of README.md."""
+    return (_ROOT / "README.md").read_text(encoding="utf-8")
+
+
+@pytest.fixture(scope="module")
+def all_markdown_files() -> tuple[Path, ...]:
+    """Provide all documentation and root markdown files."""
+    return (*_DOCS_DIR.rglob("*.md"), _ROOT / "README.md")
+
+
+@pytest.fixture(scope="module")
+def reach_source_text() -> str:
+    """Provide concatenated source text for all reach Python modules."""
+    src_files = list((_ROOT / "src" / "reach").rglob("*.py"))
+    return "\n".join(f.read_text(encoding="utf-8") for f in src_files)
+
+
 def _flatten_nav(nav_entries: list[Any]) -> list[str]:
     """Recursively extract all target document paths from the nav tree."""
     paths: list[str] = []
@@ -81,6 +112,45 @@ def _flatten_nav(nav_entries: list[Any]) -> list[str]:
     return paths
 
 
+def _command_valid_flags(verb: str) -> set[str]:
+    """Assemble all valid option flags for a registered CLI command."""
+    cmd = app[verb]
+    flags: set[str] = {"--help", "--version"}
+    for arg in cmd.assemble_argument_collection():
+        if not arg.parameter.name:
+            continue
+        for name in arg.parameter.name:
+            flags.add(name)
+            if name.startswith("--") and arg.hint is bool:
+                flags.add(f"--no-{name.removeprefix('--')}")
+    return flags
+
+
+def extract_table_column_entries(
+    markdown_section: str,
+    column_index: int = 1,
+    pattern: str = r"`([a-zA-Z0-9_.-]+)`",
+) -> set[str]:
+    """Extract backtick-enclosed identifiers from a column of a markdown table."""
+    entries: set[str] = set()
+    for raw_line in markdown_section.splitlines():
+        line = raw_line.strip()
+        if not line.startswith("|") or line.startswith("| :---"):
+            continue
+        cols = line.split("|")
+        if len(cols) > column_index + 1:
+            entries.update(re.findall(pattern, cols[column_index]))
+    return entries
+
+
+def extract_python_snippets(content: str) -> list[str]:
+    """Extract non-empty Python code blocks from markdown text."""
+    py_block_re = re.compile(r"```python\s*\n(.*?)\n```", re.DOTALL)
+    return [
+        match.group(1).strip() for match in py_block_re.finditer(content) if match.group(1).strip()
+    ]
+
+
 def test_mkdocs_config_is_valid(mkdocs_config: MkDocsConfig) -> None:
     """Verify mkdocs.yml can be loaded and contains expected top-level keys."""
     assert mkdocs_config.get("site_name") == "skill-reach"
@@ -89,19 +159,11 @@ def test_mkdocs_config_is_valid(mkdocs_config: MkDocsConfig) -> None:
     assert mkdocs_config["theme"].name == "material"
 
 
-def test_every_cli_verb_has_documentation_page() -> None:
-    """Verify every registered CLI subcommand in reach.cli.app has a dedicated doc page."""
-    verbs = _verbs()
-    cli_docs_dir = _DOCS_DIR / "cli"
-    assert cli_docs_dir.is_dir(), f"CLI docs directory missing at {cli_docs_dir}"
-
-    missing: list[str] = []
-    for verb in verbs:
-        doc_page = cli_docs_dir / f"{verb}.md"
-        if not doc_page.is_file():
-            missing.append(verb)
-
-    assert not missing, f"Missing CLI documentation pages in docs/cli/: {missing}"
+@pytest.mark.parametrize("verb", _verbs())
+def test_every_cli_verb_has_documentation_page(verb: str) -> None:
+    """Verify registered CLI subcommand has a dedicated documentation page in docs/cli/."""
+    doc_page = _DOCS_DIR / "cli" / f"{verb}.md"
+    assert doc_page.is_file(), f"Missing CLI documentation page for {verb} at {doc_page}"
 
 
 def test_cli_doc_pages_correspond_to_registered_verbs() -> None:
@@ -118,13 +180,12 @@ def test_cli_doc_pages_correspond_to_registered_verbs() -> None:
     )
 
 
-def test_every_cli_doc_is_in_mkdocs_nav(mkdocs_config: MkDocsConfig) -> None:
-    """Verify every CLI documentation page is referenced in mkdocs.yml navigation."""
+@pytest.mark.parametrize("verb", _verbs())
+def test_every_cli_doc_is_in_mkdocs_nav(verb: str, mkdocs_config: MkDocsConfig) -> None:
+    """Verify CLI documentation page is referenced in mkdocs.yml navigation."""
     nav_paths = set(_flatten_nav(mkdocs_config.get("nav", [])))
-
-    for verb in _verbs():
-        expected_path = f"cli/{verb}.md"
-        assert expected_path in nav_paths, f"Expected {expected_path} to be in mkdocs.yml nav"
+    expected_path = f"cli/{verb}.md"
+    assert expected_path in nav_paths, f"Expected {expected_path} to be in mkdocs.yml nav"
 
 
 def test_cli_nav_entries_correspond_to_registered_verbs(mkdocs_config: MkDocsConfig) -> None:
@@ -174,67 +235,48 @@ def test_documented_cli_options_exist_on_commands(verb: str) -> None:
     if "\n## " in options_part:
         options_part = options_part.split("\n## ")[0]
 
-    table_lines = [
-        line.strip()
-        for line in options_part.splitlines()
-        if line.strip().startswith("|")
-        and not line.strip().startswith("| :---")
-        and "Option" not in line.split("|")[1]
-    ]
-
-    doc_flags: set[str] = set()
-    for line in table_lines:
-        first_col = line.split("|")[1].strip()
-        doc_flags.update(re.findall(r"`(--[a-zA-Z0-9-]+)`", first_col))
-
-    cmd = app[verb]
-    cli_flags: set[str] = {"--help", "--version"}
-    for arg in cmd.assemble_argument_collection():
-        if not arg.parameter.name:
-            continue
-        for name in arg.parameter.name:
-            if name.startswith("--"):
-                cli_flags.add(name)
-                if arg.hint is bool:
-                    cli_flags.add(f"--no-{name.removeprefix('--')}")
-
+    doc_flags = extract_table_column_entries(
+        options_part,
+        column_index=1,
+        pattern=r"`(--[a-zA-Z0-9-]+)`",
+    )
+    cli_flags = _command_valid_flags(verb)
     stale_flags = doc_flags - cli_flags
     assert not stale_flags, (
         f"Stale or unrecognized CLI options in docs/cli/{verb}.md: {sorted(stale_flags)}"
     )
 
 
-def test_all_public_agents_documented() -> None:
-    """Verify every supported agent runtime is documented in README and configuration docs."""
-    readme_text = (_ROOT / "README.md").read_text()
-    config_doc_text = (_DOCS_DIR / "configuration.md").read_text()
-
-    public_agents = [a for a in known_agents() if a != FAKE_AGENT]
-    for agent in public_agents:
-        assert agent in readme_text, f"Agent {agent!r} missing from README.md"
-        assert agent in config_doc_text, f"Agent {agent!r} missing from docs/configuration.md"
-
-
-def test_discovery_client_profiles_documented() -> None:
-    """Verify client discovery profiles are documented in discovery precedence docs."""
-    readme_lower = (_ROOT / "README.md").read_text().lower()
-    config_doc_lower = (_DOCS_DIR / "configuration.md").read_text().lower()
-
-    for client in KNOWN_CLIENT_SKILLS_DIRS:
-        assert client.lower() in readme_lower, f"Client profile {client!r} missing from README.md"
-        assert client.lower() in config_doc_lower, (
-            f"Client {client!r} missing from docs/configuration.md"
-        )
+@pytest.mark.parametrize("agent", [a for a in known_agents() if a != FAKE_AGENT])
+def test_all_public_agents_documented(
+    agent: str,
+    readme_text: str,
+    config_doc_text: str,
+) -> None:
+    """Verify supported agent runtime is documented in README and configuration docs."""
+    assert agent in readme_text, f"Agent {agent!r} missing from README.md"
+    assert agent in config_doc_text, f"Agent {agent!r} missing from docs/configuration.md"
 
 
-def test_lint_rules_documented_in_lint_docs() -> None:
-    """Verify every registered static lint rule is documented in docs and configuration."""
-    lint_doc_text = (_DOCS_DIR / "cli" / "lint.md").read_text()
-    config_doc_text = (_DOCS_DIR / "configuration.md").read_text()
+@pytest.mark.parametrize("client", sorted(KNOWN_CLIENT_SKILLS_DIRS))
+def test_discovery_client_profiles_documented(
+    client: str,
+    readme_text: str,
+    config_doc_text: str,
+) -> None:
+    """Verify client discovery profile is documented in discovery precedence docs."""
+    assert client.lower() in readme_text.lower(), f"Client {client!r} missing from README.md"
+    assert client.lower() in config_doc_text.lower(), (
+        f"Client {client!r} missing from docs/configuration.md"
+    )
 
-    for rule_id in RULES:
-        assert rule_id in lint_doc_text, f"Rule {rule_id!r} missing from docs/cli/lint.md"
-        assert rule_id in config_doc_text, f"Rule {rule_id!r} missing from docs/configuration.md"
+
+@pytest.mark.parametrize("rule_id", sorted(RULES))
+def test_lint_rules_documented_in_lint_docs(rule_id: str, config_doc_text: str) -> None:
+    """Verify static lint rule is documented in docs/cli/lint.md and configuration docs."""
+    lint_doc_text = (_DOCS_DIR / "cli" / "lint.md").read_text(encoding="utf-8")
+    assert rule_id in lint_doc_text, f"Rule {rule_id!r} missing from docs/cli/lint.md"
+    assert rule_id in config_doc_text, f"Rule {rule_id!r} missing from docs/configuration.md"
 
 
 def test_documented_lint_rules_exist_in_registry() -> None:
@@ -242,32 +284,19 @@ def test_documented_lint_rules_exist_in_registry() -> None:
     lint_doc_text = (_DOCS_DIR / "cli" / "lint.md").read_text(encoding="utf-8")
     assert "## Built-in Lint Rules" in lint_doc_text, "Missing '## Built-in Lint Rules' section"
     rules_part = lint_doc_text.split("## Built-in Lint Rules")[1].split("\n## ")[0]
-    rule_table_lines = [
-        line.strip()
-        for line in rules_part.splitlines()
-        if line.strip().startswith("|")
-        and not line.strip().startswith("| :---")
-        and "Rule ID" not in line.split("|")[1]
-    ]
-
-    doc_rules: set[str] = set()
-    for line in rule_table_lines:
-        first_col = line.split("|")[1].strip()
-        doc_rules.update(re.findall(r"`([a-z0-9-]+)`", first_col))
-
+    doc_rules = extract_table_column_entries(rules_part, column_index=1, pattern=r"`([a-z0-9-]+)`")
     stale_rules = doc_rules - set(RULES.keys())
     assert not stale_rules, (
         f"Stale or unregistered lint rules in docs/cli/lint.md: {sorted(stale_rules)}"
     )
 
 
-def test_explain_examples_reference_valid_rules() -> None:
+def test_explain_examples_reference_valid_rules(all_markdown_files: tuple[Path, ...]) -> None:
     """Verify all --explain CLI examples in documentation reference registered rules."""
     explain_re = re.compile(r"--explain\s+([a-z0-9-]+)")
-    all_markdown_files = [*_DOCS_DIR.rglob("*.md"), _ROOT / "README.md"]
 
     for md_file in all_markdown_files:
-        content = md_file.read_text()
+        content = md_file.read_text(encoding="utf-8")
         for match in explain_re.finditer(content):
             rule_id = match.group(1)
             assert rule_id in RULES, (
@@ -275,32 +304,30 @@ def test_explain_examples_reference_valid_rules() -> None:
             )
 
 
-def test_builtin_agent_default_models_documented() -> None:
-    """Verify default model for each builtin agent is documented in docs/configuration.md."""
-    config_doc_text = (_DOCS_DIR / "configuration.md").read_text()
-    for agent, expected_model in BUILTIN_AGENT_DEFAULT_MODELS.items():
-        escaped_agent = re.escape(agent)
-        escaped_model = re.escape(expected_model)
-        pattern = rf"\[agents\.{escaped_agent}\][\s\S]*?default_model\s*=\s*\"{escaped_model}\""
-        assert re.search(pattern, config_doc_text), (
-            f"Agent {agent!r} default_model {expected_model!r} not in docs/configuration.md"
-        )
+@pytest.mark.parametrize(
+    ("agent", "expected_model"),
+    sorted(BUILTIN_AGENT_DEFAULT_MODELS.items()),
+)
+def test_builtin_agent_default_models_documented(
+    agent: str,
+    expected_model: str,
+    config_doc_text: str,
+) -> None:
+    """Verify default model for builtin agent is documented in docs/configuration.md."""
+    escaped_agent = re.escape(agent)
+    escaped_model = re.escape(expected_model)
+    pattern = rf"\[agents\.{escaped_agent}\][\s\S]*?default_model\s*=\s*\"{escaped_model}\""
+    assert re.search(pattern, config_doc_text), (
+        f"Agent {agent!r} default_model {expected_model!r} not in docs/configuration.md"
+    )
 
 
-def test_study_settings_fields_documented() -> None:
-    """Verify all fields in StudySettings are documented in configuration docs."""
-    config_doc_text = (_DOCS_DIR / "configuration.md").read_text()
-    study_section = config_doc_text.split("### `[study]`")[1].split("### `[catalog]`")[0]
-    for field_name in StudySettings.model_fields:
-        assert f"`{field_name}`" in study_section, (
-            f"StudySettings field {field_name!r} missing from [study] documentation table"
-        )
-
-
-def test_documented_configuration_sections_valid() -> None:
+def test_documented_configuration_sections_valid(config_doc_text: str) -> None:
     """Verify section headings in docs/configuration.md correspond to valid models."""
-    config_doc_text = (_DOCS_DIR / "configuration.md").read_text(encoding="utf-8")
-    sections_ref = config_doc_text.split("## Sections & Options Reference")[1].split("\n## ")[0]
+    sections_ref = config_doc_text.split("## Sections & Options Reference", maxsplit=1)[1].split(
+        "\n## ",
+        maxsplit=1,
+    )[0]
     section_matches = re.findall(r"### `?\[([a-zA-Z0-9_.-]+)\]`?", sections_ref)
     allowed_sections = set(RunConfig.model_fields.keys()) | {"lint.rules", "agents", "models"}
 
@@ -315,60 +342,86 @@ def test_documented_configuration_sections_valid() -> None:
     )
 
 
-def test_documented_configuration_keys_exist_in_models() -> None:
-    """Verify configuration keys in docs/configuration.md exist on settings models."""
-    section_model_map: dict[str, type[BaseModel]] = {
-        "general": GeneralSettings,
-        "discovery": DiscoverySettings,
-        "study": StudySettings,
-        "catalog": CatalogSettings,
-        "plan": PlanSettings,
-        "runtime": RuntimeSettings,
-        "lint": LintSettings,
-        "check": CheckSettings,
-        "retrieval": RetrievalSettings,
-        "overlap": OverlapSettings,
-        "diff": DiffSettings,
-        "query": QuerySettings,
-        "optimize": OptimizeSettings,
-        "registry": RegistrySettings,
-    }
+SECTION_MODEL_MAP: dict[str, type[BaseModel]] = {
+    "general": GeneralSettings,
+    "discovery": DiscoverySettings,
+    "study": StudySettings,
+    "catalog": CatalogSettings,
+    "plan": PlanSettings,
+    "runtime": RuntimeSettings,
+    "lint": LintSettings,
+    "check": CheckSettings,
+    "retrieval": RetrievalSettings,
+    "overlap": OverlapSettings,
+    "diff": DiffSettings,
+    "query": QuerySettings,
+    "optimize": OptimizeSettings,
+    "registry": RegistrySettings,
+}
 
-    config_doc_text = (_DOCS_DIR / "configuration.md").read_text(encoding="utf-8")
-    sections_ref = config_doc_text.split("## Sections & Options Reference")[1].split("\n## ")[0]
-    section_blocks = re.split(r"\n(?=### `?\[[a-zA-Z0-9_.-]+\]`?)", sections_ref)
+# Settings fields that are internal, dynamic, or CLI-only, and deliberately omitted from tables
+UNDOCUMENTED_CONFIG_FIELDS: dict[str, set[str]] = {
+    "runtime": {"agent", "allowed_tools", "options"},
+    "lint": {"rules", "similarity_threshold"},
+    "registry": {"registry", "fresh", "no_cache"},
+}
 
+
+def _extract_section_block(config_doc_text: str, section_name: str) -> str:
+    """Extract markdown text block for a specific section from docs/configuration.md."""
+    sections_ref = config_doc_text.split("## Sections & Options Reference", maxsplit=1)[1].split(
+        "\n## ",
+        maxsplit=1,
+    )[0]
+    section_blocks = re.split(r"\n(?=### `?\[)", sections_ref)
     for block in section_blocks:
         header_match = re.search(r"### `?\[([a-zA-Z0-9_.-]+)\]`?", block)
-        if not header_match:
-            continue
-        sec_name = header_match.group(1)
-        if sec_name not in section_model_map:
-            continue
-        model_cls = section_model_map[sec_name]
-        table_lines = [
-            line.strip()
-            for line in block.splitlines()
-            if line.strip().startswith("|")
-            and not line.strip().startswith("| :---")
-            and "Key" not in line.split("|")[1]
-        ]
-        doc_keys: set[str] = set()
-        for line in table_lines:
-            first_col = line.split("|")[1].strip()
-            found = re.findall(r"`([a-zA-Z0-9_-]+)`", first_col)
-            doc_keys.update(k for k in found if not k.startswith("rules."))
-
-        stale_keys = doc_keys - set(model_cls.model_fields.keys())
-        assert not stale_keys, (
-            f"Stale or unrecognized configuration keys in docs/configuration.md [{sec_name}]: "
-            f"{sorted(stale_keys)}"
-        )
+        if header_match and header_match.group(1) == section_name:
+            return block
+    return ""
 
 
-def test_documented_agent_profiles_exist_in_known_agents() -> None:
+@pytest.mark.parametrize(("section_name", "model_cls"), sorted(SECTION_MODEL_MAP.items()))
+def test_all_model_fields_are_documented(
+    section_name: str,
+    model_cls: type[BaseModel],
+    config_doc_text: str,
+) -> None:
+    """Verify that every setting on each configuration model is documented in configuration.md."""
+    section_block = _extract_section_block(config_doc_text, section_name)
+    assert section_block, f"Missing section block for [{section_name}] in configuration.md"
+    doc_keys = extract_table_column_entries(section_block)
+    expected_keys = set(model_cls.model_fields.keys()) - UNDOCUMENTED_CONFIG_FIELDS.get(
+        section_name,
+        set(),
+    )
+    missing = expected_keys - doc_keys
+    assert not missing, (
+        f"Model fields in [{section_name}] missing from docs/configuration.md: {sorted(missing)}"
+    )
+
+
+@pytest.mark.parametrize(("section_name", "model_cls"), sorted(SECTION_MODEL_MAP.items()))
+def test_documented_configuration_keys_exist_in_models(
+    section_name: str,
+    model_cls: type[BaseModel],
+    config_doc_text: str,
+) -> None:
+    """Verify configuration keys in docs/configuration.md exist on settings models."""
+    section_block = _extract_section_block(config_doc_text, section_name)
+    assert section_block, f"Missing section block for [{section_name}] in configuration.md"
+    doc_keys = {
+        k for k in extract_table_column_entries(section_block) if not k.startswith("rules.")
+    }
+    stale_keys = doc_keys - set(model_cls.model_fields.keys())
+    assert not stale_keys, (
+        f"Stale or unrecognized configuration keys in docs/configuration.md [{section_name}]: "
+        f"{sorted(stale_keys)}"
+    )
+
+
+def test_documented_agent_profiles_exist_in_known_agents(config_doc_text: str) -> None:
     """Verify all agent profiles documented in docs/configuration.md exist in known_agents."""
-    config_doc_text = (_DOCS_DIR / "configuration.md").read_text(encoding="utf-8")
     agent_matches = re.findall(r"\[agents\.([a-zA-Z0-9_-]+)\]", config_doc_text)
     public_agents = set(known_agents()) - {FAKE_AGENT}
 
@@ -403,15 +456,14 @@ def test_check_strict_default_documented() -> None:
     )
 
 
-def test_configuration_doc_documents_default_model_profiles() -> None:
+def test_configuration_doc_documents_default_model_profiles(config_doc_text: str) -> None:
     """Verify docs/configuration.md documents default Gemini and Claude model profiles."""
-    config_doc = (_DOCS_DIR / "configuration.md").read_text(encoding="utf-8")
     gemini_key = DEFAULT_GEMINI_MODEL.replace(".", "-")
     claude_key = DEFAULT_CLAUDE_MODEL.replace(".", "-")
-    assert f"[models.{gemini_key}]" in config_doc, (
+    assert f"[models.{gemini_key}]" in config_doc_text, (
         f"docs/configuration.md should show [models.{gemini_key}] under [models.*]"
     )
-    assert f"[models.{claude_key}]" in config_doc, (
+    assert f"[models.{claude_key}]" in config_doc_text, (
         f"docs/configuration.md should show [models.{claude_key}] under [models.*]"
     )
 
@@ -433,7 +485,7 @@ INTERNAL_MODULES: frozenset[str] = frozenset(
         "reach.static",
         "reach.view",
         "reach.views",
-    }
+    },
 )
 
 #: Discover all top-level public API modules dynamically. Any newly added module
@@ -447,7 +499,7 @@ PUBLIC_API_MODULES: tuple[str, ...] = tuple(
         }
         - INTERNAL_MODULES,
         key=str.casefold,
-    )
+    ),
 )
 
 
@@ -586,8 +638,6 @@ def test_documented_api_members_cover_public_interface(
     parsed_api_docs: dict[str, ParsedApiDoc],
 ) -> None:
     """Verify all primary public classes, functions, and exports are documented."""
-    import inspect
-
     short_name = mod_name.rsplit(".", maxsplit=1)[-1]
     parsed = parsed_api_docs.get(short_name)
     assert parsed is not None, f"Documentation page missing for module {mod_name}"
@@ -649,19 +699,11 @@ def test_api_module_index_and_nav_parity(mkdocs_config: MkDocsConfig) -> None:
         )
 
 
-def test_doc_python_snippets_syntax() -> None:
+def test_doc_python_snippets_syntax(all_markdown_files: tuple[Path, ...]) -> None:
     """Verify all Python code snippets in markdown files parse as valid syntax."""
-    import ast
-
-    py_block_re = re.compile(r"```python\s*\n(.*?)\n```", re.DOTALL)
-    all_markdown_files = [*_DOCS_DIR.rglob("*.md"), _ROOT / "README.md"]
-
     for md_file in all_markdown_files:
-        content = md_file.read_text()
-        for i, match in enumerate(py_block_re.finditer(content), 1):
-            snippet = match.group(1).strip()
-            if not snippet:
-                continue
+        content = md_file.read_text(encoding="utf-8")
+        for i, snippet in enumerate(extract_python_snippets(content), 1):
             try:
                 ast.parse(snippet)
             except SyntaxError as err:
@@ -671,19 +713,16 @@ def test_doc_python_snippets_syntax() -> None:
                 raise AssertionError(pytest_fail_msg) from err
 
 
-def test_all_public_agents_in_live_probing_docs() -> None:
-    """Verify all public agents are documented in docs/index.md live probing and REACH_AGENT."""
-    index_text = (_DOCS_DIR / "index.md").read_text()
-    config_text = (_DOCS_DIR / "configuration.md").read_text()
-    public_agents = [a for a in known_agents() if a != FAKE_AGENT]
-
-    for agent in public_agents:
-        assert agent in index_text, (
-            f"Agent {agent!r} missing from Live Empirical Probing in docs/index.md"
-        )
-        assert agent in config_text, (
-            f"Agent {agent!r} missing from REACH_AGENT description in docs/configuration.md"
-        )
+@pytest.mark.parametrize("agent", [a for a in known_agents() if a != FAKE_AGENT])
+def test_all_public_agents_in_live_probing_docs(agent: str, config_doc_text: str) -> None:
+    """Verify public agent is documented in docs/index.md and docs/configuration.md."""
+    index_text = (_DOCS_DIR / "index.md").read_text(encoding="utf-8")
+    assert agent in index_text, (
+        f"Agent {agent!r} missing from Live Empirical Probing in docs/index.md"
+    )
+    assert agent in config_doc_text, (
+        f"Agent {agent!r} missing from agent descriptions in docs/configuration.md"
+    )
 
 
 def test_citations_companion_path_documentation() -> None:
@@ -695,9 +734,8 @@ def test_citations_companion_path_documentation() -> None:
     )
 
 
-def test_readme_repository_layout_paths_exist() -> None:
+def test_readme_repository_layout_paths_exist(readme_text: str) -> None:
     """Verify all files and directories listed in README Repository Layout exist on disk."""
-    readme_text = (_ROOT / "README.md").read_text()
     layout_match = re.search(r"## Repository Layout\s+```\s*(.*?)\s*```", readme_text, re.DOTALL)
     assert layout_match is not None, "Repository Layout code block missing from README.md"
 
@@ -723,14 +761,14 @@ def test_readme_repository_layout_paths_exist() -> None:
             assert target_path.exists(), f"README layout path {target_path} does not exist"
 
 
-def test_every_cli_verb_in_cli_index_overview() -> None:
-    """Verify every registered CLI subcommand is listed in docs/cli/index.md overview table."""
-    cli_index_text = (_DOCS_DIR / "cli" / "index.md").read_text()
-    for verb in _verbs():
-        expected_entry = f"[`reach {verb}`]"
-        assert expected_entry in cli_index_text, (
-            f"CLI verb {verb!r} missing from Command Overview table in docs/cli/index.md"
-        )
+@pytest.mark.parametrize("verb", _verbs())
+def test_every_cli_verb_in_cli_index_overview(verb: str) -> None:
+    """Verify registered CLI subcommand is listed in docs/cli/index.md overview table."""
+    cli_index_text = (_DOCS_DIR / "cli" / "index.md").read_text(encoding="utf-8")
+    expected_entry = f"[`reach {verb}`]"
+    assert expected_entry in cli_index_text, (
+        f"CLI verb {verb!r} missing from Command Overview table in docs/cli/index.md"
+    )
 
 
 def test_cli_index_overview_only_lists_registered_verbs() -> None:
@@ -745,33 +783,24 @@ def test_cli_index_overview_only_lists_registered_verbs() -> None:
     )
 
 
-def test_every_cli_verb_in_readme_commands_table() -> None:
-    """Verify all registered CLI verbs appear in README.md command tables."""
-    readme_text = (_ROOT / "README.md").read_text(encoding="utf-8")
-    registered_verbs = set(_verbs())
-    for verb in registered_verbs:
-        pattern = rf"\|\s*\[?`{re.escape(verb)}`\]?\s*\|"
-        assert re.search(pattern, readme_text), (
-            f"CLI verb '{verb}' is registered but missing from README.md command table"
-        )
+@pytest.mark.parametrize("verb", _verbs())
+def test_every_cli_verb_in_readme_commands_table(verb: str, readme_text: str) -> None:
+    """Verify registered CLI verb appears in README.md command tables."""
+    pattern = rf"\|\s*\[?`{re.escape(verb)}`\]?\s*\|"
+    assert re.search(pattern, readme_text), (
+        f"CLI verb '{verb}' is registered but missing from README.md command table"
+    )
 
 
-def test_readme_commands_table_only_lists_registered_verbs() -> None:
+def test_readme_commands_table_only_lists_registered_verbs(readme_text: str) -> None:
     """Verify README.md command tables do not list obsolete or unregistered commands."""
-    readme_text = (_ROOT / "README.md").read_text(encoding="utf-8")
-    command_section = readme_text.split("## Commands")[1].split("## Supported Agents")[0]
-    table_lines = [
-        line.strip()
-        for line in command_section.splitlines()
-        if line.strip().startswith("|")
-        and not line.strip().startswith("| :---")
-        and "Command" not in line.split("|")[1]
-    ]
-    doc_verbs: set[str] = set()
-    for line in table_lines:
-        first_col = line.split("|")[1].strip()
-        doc_verbs.update(re.findall(r"`([a-z0-9-]+)`", first_col))
-
+    commands_split = readme_text.split("## Commands")[1]
+    command_section = commands_split.split("## Supported Agents", maxsplit=1)[0]
+    doc_verbs = extract_table_column_entries(
+        command_section,
+        column_index=1,
+        pattern=r"`([a-z0-9-]+)`",
+    )
     registered_verbs = set(_verbs())
     stale_verbs = doc_verbs - registered_verbs
     assert not stale_verbs, (
@@ -779,12 +808,11 @@ def test_readme_commands_table_only_lists_registered_verbs() -> None:
     )
 
 
-def test_no_overescaped_latex_in_markdown() -> None:
+def test_no_overescaped_latex_in_markdown(all_markdown_files: tuple[Path, ...]) -> None:
     """Detect accidental double-backslash escaping in LaTeX math blocks."""
-    all_markdown = [*_DOCS_DIR.rglob("*.md"), _ROOT / "README.md"]
     bad_pattern = re.compile(r"\$[^$\n]*(?:\\{2}\w+|\\_)[^$\n]*\$")
 
-    for md_file in all_markdown:
+    for md_file in all_markdown_files:
         content = md_file.read_text(encoding="utf-8")
         matches = bad_pattern.findall(content)
         assert not matches, (
@@ -792,19 +820,13 @@ def test_no_overescaped_latex_in_markdown() -> None:
         )
 
 
-def test_doc_python_snippets_reach_imports_resolve() -> None:
+def test_doc_python_snippets_reach_imports_resolve(
+    all_markdown_files: tuple[Path, ...],
+) -> None:
     """Verify all symbols imported from reach.* in doc python snippets resolve to real objects."""
-    import ast
-
-    py_block_re = re.compile(r"```python\s*\n(.*?)\n```", re.DOTALL)
-    all_markdown_files = [*_DOCS_DIR.rglob("*.md"), _ROOT / "README.md"]
-
     for md_file in all_markdown_files:
-        content = md_file.read_text()
-        for i, match in enumerate(py_block_re.finditer(content), 1):
-            snippet = match.group(1).strip()
-            if not snippet:
-                continue
+        content = md_file.read_text(encoding="utf-8")
+        for i, snippet in enumerate(extract_python_snippets(content), 1):
             tree = ast.parse(snippet)
             for node in ast.walk(tree):
                 if (
@@ -827,36 +849,36 @@ def test_doc_python_snippets_reach_imports_resolve() -> None:
                         )
 
 
-def test_runconfig_sections_documented_in_configuration_reference() -> None:
-    """Verify all RunConfig sections are documented in docs/configuration.md."""
-    config_doc_text = (_DOCS_DIR / "configuration.md").read_text()
-    for section_name in RunConfig.model_fields:
-        section_header = f"[{section_name}]"
-        assert section_header in config_doc_text, (
-            f"Config section {section_header!r} is not documented in docs/configuration.md"
-        )
+@pytest.mark.parametrize("section_name", sorted(RunConfig.model_fields))
+def test_runconfig_sections_documented_in_configuration_reference(
+    section_name: str,
+    config_doc_text: str,
+) -> None:
+    """Verify RunConfig section header is documented in docs/configuration.md."""
+    section_header = f"[{section_name}]"
+    assert section_header in config_doc_text, (
+        f"Config section {section_header!r} is not documented in docs/configuration.md"
+    )
 
 
-def test_cli_docs_have_synopsis_and_headings() -> None:
-    """Verify every CLI subcommand document has a proper heading and Synopsis section."""
-    for verb in _verbs():
-        doc_file = _DOCS_DIR / "cli" / f"{verb}.md"
-        assert doc_file.is_file(), f"Missing CLI doc file: {doc_file}"
-        content = doc_file.read_text()
-        first_line = content.splitlines()[0].strip() if content.splitlines() else ""
-        assert first_line in (f"# `reach {verb}`", f"# reach {verb}"), (
-            f"Expected top-level heading '# `reach {verb}`' in {doc_file.name}, got {first_line!r}"
-        )
-        assert "## Synopsis" in content, f"Missing '## Synopsis' section in {doc_file.name}"
+@pytest.mark.parametrize("verb", _verbs())
+def test_cli_docs_have_synopsis_and_headings(verb: str) -> None:
+    """Verify CLI subcommand document has a proper heading and Synopsis section."""
+    doc_file = _DOCS_DIR / "cli" / f"{verb}.md"
+    assert doc_file.is_file(), f"Missing CLI doc file: {doc_file}"
+    content = doc_file.read_text(encoding="utf-8")
+    first_line = content.splitlines()[0].strip() if content.splitlines() else ""
+    assert first_line in (f"# `reach {verb}`", f"# reach {verb}"), (
+        f"Expected top-level heading '# `reach {verb}`' in {doc_file.name}, got {first_line!r}"
+    )
+    assert "## Synopsis" in content, f"Missing '## Synopsis' section in {doc_file.name}"
 
 
-def test_concept_docs_are_cross_referenced() -> None:
+def test_concept_docs_are_cross_referenced(all_markdown_files: tuple[Path, ...]) -> None:
     """Verify every concept document in docs/concepts/ is referenced across the docs."""
     concept_docs_dir = _DOCS_DIR / "concepts"
-    all_markdown_files = [
-        f for f in [*_DOCS_DIR.rglob("*.md"), _ROOT / "README.md"] if f.parent != concept_docs_dir
-    ]
-    all_content = "\n".join(f.read_text() for f in all_markdown_files)
+    non_concept_files = [f for f in all_markdown_files if f.parent != concept_docs_dir]
+    all_content = "\n".join(f.read_text(encoding="utf-8") for f in non_concept_files)
 
     for concept_file in concept_docs_dir.glob("*.md"):
         rel_path = f"concepts/{concept_file.name}"
@@ -910,27 +932,11 @@ def test_api_doc_members_are_alphabetized(
     assert not unsorted, f"API doc members must be sorted alphabetically: {unsorted}"
 
 
-def _command_valid_flags(verb: str) -> set[str]:
-    """Assemble all valid option flags for a registered CLI command."""
-    cmd = app[verb]
-    flags: set[str] = {"--help", "--version"}
-    for arg in cmd.assemble_argument_collection():
-        if not arg.parameter.name:
-            continue
-        for name in arg.parameter.name:
-            flags.add(name)
-            if name.startswith("--") and arg.hint is bool:
-                flags.add(f"--no-{name.removeprefix('--')}")
-    return flags
-
-
 def _extract_markdown_cli_commands(
     md_file: Path,
     verbs: set[str],
 ) -> list[tuple[str, list[str], str]]:
     """Extract concrete CLI command invocations from markdown code blocks."""
-    import shlex
-
     invocations: list[tuple[str, list[str], str]] = []
     text = md_file.read_text(encoding="utf-8")
     for block in re.findall(r"```(?:bash|sh)\s*\n(.*?)\n```", text, re.DOTALL):
@@ -956,9 +962,10 @@ def _extract_markdown_cli_commands(
     return invocations
 
 
-def test_cli_command_snippets_in_markdown_use_valid_flags() -> None:
+def test_cli_command_snippets_in_markdown_use_valid_flags(
+    all_markdown_files: tuple[Path, ...],
+) -> None:
     """Verify all CLI command options used in markdown code blocks exist on commands."""
-    all_markdown_files = [*_DOCS_DIR.rglob("*.md"), _ROOT / "README.md"]
     verbs = set(_verbs())
 
     for md_file in all_markdown_files:
@@ -977,8 +984,6 @@ def test_cli_command_snippets_in_markdown_use_valid_flags() -> None:
 
 def test_example_models_defined_in_bundled_reach_toml() -> None:
     """Verify all model definitions in reach.example.toml exist in bundled reach.toml."""
-    import tomllib
-
     bundled_toml = tomllib.loads((_ROOT / "src/reach/reach.toml").read_text(encoding="utf-8"))
     bundled_models = set(bundled_toml.get("models", {}).keys())
 
@@ -987,4 +992,57 @@ def test_example_models_defined_in_bundled_reach_toml() -> None:
     missing = example_models - bundled_models
     assert not missing, (
         f"Models configured in reach.example.toml missing from src/reach/reach.toml: {missing}"
+    )
+
+
+def test_markdown_tables_have_no_blank_lines(all_markdown_files: tuple[Path, ...]) -> None:
+    """Detect broken markdown tables separated by blank lines within table rows."""
+    table_row_re = re.compile(r"^\s*\|.*\|\s*$")
+
+    for md_file in all_markdown_files:
+        lines = md_file.read_text(encoding="utf-8").splitlines()
+        for i, line in enumerate(lines[:-1]):
+            if table_row_re.match(line) and not lines[i + 1].strip():
+                # Look ahead past blank lines
+                next_idx = i + 2
+                while next_idx < len(lines) and not lines[next_idx].strip():
+                    next_idx += 1
+                if next_idx < len(lines) and table_row_re.match(lines[next_idx]):
+                    # Check that the line after the blank line is not a new table header + delimiter
+                    is_new_table = False
+                    if next_idx + 1 < len(lines):
+                        delimiter_line = lines[next_idx + 1].strip()
+                        delim_pattern = r"^\|(\s*:?-+:?\s*\|)+$"
+                        if delimiter_line.startswith("|") and re.match(
+                            delim_pattern,
+                            delimiter_line,
+                        ):
+                            is_new_table = True
+                    if not is_new_table:
+                        pytest.fail(
+                            f"Broken table with blank line inside table rows at "
+                            f"{md_file.relative_to(_ROOT)}:{i + 1}",
+                        )
+
+
+def test_documented_environment_variables_exist_in_source(
+    config_doc_text: str,
+    reach_source_text: str,
+) -> None:
+    """Verify all REACH_* environment variables documented in configuration.md exist in code."""
+    assert "## Environment Variables" in config_doc_text, (
+        "Missing '## Environment Variables' section"
+    )
+    env_section = config_doc_text.split("## Environment Variables")[1]
+    if "\n## " in env_section:
+        env_section = env_section.split("\n## ")[0]
+
+    documented_vars = set(re.findall(r"`(REACH_[A-Z0-9_]+)`", env_section))
+    assert documented_vars, (
+        "Expected at least one REACH_* environment variable in docs/configuration.md"
+    )
+
+    unreferenced = {var for var in documented_vars if var not in reach_source_text}
+    assert not unreferenced, (
+        f"Documented env vars not referenced anywhere in src/reach: {sorted(unreferenced)}"
     )

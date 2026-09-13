@@ -15,6 +15,9 @@
 # Bundled model specifications and registry for Reach.
 # Project-level configuration overrides can be placed in ./reach.toml.
 
+[general]
+default_agent = "antigravity-cli"
+
 [agents.antigravity-cli]
 default_model = "gemini-3.8-flash"
 
