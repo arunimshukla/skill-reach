@@ -1575,3 +1575,13 @@ def test_overlap_and_suggest_views_renderers() -> None:
     assert "csv" in REWRITE_RENDERERS
     assert "json" in REWRITE_RENDERERS
     assert "jsonl" in REWRITE_RENDERERS
+
+
+def test_console_isolates_terminal_rendering_from_ambient_environment(
+    make_console,
+) -> None:
+    """Verify test console preserves ANSI styling and width under standard test fixtures."""
+    console, buffer = make_console(terminal=True, width=120)
+    console.print("[reach.hit]matched[/reach.hit]")
+    assert "\x1b[" in buffer.getvalue()
+    assert console.width == 120
