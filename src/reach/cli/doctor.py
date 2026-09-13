@@ -151,7 +151,10 @@ def _check_google_adc() -> CheckResult:
         name="Google Cloud ADC",
         status="warn",
         detail="not found",
-        remedy="Run 'gcloud auth application-default login' if using Google Cloud Model Garden on Agent Platform",
+        remedy=(
+            "Run 'gcloud auth application-default login' if using Google Cloud "
+            "Model Garden on Agent Platform"
+        ),
     )
 
 
