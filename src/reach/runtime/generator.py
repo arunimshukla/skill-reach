@@ -107,8 +107,9 @@ class BaseTextGenerator[OptionsT](ABC):
     def model(self, value: str) -> None:
         """Update configured model identifier."""
         self._model = value
-        if hasattr(self.options, "model_copy"):
-            self.options = self.options.model_copy(update={"model": value})
+        copy_fn = getattr(self.options, "model_copy", None)
+        if callable(copy_fn):
+            self.options = cast("OptionsT", copy_fn(update={"model": value}))
 
     def prompt_budget_chars(self) -> int | None:
         """Return maximum character length for prompts, or None if unbounded."""
