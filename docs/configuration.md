@@ -217,7 +217,7 @@ user_skills_dir = ".claude/skills"
 [agents.goose]
 default_model = "gemini-3.6-flash"
 executable = "goose"
-models = ["gemini-3.6-flash", "gemini-3-flash-preview", "gemini-3.1-flash-lite", "gemini-3.1-pro-preview"]
+models = ["gemini-3.6-flash", "gemini-3.1-flash-lite"]
 skills_dir = ".agents/skills"
 user_skills_dir = ".agents/skills"
 
@@ -318,12 +318,12 @@ Controls probe replication and network resilience.
 
 ### `[runtime]`
 
-| Key                | Type             | Default | Description                                                                                                                                                                                                                                                                                                         |
-| :----------------- | :--------------- | :------ | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `timeout_s`        | Integer          | `200`   | Process execution timeout in seconds before aborting an unresponsive probe.                                                                                                                                                                                                                                         |
-| `max_turns`        | Integer          | `3`     | Maximum conversation turns to execute and evaluate per probe.                                                                                                                                                                                                                                                       |
-| `early_exit`       | Boolean          | `true`  | When true, aborts probe execution immediately when the target skill is invoked.                                                                                                                                                                                                                                     |
-| `blocked_env_vars` | Sequence[String] | `None`  | Explicit list of ambient environment variables to strip from child agent processes. When omitted, Reach's default sensitive credentials are stripped (with automatic exemption of `GOOGLE_APPLICATION_CREDENTIALS` when Vertex AI or Google Enterprise mode is active). Set to `[]` to allow all ambient variables. |
+| Key                | Type             | Default | Description                                                                                                                                                                                                                                                                                                                                          |
+| :----------------- | :--------------- | :------ | :--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `timeout_s`        | Integer          | `200`   | Process execution timeout in seconds before aborting an unresponsive probe.                                                                                                                                                                                                                                                                          |
+| `max_turns`        | Integer          | `3`     | Maximum conversation turns to execute and evaluate per probe.                                                                                                                                                                                                                                                                                        |
+| `early_exit`       | Boolean          | `true`  | When true, aborts probe execution immediately when the target skill is invoked.                                                                                                                                                                                                                                                                      |
+| `blocked_env_vars` | Sequence[String] | `None`  | Explicit list of ambient environment variables to strip from child agent processes. When omitted, Reach's default sensitive credentials are stripped (with automatic exemption of `GOOGLE_APPLICATION_CREDENTIALS` when Google Cloud Agent Platform / Model Garden or Google Enterprise mode is active). Set to `[]` to allow all ambient variables. |
 
 ### `[lint]` & `[lint.rules]`
 
@@ -458,16 +458,15 @@ Configuration values in `reach.toml` can also interpolate environment variables 
 
 Reach automatically routes model API keys to the corresponding environment variables expected by each runtime agent:
 
-| Provider            | Injected Environment Variables     | Support Tier                |
-| :------------------ | :--------------------------------- | :-------------------------- |
-| `google` / `gemini` | `GEMINI_API_KEY`, `GOOGLE_API_KEY` | Tested (Primary reference)  |
-| `anthropic`         | `ANTHROPIC_API_KEY`                | Pass-through (Experimental) |
-| `openai`            | `OPENAI_API_KEY`                   | Pass-through (Experimental) |
+| Provider            | Credentials / Injected Environment Variables | Support Tier               |
+| :------------------ | :------------------------------------------- | :------------------------- |
+| `google` / `gemini` | `GEMINI_API_KEY`, `GOOGLE_API_KEY`           | Tested (Primary reference) |
+| `google-cloud`      | Application Default Credentials (ADC)        | Tested (Agent Platform)    |
 
 > [!NOTE]
-> **Provider Support Status**: Google Gemini is the primary, tested, and benchmarked provider for Reach. Ambient environment credentials for Anthropic (`ANTHROPIC_API_KEY`) and OpenAI (`OPENAI_API_KEY`) pass through transparently to child subprocesses for Bring-Your-Own-Key (BYOK) workflows, but third-party CLI output schemas, telemetry, and model evaluations are experimental and unverified.
+> **Provider Support Status**: Google Gemini (via Developer API keys) and Google Cloud Agent Platform / Model Garden (via Application Default Credentials) are the tested and benchmarked authentication paths for Reach. For Claude Code, configure Google Cloud Model Garden on Agent Platform (`CLAUDE_CODE_USE_VERTEX=1`).
 
-If an unrecognized provider name is specified via options, Reach raises an error rather than mapping credentials to an unintended third-party provider. For custom, local, or self-hosted model engines (such as Ollama, vLLM, or Mistral), set the provider's expected environment variables directly in your shell or CI workflow.
+If an unrecognized provider name is specified via options, Reach raises an error rather than mapping credentials to an unintended provider. For custom, local, or self-hosted model engines (such as Ollama, vLLM, or Mistral), set the provider's expected environment variables directly in your shell or CI workflow.
 
 ---
 

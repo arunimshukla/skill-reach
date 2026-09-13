@@ -16,7 +16,7 @@ reach doctor [OPTIONS]
 
 1. **Python Environment**: Verifies Python `>= 3.12` and runtime platform details.
 2. **Agent Runtime Drivers**: Checks for installed agent CLI executables (`claude`, `agy`, `goose`, `pi`) and SDK packages (`google.antigravity`, `keyword`).
-3. **Credentials & Keys**: Checks for configured environment variables (`ANTHROPIC_API_KEY`, `GEMINI_API_KEY`), Google Cloud Application Default Credentials (ADC), and Agent Registry target configuration.
+3. **Credentials & Keys**: Checks for configured API keys (`GEMINI_API_KEY`, `GOOGLE_API_KEY`), Google Cloud Application Default Credentials (ADC), and Agent Registry target configuration.
 4. **Skill Directories & Cache**: Scans for resident skills across standard workspace paths (`.agents/skills`, `.claude/skills`, etc.) and cached Agent Registry bundles.
 5. **Project Configuration**: Validates the syntax, schema, and active settings in `reach.toml`.
 
