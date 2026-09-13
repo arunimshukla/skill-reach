@@ -1384,6 +1384,14 @@ def make_console() -> Callable[..., tuple[object, io.StringIO]]:
     return _make
 
 
+@pytest.fixture(autouse=True)
+def _standard_terminal_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Isolate test runs from ambient terminal types and color flags."""
+    monkeypatch.setenv("TERM", "xterm-256color")
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.delenv("FORCE_COLOR", raising=False)
+
+
 @pytest.fixture
 def wide(monkeypatch: pytest.MonkeyPatch) -> None:
     """Set terminal width environment variable to 200 columns for test consistency."""
