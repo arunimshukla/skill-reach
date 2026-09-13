@@ -56,6 +56,5 @@ uv run mkdocs build --strict
 
 Pull requests submitted to `skill-reach` are eligible for automated AI code reviews via the Antigravity CLI:
 
-- **Internal Branches**: Reviews run automatically upon opening or pushing to a pull request.
-- **External Forks**: To safeguard project secrets and API quotas, reviews on external forks are gated. A maintainer must comment `@agy /review` to authorize the review.
-- **Subsequent Pushes**: When new commits are pushed to an external fork PR, a new `@agy /review` comment is required to trigger a re-inspection.
+- **Initial Review**: Reviews run automatically once when a pull request is first opened or reopened.
+- **On-Demand & Subsequent Pushes**: To minimize noise and safeguard API quotas, reviews do not re-run automatically on push (`synchronize`). Comment `@agy /review` on the pull request to request or re-run an inspection. For external forks, a maintainer comment is required.
