@@ -97,7 +97,7 @@ class _DummyModel2Vec:
         return embeddings
 
 
-setattr(retrieval, "_load_model2vec_model", lambda _name: _DummyModel2Vec())
+cast(Any, retrieval)._load_model2vec_model = lambda _name: _DummyModel2Vec()
 
 
 # ==============================================================================
