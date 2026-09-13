@@ -68,13 +68,25 @@ jobs:
         with:
           github-token: ${{ secrets.PAT_WORKFLOW_DISPATCH || secrets.GITHUB_TOKEN }}
           script: |
-            await github.rest.actions.createWorkflowDispatch({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              workflow_id: 'antigravity-review.yml',
-              ref: context.payload.repository?.default_branch || 'main',
-              inputs: {
-                pr_number: process.env.PR_NUMBER,
-                commit_sha: process.env.COMMIT_SHA
+            try {
+              await github.rest.actions.createWorkflowDispatch({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                workflow_id: 'antigravity-review.yml',
+                ref: context.payload.repository?.default_branch || 'main',
+                inputs: {
+                  pr_number: process.env.PR_NUMBER,
+                  commit_sha: process.env.COMMIT_SHA
+                }
+              });
+            } catch (error) {
+              if (error.status === 404) {
+                core.warning(
+                  'Workflow antigravity-review.yml not found on default ' +
+                  'branch. This is expected while introducing the workflow; ' +
+                  'it will become active once merged into main.'
+                );
+              } else {
+                throw error;
               }
-            });
+            }
