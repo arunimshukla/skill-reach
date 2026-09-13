@@ -20,7 +20,7 @@ import contextlib
 import shutil
 import subprocess
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, override
+from typing import TYPE_CHECKING, Any, ClassVar, override
 
 from pydantic import Field
 
@@ -40,6 +40,7 @@ from reach.runtime._env import (
 from reach.runtime._fs import (
     probe_slot_dir,
     resolve_skill_from_path,
+    safe_cleanup_isolated_dir,
 )
 from reach.runtime._subprocess import (
     extract_content_reasoning,
@@ -78,6 +79,8 @@ class PiOptions(CliOptions):
     thinking: str | None = None
     tools: str = "read"
     no_themes: bool = True
+    agent_dir: Path | None = None
+    isolation_dir_field: ClassVar[str | None] = "agent_dir"
 
 
 def _extract_pi_tool_call(
@@ -246,7 +249,7 @@ class PiRuntime(CliAgentRuntime[PiOptions]):
         sync_google_and_gemini_keys(env)
 
         if workdir is not None and self.options.isolate_config_dir:
-            agent_dir = (Path(workdir) / ".reach_pi_agent").resolve()
+            agent_dir = (self.options.agent_dir or (Path(workdir) / ".reach_pi_agent")).resolve()
             agent_dir.mkdir(parents=True, exist_ok=True)
             env["PI_CODING_AGENT_DIR"] = str(agent_dir)
 
@@ -265,9 +268,8 @@ class PiRuntime(CliAgentRuntime[PiOptions]):
         with contextlib.suppress(OSError):
             session_root.rmdir()
         if self.options.isolate_config_dir:
-            agent_dir = (Path(workdir) / ".reach_pi_agent").resolve()
-            if agent_dir.exists():
-                shutil.rmtree(agent_dir, ignore_errors=True)
+            agent_dir = self.options.agent_dir or (Path(workdir) / ".reach_pi_agent")
+            safe_cleanup_isolated_dir(workdir, agent_dir)
 
     @override
     def select(

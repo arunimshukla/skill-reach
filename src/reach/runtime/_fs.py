@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 import threading
 from collections.abc import Iterable, Mapping
@@ -23,9 +24,43 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from reach.catalog import resident_skills
+from reach.config import resolve_path
 
 if TYPE_CHECKING:
     from reach.models import Catalog, Skill
+
+
+def validate_isolated_directory(value: Path | None, field_name: str = "directory") -> Path | None:
+    """Validate that a directory path does not point to user's home or root directory."""
+    if value is not None:
+        resolved = resolve_path(value)
+        if resolved == Path.home().resolve() or resolved == Path(resolved.root).resolve():
+            msg = (
+                f"{field_name} must not be the user's active home or root directory; "
+                "point it at an isolated directory for agent workspace files"
+            )
+            raise ValueError(msg)
+    return value
+
+
+def safe_cleanup_isolated_dir(workdir: Path | str, target_dir: Path | str | None) -> bool:
+    """Safely remove isolated target directory only if strictly contained within workdir.
+
+    Args:
+        workdir: Filesystem workspace root directory.
+        target_dir: Subdirectory candidate to clean up, or None.
+
+    Returns:
+        True if the directory existed and was removed, False otherwise.
+    """
+    if target_dir is None:
+        return False
+    resolved_workdir = Path(workdir).resolve()
+    resolved_target = Path(target_dir).resolve()
+    if resolved_workdir in resolved_target.parents and resolved_target.exists():
+        shutil.rmtree(resolved_target, ignore_errors=True)
+        return True
+    return False
 
 
 def probe_slot_id() -> int:
@@ -34,8 +69,8 @@ def probe_slot_id() -> int:
 
 
 def probe_slot_dir(parent: Path, prefix: str = "slot") -> Path:
-    """Return the scratch directory reserved for the calling thread under parent."""
-    return Path(parent) / f"{prefix}_{probe_slot_id()}"
+    """Return the scratch directory reserved for the calling process and thread under parent."""
+    return Path(parent) / f"{prefix}_{os.getpid()}_{probe_slot_id()}"
 
 
 def resolve_catalog_skills(
@@ -54,12 +89,16 @@ def install_skills(
     use_symlinks: bool = False,
 ) -> tuple[str, ...]:
     """Copy or symlink skill directories for a catalog into destination workspace."""
-    if destination.exists():
-        shutil.rmtree(destination)
-    destination.mkdir(parents=True, exist_ok=True)
+    resolved_dest = destination.resolve()
+    if resolved_dest.exists():
+        shutil.rmtree(resolved_dest)
+    resolved_dest.mkdir(parents=True, exist_ok=True)
     for name in catalog.skills:
         src = by_name[name].path
-        dst = destination / name
+        dst = (resolved_dest / name).resolve()
+        if not dst.is_relative_to(resolved_dest) or dst == resolved_dest:
+            msg = f"Skill destination path escapes destination directory: {name!r}"
+            raise ValueError(msg)
         if use_symlinks:
             try:
                 dst.symlink_to(src, target_is_directory=True)

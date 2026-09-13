@@ -41,18 +41,39 @@ def apply_provider_api_key(
     api_key: str | None,
     default_provider: str = "google",
 ) -> dict[str, str]:
-    """Map provider-specific API key into environment variables dictionary."""
+    """Map provider-specific API key into environment variables dictionary.
+
+    Supported providers:
+        - google / gemini: GEMINI_API_KEY, GOOGLE_API_KEY
+        - anthropic: ANTHROPIC_API_KEY
+        - openai: OPENAI_API_KEY
+
+    When provider is None, the key is mapped according to default_provider.
+    When provider is explicitly specified but unrecognized, raises ValueError
+    to prevent unintended key leakage to other provider endpoints.
+    """
     if not api_key:
         return env
 
-    prov = (provider or default_provider).lower()
-    for name, env_vars in _PROVIDER_KEY_ENV_VARS.items():
-        if name in prov:
-            for var in env_vars:
-                env[var] = str(api_key)
-            return env
+    if provider is not None:
+        prov = provider.strip().lower()
+        for name, env_vars in _PROVIDER_KEY_ENV_VARS.items():
+            if name in prov:
+                for var in env_vars:
+                    env[var] = str(api_key)
+                return env
 
-    fallback_vars = _PROVIDER_KEY_ENV_VARS.get(default_provider, ("OPENAI_API_KEY",))
+        supported = ", ".join(sorted(_PROVIDER_KEY_ENV_VARS))
+        msg = (
+            f"Unrecognized provider {provider!r} for automatic API key mapping. "
+            f"Supported providers: {supported}. "
+            "For custom or self-hosted providers, set required environment variables directly."
+        )
+        raise ValueError(msg)
+
+    # Provider omitted: fall back to default_provider mapping
+    default_prov = default_provider.strip().lower()
+    fallback_vars = _PROVIDER_KEY_ENV_VARS.get(default_prov, ("OPENAI_API_KEY",))
     for var in fallback_vars:
         env[var] = str(api_key)
     return env

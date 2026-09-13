@@ -31,6 +31,7 @@ from reach.catalog import build_catalogs, load_skills
 from reach.config import RuntimeSettings, agent_profiles, default_agent, load_config
 from reach.models import Catalog, CatalogMode, Skill
 from reach.runtime import (
+    AgentOptions,
     AgentRuntime,
     AntigravityRuntime,
     CatalogFit,
@@ -43,12 +44,14 @@ from reach.runtime import (
     TextGenerator,
     ToolCallInfo,
     agent_default_model,
+    antigravity_agents,
     build_runtime,
     build_text_generator,
     cli_agents,
     find_agent_for_model,
     known_agents,
     options_model,
+    runtime_class,
 )
 from reach.runtime._env import (
     apply_provider_api_key,
@@ -56,6 +59,8 @@ from reach.runtime._env import (
 )
 from reach.runtime._fs import (
     install_skills,
+    probe_slot_dir,
+    probe_slot_id,
     resolve_skill_from_path,
 )
 from reach.runtime._subprocess import (
@@ -64,20 +69,7 @@ from reach.runtime._subprocess import (
     format_subprocess_error,
     process_failure_reason,
 )
-from reach.runtime.antigravity_cli import (
-    AntigravityCliOptions,
-    AntigravityCliRuntime,
-)
-from reach.runtime.antigravity_sdk import _HAS_ANTIGRAVITY, AntigravitySdkOptions
-from reach.runtime.claude_code import (
-    ClaudeCodeOptions,
-    ClaudeCodeRuntime,
-    ClaudeGenerator,
-)
-from reach.runtime.fake import FakeGenerator, FakeOptions, FakeRuntime
-from reach.runtime.goose import GooseOptions
-from reach.runtime.keyword import KeywordOptions, KeywordRuntime
-from reach.runtime.pi import PiGenerator, PiOptions
+from reach.runtime.fake import FakeGenerator, FakeRuntime
 from reach.runtime.profiles import model_profile
 
 from .conftest import MINIMAL_OPTIONS
@@ -159,8 +151,6 @@ def test_every_agent_runtime_conforms_to_agent_runtime_contract(
     tmp_path: Path,
 ) -> None:
     """Verify every registered agent implementation satisfies the AgentRuntime ABC contract."""
-    if agent == "antigravity-sdk" and not _HAS_ANTIGRAVITY:
-        pytest.skip("google-antigravity is not installed")
     runtime = build_runtime(
         RuntimeSettings(agent=agent, options=MINIMAL_OPTIONS.get(agent, {})),
     )
@@ -173,8 +163,6 @@ def test_every_agent_runtime_conforms_to_agent_runtime_contract(
 @pytest.mark.parametrize("agent", known_agents())
 def test_every_advertised_agent_can_be_built(agent: str) -> None:
     """Verify build_runtime successfully instantiates every agent in known_agents."""
-    if agent == "antigravity-sdk" and not _HAS_ANTIGRAVITY:
-        pytest.skip("google-antigravity is not installed")
     runtime = build_runtime(
         RuntimeSettings(agent=agent, options=MINIMAL_OPTIONS.get(agent, {})),
     )
@@ -184,11 +172,11 @@ def test_every_advertised_agent_can_be_built(agent: str) -> None:
 
 def test_an_unknown_agent_names_the_alternatives() -> None:
     """Verify ValueError lists available agents when unknown agent is requested."""
-    with pytest.raises(
-        ValueError,
-        match="antigravity-cli, antigravity-sdk, claude-code, fake, goose, keyword, pi",
-    ):
+    with pytest.raises(ValueError, match="unknown runtime agent") as exc_info:
         build_runtime(RuntimeSettings(agent="codex"))
+    err_msg = str(exc_info.value)
+    for agent in known_agents():
+        assert agent in err_msg
 
 
 def test_the_agent_carries_the_configured_model() -> None:
@@ -201,8 +189,10 @@ def test_the_agent_carries_the_configured_model() -> None:
 
 
 def test_two_agents_make_the_seam_real() -> None:
-    """Verify known_agents includes both ClaudeCodeRuntime and KeywordRuntime."""
-    assert {ClaudeCodeRuntime.name, KeywordRuntime.name} <= set(known_agents())
+    """Verify known_agents registers multiple distinct implementations."""
+    agents = known_agents()
+    assert len(agents) >= 2
+    assert "fake" in agents
 
 
 @pytest.mark.parametrize("agent", known_agents())
@@ -386,8 +376,6 @@ def test_model_profile_defaults_are_sound() -> None:
 @pytest.mark.parametrize("agent", known_agents())
 def test_every_agent_supports_prompt_budget_query(agent: str) -> None:
     """Verify prompt_budget_chars method returns None or positive integer across all generators."""
-    if agent == "antigravity-sdk" and not _HAS_ANTIGRAVITY:
-        pytest.skip("google-antigravity is not installed")
     gen = build_text_generator(agent=agent, options=MINIMAL_OPTIONS.get(agent, {}))
     budget = gen.prompt_budget_chars()
     assert budget is None or budget > 0
@@ -613,24 +601,14 @@ def test_agent_runtime_default_model_reads_options_or_empty() -> None:
     assert bare.model == ""
 
 
-@pytest.mark.parametrize(
-    ("agent", "expected_type"),
-    [
-        ("antigravity-cli", AntigravityCliOptions),
-        ("antigravity-sdk", AntigravitySdkOptions),
-        ("claude-code", ClaudeCodeOptions),
-        ("keyword", KeywordOptions),
-        ("goose", GooseOptions),
-        ("pi", PiOptions),
-        ("fake", FakeOptions),
-    ],
-)
-def test_options_model_matches_registered_schema(
-    agent: str,
-    expected_type: type[BaseModel] | None,
-) -> None:
-    """Verify options_model returns designated schema model across all agents."""
-    assert options_model(agent) is expected_type
+@pytest.mark.parametrize("agent", known_agents())
+def test_options_model_matches_registered_schema(agent: str) -> None:
+    """Verify options_model returns a valid AgentOptions schema model across all agents."""
+    from reach.runtime import AgentOptions
+
+    model = options_model(agent)
+    assert model is not None
+    assert issubclass(model, AgentOptions)
 
 
 @pytest.mark.parametrize("agent", known_agents())
@@ -746,6 +724,20 @@ def test_install_skills_falls_back_to_copy_on_symlink_error(
     assert (dest / skills[0].name / "SKILL.md").is_file()
 
 
+def test_install_skills_rejects_path_traversal(
+    skill_repo: Path,
+    tmp_path: Path,
+) -> None:
+    """Verify install_skills raises ValueError if a skill name attempts directory escape."""
+    skills = load_skills(skill_repo)
+    by_name = {s.name: s for s in skills}
+    catalog = Catalog.model_construct(id="c", mode=CatalogMode.SINGLETON, skills=("../escape",))
+    by_name["../escape"] = skills[0]
+    dest = tmp_path / "installed_skills"
+    with pytest.raises(ValueError, match="escapes destination directory"):
+        install_skills(catalog, by_name, dest)
+
+
 @pytest.mark.parametrize("agent", known_agents())
 def test_install_uses_symlinks_by_default(
     agent: str,
@@ -817,8 +809,6 @@ def test_all_agents_fit_matches_catalog_rationing_capability(
 @pytest.mark.parametrize("agent", known_agents())
 def test_prompt_budget_uses_default_for_unregistered_model(agent: str) -> None:
     """Verify prompt_budget_chars returns standard default budget on unregistered model."""
-    if agent == "antigravity-sdk" and not _HAS_ANTIGRAVITY:
-        pytest.skip("google-antigravity is not installed")
     gen = build_text_generator(agent=agent, model="unmeasured-future-model-999")
     assert gen.prompt_budget_chars() == 4_194_304
 
@@ -826,8 +816,6 @@ def test_prompt_budget_uses_default_for_unregistered_model(agent: str) -> None:
 @pytest.mark.parametrize("agent", _EXECUTION_AGENTS)
 def test_prompt_budget_is_measured_for_recognized_models(agent: str) -> None:
     """Verify prompt_budget_chars returns positive integer for registered model profiles."""
-    if agent == "antigravity-sdk" and not _HAS_ANTIGRAVITY:
-        pytest.skip("google-antigravity is not installed")
     gen = build_text_generator(agent=agent)
     budget = gen.prompt_budget_chars()
     assert budget is not None
@@ -1173,14 +1161,13 @@ def test_all_agents_select_invokes_post_probe(
     """Verify select invokes post_probe lifecycle hook upon completion across all agents."""
     mock_subprocess(stdout="")
     if agent == "antigravity-sdk":
-        if not _HAS_ANTIGRAVITY:
-            pytest.skip("google-antigravity is not installed")
-        from reach.runtime.antigravity_sdk import AntigravitySdkRuntime
+        sdk_cls = runtime_class(agent)
+        assert sdk_cls is not None
 
         async def _mock_select_async(*_args: Any, **_kwargs: Any) -> SelectionOutcome:
             return SelectionOutcome()
 
-        monkeypatch.setattr(AntigravitySdkRuntime, "_select_async", _mock_select_async)
+        monkeypatch.setattr(sdk_cls, "_select_async", _mock_select_async)
 
     runtime = _build_agent(agent, tmp_path)
     called_workdirs: list[Path] = []
@@ -1238,8 +1225,6 @@ def test_isolated_config_dir_cleanup_on_auto_clean(
     tmp_path: Path,
 ) -> None:
     """Verify post_probe removes isolated runtime directories when auto_clean is enabled."""
-    if agent == "antigravity-sdk" and not _HAS_ANTIGRAVITY:
-        pytest.skip("google-antigravity is not installed")
     workdir = tmp_path / f"work_{agent}"
     workdir.mkdir(parents=True, exist_ok=True)
     dirs = [workdir / name for name in dir_names]
@@ -1299,16 +1284,15 @@ def test_build_text_generator_options_model_is_respected() -> None:
 
 
 def test_agent_options_inheritance_hierarchy() -> None:
-    """Verify AgentOptions is the root model and CliOptions subclasses it."""
+    """Verify AgentOptions is the root model and all registered agent options subclass it."""
     from reach.runtime import AgentOptions, CliOptions
-    from reach.runtime.antigravity_sdk import AntigravitySdkOptions
-    from reach.runtime.fake import FakeOptions
-    from reach.runtime.keyword import KeywordOptions
 
     assert issubclass(CliOptions, AgentOptions)
-    assert issubclass(AntigravitySdkOptions, AgentOptions)
-    assert issubclass(FakeOptions, AgentOptions)
-    assert issubclass(KeywordOptions, AgentOptions)
+
+    for agent in known_agents():
+        opt_cls = options_model(agent)
+        assert opt_cls is not None
+        assert issubclass(opt_cls, AgentOptions)
 
     # AgentOptions has core routing, isolation, and performance flags
     base = AgentOptions(
@@ -1328,23 +1312,24 @@ def test_agent_options_inheritance_hierarchy() -> None:
     assert base.isolate_config_dir is True
     assert base.auto_clean is False
 
-    # Subclasses inherit performance and isolation defaults
-    assert FakeOptions().use_symlinks is True
-    assert FakeOptions().isolate_config_dir is True
-    assert FakeOptions().auto_clean is False
-    assert KeywordOptions().use_symlinks is True
-    assert KeywordOptions().isolate_config_dir is True
-    assert KeywordOptions().auto_clean is False
+    # All options classes inherit performance and isolation defaults
+    for agent in known_agents():
+        opt_cls = options_model(agent)
+        assert opt_cls is not None
+        assert issubclass(opt_cls, AgentOptions)
+        instance = opt_cls()
+        assert instance.use_symlinks is True
+        assert instance.isolate_config_dir is True
+        assert instance.auto_clean is False
 
-    # SDK options does not have executable or extra_args
-    sdk_opts = AntigravitySdkOptions(model="gemini-2.5-flash", max_turns=3, early_exit=True)
-    assert not hasattr(sdk_opts, "executable")
-    assert not hasattr(sdk_opts, "extra_args")
-    assert sdk_opts.max_turns == 3
-    assert sdk_opts.early_exit is True
-    assert sdk_opts.use_symlinks is True
-    assert sdk_opts.isolate_config_dir is True
-    assert sdk_opts.auto_clean is False
+    # Non-CLI options do not expose executable or extra_args
+    for agent in set(known_agents()) - set(cli_agents()):
+        opt_cls = options_model(agent)
+        assert opt_cls is not None
+        assert issubclass(opt_cls, AgentOptions)
+        instance = opt_cls()
+        assert not hasattr(instance, "executable")
+        assert not hasattr(instance, "extra_args")
 
 
 @pytest.mark.parametrize(
@@ -1381,44 +1366,6 @@ def test_selection_outcome_and_probe_result_early_exit_propagation(
     assert result.early_exit is early_exit
     assert result.turns_taken == turns_taken
     assert result.invoked_skill == "target-skill"
-
-
-@pytest.mark.parametrize(
-    ("agent", "max_turns", "early_exit"),
-    [
-        ("antigravity-cli", 1, False),
-        ("antigravity-cli", 3, True),
-        ("antigravity-sdk", 1, False),
-        ("antigravity-sdk", 3, True),
-    ],
-)
-def test_antigravity_agents_enforce_schema_in_both_single_and_multi_turn(
-    agent: str,
-    max_turns: int,
-    early_exit: bool,
-    tmp_path: Path,
-) -> None:
-    """Verify Antigravity runtimes configure catalog response schema regardless of turn mode."""
-    if agent == "antigravity-sdk" and not _HAS_ANTIGRAVITY:
-        pytest.skip("google-antigravity is not installed")
-    import json
-
-    from reach.runtime.antigravity_sdk import AntigravitySdkRuntime
-
-    rt = _build_agent(agent, tmp_path, max_turns=max_turns, early_exit=early_exit)
-    rt._resident = ("skill-a", "skill-b")
-
-    if isinstance(rt, AntigravityCliRuntime):
-        cmd = rt.build_command("query")
-        assert "--json-schema" in cmd
-        assert "--disable-slash-commands" in cmd
-        schema = json.loads(cmd[cmd.index("--json-schema") + 1])
-        branches = schema["properties"]["selected_skill"]["anyOf"]
-        enum = next(b["enum"] for b in branches if "enum" in b)
-        assert sorted(enum) == ["skill-a", "skill-b"]
-    elif isinstance(rt, AntigravitySdkRuntime):
-        config = rt._select_config(tmp_path)
-        assert config.response_schema is not None
 
 
 # --- Trajectory tracking and session telemetry -------------------------------
@@ -1727,36 +1674,6 @@ def test_antigravity_runtime_selection_tools() -> None:
     assert expected == AntigravityRuntime.ANTIGRAVITY_SELECTION_TOOLS
 
 
-def test_antigravity_runtime_effective_model_provider(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Verify AntigravityRuntime auto-detects gemini provider when API keys are set."""
-    from reach.config import RuntimeSettings
-    from reach.runtime.antigravity_cli import AntigravityCliOptions, AntigravityCliRuntime
-    from reach.runtime.antigravity_sdk import AntigravitySdkRuntime
-
-    monkeypatch.setenv("GEMINI_API_KEY", "test-key-123")
-    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
-
-    cli_rt = AntigravityCliRuntime(
-        options=AntigravityCliOptions(model="gemini-3.7-flash"),
-    )
-    assert cli_rt.effective_model_provider == "gemini"
-
-    if _HAS_ANTIGRAVITY:
-        sdk_rt = AntigravitySdkRuntime(
-            settings=RuntimeSettings(
-                agent="antigravity-sdk",
-                options={"model": "gemini-3.7-flash"},
-            ),
-        )
-        assert sdk_rt.effective_model_provider == "gemini"
-
-    # Non-gemini model does not activate provider
-    non_gemini = AntigravityCliRuntime(
-        options=AntigravityCliOptions(model="claude-3-opus"),
-    )
-    assert non_gemini.effective_model_provider is None
-
-
 # --- CLI agent runtime execution template ------------------------------------
 
 
@@ -1862,7 +1779,7 @@ def test_cli_generator_complete_success(
 ) -> None:
     """Verify CLI generator complete executes subprocess and returns text."""
     mock_subprocess(stdout="generated answer\n")
-    gen = PiGenerator()
+    gen = build_text_generator(agent="pi")
     assert gen.complete("test prompt") == "generated answer"
     assert gen.completions == 1
 
@@ -1872,7 +1789,7 @@ def test_cli_generator_complete_failure(
 ) -> None:
     """Verify CLI generator complete raises on subprocess failure."""
     mock_subprocess(returncode=1, stderr="fatal error")
-    gen = PiGenerator()
+    gen = build_text_generator(agent="pi")
     with pytest.raises(RuntimeError, match=r"generation failed: fatal error"):
         gen.complete("test prompt")
 
@@ -1999,18 +1916,6 @@ def test_all_agents_parse_stream_empty_input(agent: str, tmp_path: Path) -> None
     assert not summary.saw_result
 
 
-def test_keyword_runtime_parse_stream_extracts_skill() -> None:
-    """Verify KeywordRuntime extracts invoked skill from stream lines."""
-    runtime = KeywordRuntime()
-    summary = runtime.parse_stream(
-        ["Model chose tool cloud-sql to proceed"],
-        resident=("cloud-sql", "gcloud"),
-    )
-    assert summary.invoked_skill == "cloud-sql"
-    assert summary.invoked_skills == ("cloud-sql",)
-    assert summary.saw_result
-
-
 def test_fake_runtime_parse_stream_uses_configured_default() -> None:
     """Verify FakeRuntime extracts default response during stream parsing."""
     runtime = FakeRuntime(default="alpha")
@@ -2117,51 +2022,38 @@ def test_apply_provider_api_key_fallback_and_empty() -> None:
     apply_provider_api_key(env3, provider=None, api_key="k2", default_provider="google")
     assert env3 == {"GEMINI_API_KEY": "k2", "GOOGLE_API_KEY": "k2"}
 
-    # Unknown provider falls back to default_provider
+    # Explicit unknown provider raises ValueError to avoid secret leakage
     env4: dict[str, str] = {}
-    apply_provider_api_key(env4, provider="unknown-custom", api_key="k3", default_provider="openai")
-    assert env4 == {"OPENAI_API_KEY": "k3"}
+    with pytest.raises(ValueError, match="Unrecognized provider 'unknown-custom'"):
+        apply_provider_api_key(
+            env4,
+            provider="unknown-custom",
+            api_key="k3",
+            default_provider="openai",
+        )
 
 
-@pytest.mark.parametrize(
-    "agent",
-    [a for a in _EXECUTION_AGENTS if a != "claude-code"],
-)
-def test_all_google_supporting_agents_sync_ambient_keys(
-    agent: str,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Verify Google-supporting agents synchronize ambient GEMINI and GOOGLE keys in build_env."""
-    monkeypatch.setenv("GEMINI_API_KEY", "ambient-sync-key")
-    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
-    runtime = _build_agent(agent, tmp_path)
-    env = runtime.build_env(tmp_path / f"work_{agent}")
-    assert env["GEMINI_API_KEY"] == "ambient-sync-key"
-    assert env["GOOGLE_API_KEY"] == "ambient-sync-key"
+def test_probe_slot_dir_includes_pid_and_thread(tmp_path: Path) -> None:
+    """Verify probe_slot_dir isolates directories by process ID and thread ID."""
+    import os
+
+    slot = probe_slot_dir(tmp_path, prefix="test_slot")
+    expected_name = f"test_slot_{os.getpid()}_{probe_slot_id()}"
+    assert slot.name == expected_name
+    assert slot.parent == tmp_path
 
 
 def test_cli_agents_discovery() -> None:
     """Verify cli_agents returns registered CLI driver names and filters non-CLI runtimes."""
-    agents = cli_agents()
-    assert agents == ("antigravity-cli", "claude-code", "goose", "pi")
-    for agent in agents:
+    cli = set(cli_agents())
+    assert cli <= set(known_agents())
+    for agent in cli:
         opt = options_model(agent)
         assert opt is not None
         assert issubclass(opt, CliOptions)
-
-
-def test_claude_generator_build_env_forwards_api_key() -> None:
-    """Verify ClaudeGenerator build_env passes ANTHROPIC_API_KEY when configured in options."""
-    from reach.runtime.claude_code import ClaudeCodeOptions
-
-    gen = ClaudeGenerator(
-        options=ClaudeCodeOptions(
-            api_key="claude-secret-key",
-        ),
-    )
-    env = gen.build_env()
-    assert env["ANTHROPIC_API_KEY"] == "claude-secret-key"
+    for agent in set(known_agents()) - cli:
+        opt = options_model(agent)
+        assert opt is None or not issubclass(opt, CliOptions)
 
 
 def test_model_validators_preserve_input_dict_immutability() -> None:
@@ -2181,3 +2073,249 @@ def test_model_validators_preserve_input_dict_immutability() -> None:
     outcome = SelectionOutcome.model_validate(outcome_dict)
     assert outcome.error is None
     assert outcome_dict["error"] == "process killed"
+
+
+def test_validate_isolated_directory(tmp_path: Path) -> None:
+    """Verify validate_isolated_directory rejects active home and root."""
+    from reach.runtime._fs import validate_isolated_directory
+
+    assert validate_isolated_directory(None) is None
+    custom = tmp_path / "reach_isolated"
+    assert validate_isolated_directory(custom) == custom
+
+    with pytest.raises(ValueError, match="must not be the user's active home or root"):
+        validate_isolated_directory(Path.home(), "home_dir")
+
+    with pytest.raises(ValueError, match="must not be the user's active home or root"):
+        validate_isolated_directory(Path("/"), "home_dir")
+
+
+@pytest.mark.parametrize(
+    "agent",
+    [a for a in known_agents() if getattr(options_model(a), "isolation_dir_field", None)],
+)
+def test_agent_options_reject_home_and_root(agent: str, tmp_path: Path) -> None:
+    """Verify all agent options models reject active home and root paths."""
+    opt_cls = options_model(agent)
+    assert opt_cls is not None
+    assert issubclass(opt_cls, AgentOptions)
+    field_name = opt_cls.isolation_dir_field
+    assert field_name is not None
+
+    with pytest.raises(PydanticValidationError, match="must not be the user's active home or root"):
+        opt_cls.model_validate({field_name: str(Path.home())})
+
+    with pytest.raises(PydanticValidationError, match="must not be the user's active home or root"):
+        opt_cls.model_validate({field_name: "/"})
+
+    valid_path = tmp_path / "isolated_test"
+    valid = opt_cls.model_validate({field_name: str(valid_path)})
+    assert getattr(valid, field_name) == valid_path
+
+
+@pytest.mark.parametrize("agent", known_agents())
+def test_runtime_post_probe_never_cleans_outside_workdir(agent: str, tmp_path: Path) -> None:
+    """Verify post_probe on all runtimes safely ignores external directories without raising."""
+    workdir = tmp_path / "workspace"
+    workdir.mkdir()
+    outside_dir = tmp_path / "outside"
+    outside_dir.mkdir()
+    canary = outside_dir / "canary.txt"
+    canary.write_text("safe")
+
+    opts: dict[str, Any] = dict(MINIMAL_OPTIONS.get(agent, {}))
+    opts["auto_clean"] = True
+    opt_cls = options_model(agent)
+    if opt_cls is not None and issubclass(opt_cls, AgentOptions) and opt_cls.isolation_dir_field:
+        opts[opt_cls.isolation_dir_field] = outside_dir
+
+    runtime = build_runtime(RuntimeSettings(agent=agent, options=opts))
+    runtime.post_probe(workdir)
+
+    assert canary.exists()
+
+
+@pytest.mark.parametrize(
+    ("target_rel", "should_delete"),
+    [
+        (".isolated_dir", True),
+        ("nested/sub_isolated", True),
+    ],
+)
+def test_safe_cleanup_isolated_dir_removes_contained_dir(
+    target_rel: str,
+    should_delete: bool,
+    tmp_path: Path,
+) -> None:
+    """Verify safe_cleanup_isolated_dir removes directories strictly inside workdir."""
+    from reach.runtime._fs import safe_cleanup_isolated_dir
+
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+    target = workdir / target_rel
+    target.mkdir(parents=True)
+    (target / "dummy.txt").write_text("content")
+
+    deleted = safe_cleanup_isolated_dir(workdir, target)
+    assert deleted is should_delete
+    assert not target.exists()
+
+
+def test_safe_cleanup_isolated_dir_refuses_outside_or_root(tmp_path: Path) -> None:
+    """Verify safe_cleanup_isolated_dir refuses outside dirs, None, or workdir itself."""
+    from reach.runtime._fs import safe_cleanup_isolated_dir
+
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "file.txt").write_text("content")
+
+    # Outside dir
+    assert safe_cleanup_isolated_dir(workdir, outside) is False
+    assert outside.exists()
+
+    # Workdir itself
+    assert safe_cleanup_isolated_dir(workdir, workdir) is False
+    assert workdir.exists()
+
+    # None
+    assert safe_cleanup_isolated_dir(workdir, None) is False
+
+    # Non-existent
+    assert safe_cleanup_isolated_dir(workdir, workdir / "non_existent") is False
+
+
+@pytest.mark.parametrize("agent", known_agents())
+def test_runtime_isolation_dir_properties(agent: str, tmp_path: Path) -> None:
+    """Verify isolation_dir_field and custom_isolation_dir properties reflect configuration."""
+    opts: dict[str, Any] = dict(MINIMAL_OPTIONS.get(agent, {}))
+    opt_cls = options_model(agent)
+    custom_dir = tmp_path / f"custom_{agent}"
+    if opt_cls is not None and issubclass(opt_cls, AgentOptions) and opt_cls.isolation_dir_field:
+        opts[opt_cls.isolation_dir_field] = custom_dir
+
+    runtime = build_runtime(RuntimeSettings(agent=agent, options=opts))
+    if opt_cls is not None and issubclass(opt_cls, AgentOptions) and opt_cls.isolation_dir_field:
+        assert runtime.isolation_dir_field == opt_cls.isolation_dir_field
+        assert runtime.custom_isolation_dir == custom_dir
+        assert runtime.options.custom_isolation_dir == custom_dir
+    else:
+        assert runtime.isolation_dir_field is None
+        assert runtime.custom_isolation_dir is None
+
+
+def test_antigravity_agents_discovery() -> None:
+    """Verify antigravity_agents and runtime_class discover Antigravity runtimes."""
+    agents = antigravity_agents()
+    assert "antigravity-cli" in agents
+    assert "antigravity-sdk" in agents
+    for agent in agents:
+        cls = runtime_class(agent)
+        assert cls is not None
+        assert issubclass(cls, AntigravityRuntime)
+
+
+@pytest.mark.parametrize("agent", antigravity_agents())
+def test_antigravity_runtime_effective_model_provider(
+    agent: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify effective_model_provider auto-detects gemini across all Antigravity runtimes."""
+    # 1. Auto-detect when GEMINI_API_KEY is present
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key-123")
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    rt = build_runtime(RuntimeSettings(agent=agent, options={"model": "gemini-3.7-flash"}))
+    assert isinstance(rt, AntigravityRuntime)
+    assert hasattr(rt, "effective_model_provider")
+    assert rt.effective_model_provider == "gemini"
+
+    # 2. Auto-detect when GOOGLE_API_KEY is present
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.setenv("GOOGLE_API_KEY", "test-key-456")
+    rt = build_runtime(RuntimeSettings(agent=agent, options={"model": "gemini-3.7-flash"}))
+    assert isinstance(rt, AntigravityRuntime)
+    assert rt.effective_model_provider == "gemini"
+
+    # 3. Explicit provider overrides auto-detect when supported by options model
+    opt_cls = options_model(agent)
+    if opt_cls is not None and "model_provider" in opt_cls.model_fields:
+        rt = build_runtime(
+            RuntimeSettings(
+                agent=agent,
+                options={"model": "gemini-3.7-flash", "model_provider": "custom-prov"},
+            )
+        )
+        assert isinstance(rt, AntigravityRuntime)
+        assert rt.effective_model_provider == "custom-prov"
+
+    # 4. Non-gemini model does not auto-detect
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key-123")
+    rt = build_runtime(RuntimeSettings(agent=agent, options={"model": "claude-3-opus"}))
+    assert isinstance(rt, AntigravityRuntime)
+    assert rt.effective_model_provider is None
+
+    # 5. No keys present results in None
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    rt = build_runtime(RuntimeSettings(agent=agent, options={"model": "gemini-3.7-flash"}))
+    assert isinstance(rt, AntigravityRuntime)
+    assert rt.effective_model_provider is None
+
+
+@pytest.mark.parametrize("agent", antigravity_agents())
+def test_antigravity_runtime_effective_api_key_resolution(
+    agent: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify effective_api_key resolution hierarchy across Antigravity runtimes."""
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+
+    # Fallback to GEMINI_API_KEY
+    monkeypatch.setenv("GEMINI_API_KEY", "env-gemini-key")
+    rt = build_runtime(RuntimeSettings(agent=agent, options={"model": "gemini-3.7-flash"}))
+    assert isinstance(rt, AntigravityRuntime)
+    assert rt.effective_api_key == "env-gemini-key"
+
+    # Fallback to GOOGLE_API_KEY if GEMINI_API_KEY unset
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.setenv("GOOGLE_API_KEY", "env-google-key")
+    rt = build_runtime(RuntimeSettings(agent=agent, options={"model": "gemini-3.7-flash"}))
+    assert isinstance(rt, AntigravityRuntime)
+    assert rt.effective_api_key == "env-google-key"
+
+    # Options api_key takes precedence
+    rt = build_runtime(
+        RuntimeSettings(
+            agent=agent,
+            options={"model": "gemini-3.7-flash", "api_key": "explicit-key"},
+        )
+    )
+    assert isinstance(rt, AntigravityRuntime)
+    assert rt.effective_api_key == "explicit-key"
+
+
+@pytest.mark.parametrize("agent", cli_agents())
+def test_cli_agents_select_executes_in_workdir_cwd(
+    agent: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Verify select executes underlying process with cwd pointing to workdir."""
+    workdir = tmp_path / "sandbox_workspace"
+    workdir.mkdir()
+    seen: dict[str, Any] = {}
+
+    def record_run(*args: Any, **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        seen.update(kwargs)
+        return subprocess.CompletedProcess(
+            args=args,
+            returncode=0,
+            stdout="",
+            stderr="",
+        )
+
+    monkeypatch.setattr(subprocess, "run", record_run)
+    opts = dict(MINIMAL_OPTIONS.get(agent, {}))
+    runtime = build_runtime(RuntimeSettings(agent=agent, options=opts))
+    runtime.select("test query", workdir)
+
+    assert "cwd" in seen
+    assert Path(seen["cwd"]).resolve() == workdir.resolve()

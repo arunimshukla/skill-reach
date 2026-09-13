@@ -20,6 +20,7 @@ import hashlib
 from typing import TYPE_CHECKING, cast
 
 import pytest
+from pydantic import ValidationError
 
 from reach.catalog import (
     _compute_cosine_bm25_distance_matrix,
@@ -1013,3 +1014,34 @@ def test_build_corpus_scaling_queries_with_anchors() -> None:
         anchor_skills=None,
     )
     assert len(res_all.queries) == 3
+
+
+@pytest.mark.parametrize("empty_name", ["", "   ", "\t\n"])
+def test_skill_name_requires_non_empty(empty_name: str, tmp_path: Path) -> None:
+    """Verify Skill model raises ValidationError when name is empty or whitespace."""
+    with pytest.raises(ValidationError):
+        Skill(
+            name=empty_name,
+            description="A valid description.",
+            path=tmp_path,
+        )
+
+
+@pytest.mark.parametrize(
+    "valid_name",
+    [
+        "code-review",
+        "pdf-processing",
+        "++",
+        "my_skill",
+        "SkillWithCamelCase",
+    ],
+)
+def test_skill_name_accepts_non_empty(valid_name: str, tmp_path: Path) -> None:
+    """Verify Skill model accepts non-empty names across naming conventions."""
+    skill = Skill(
+        name=valid_name,
+        description="A valid description.",
+        path=tmp_path,
+    )
+    assert skill.name == valid_name

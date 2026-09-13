@@ -86,7 +86,11 @@ def clean(
     console = build_console(quiet=quiet)
     cache_mgr = RegistryCacheManager()
 
-    total_bytes, paths = cache_mgr.clean(project=project, dry_run=dry_run)
+    try:
+        total_bytes, paths = cache_mgr.clean(project=project, dry_run=dry_run)
+    except ValueError as err:
+        console.print(f"[bold red]Error:[/bold red] {err}")
+        return 1
 
     # If --all is passed, also clean .reach run artifacts
     extra_paths: list[Path] = []

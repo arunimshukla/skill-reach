@@ -949,3 +949,14 @@ def test_result_event_with_non_numeric_telemetry() -> None:
     assert summary.cost_usd is None
     assert summary.duration_ms is None
     assert summary.result_subtype == "success"
+
+
+def test_claude_generator_build_env_forwards_api_key() -> None:
+    """Verify ClaudeGenerator build_env passes ANTHROPIC_API_KEY when configured in options."""
+    gen = ClaudeGenerator(
+        options=ClaudeCodeOptions(
+            api_key="claude-secret-key",
+        ),
+    )
+    env = gen.build_env()
+    assert env["ANTHROPIC_API_KEY"] == "claude-secret-key"

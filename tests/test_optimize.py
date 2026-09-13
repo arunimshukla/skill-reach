@@ -436,7 +436,7 @@ def test_evaluate_candidate_materializes_candidate_description_to_disk(
     installed_descriptions: list[str] = []
 
     class InspectingRuntime(FakeRuntime):
-        def install(self, catalog, skills, workdir):
+        def install(self, catalog, skills, workdir) -> Path:
             for s in skills:
                 if s.name == "calc-tool":
                     manifest = s.path / "SKILL.md"
@@ -491,7 +491,7 @@ def test_evaluate_candidate_handles_nonexistent_or_file_target_path(
     manifest_contents: list[str] = []
 
     class CapturingRuntime(FakeRuntime):
-        def install(self, catalog, skills, workdir):
+        def install(self, catalog, skills, workdir) -> Path:
             for s in skills:
                 if s.name == "ghost-tool":
                     manifest = s.path / "SKILL.md"

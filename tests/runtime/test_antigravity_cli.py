@@ -401,6 +401,14 @@ def test_home_dir_must_not_be_the_operators_real_home(
         )
 
 
+def test_home_dir_must_not_be_root() -> None:
+    """Verify ValidationError is raised if home_dir resolves to root directory."""
+    with pytest.raises(ValidationError, match="home_dir"):
+        AntigravityCliOptions.model_validate(
+            {"model": "test-model", "home_dir": "/"},
+        )
+
+
 def test_model_provider_accepts_configured_provider(home_dir: Path) -> None:
     """Verify model_provider and provider fields validate successfully."""
     opts = AntigravityCliOptions.model_validate(
@@ -583,44 +591,6 @@ def test_trust_replaces_rather_than_accumulates(home_dir: Path, tmp_path: Path) 
     _ensure_isolated_settings(home_dir, trust=second)
     settings = json.loads(_isolated_settings_path(home_dir).read_text())
     assert settings["trustedWorkspaces"] == [str(second.resolve())]
-
-
-def test_ensure_isolated_settings_copies_oauth_token_when_present(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    """Verify _ensure_isolated_settings copies antigravity-oauth-token to isolated home."""
-    fake_user_home = tmp_path / "user_home"
-    fake_agy_home = tmp_path / "isolated_home"
-    token_file = fake_user_home / ".gemini" / "antigravity-cli" / "antigravity-oauth-token"
-    token_file.parent.mkdir(parents=True)
-    token_file.write_text("test-token-value")
-    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_user_home))
-
-    _ensure_isolated_settings(fake_agy_home)
-    isolated_token = fake_agy_home / ".gemini" / "antigravity-cli" / "antigravity-oauth-token"
-    assert isolated_token.is_file()
-    assert isolated_token.read_text() == "test-token-value"
-
-
-def test_ensure_isolated_settings_suppresses_and_removes_oauth_token_for_gemini(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    """Verify isolated settings suppresses and deletes oauth token when provider is gemini."""
-    fake_user_home = tmp_path / "user_home"
-    fake_agy_home = tmp_path / "isolated_home"
-    user_token = fake_user_home / ".gemini" / "antigravity-cli" / "antigravity-oauth-token"
-    user_token.parent.mkdir(parents=True)
-    user_token.write_text("user-token")
-    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_user_home))
-
-    isolated_token = fake_agy_home / ".gemini" / "antigravity-cli" / "antigravity-oauth-token"
-    isolated_token.parent.mkdir(parents=True)
-    isolated_token.write_text("pre-existing-token")
-
-    _ensure_isolated_settings(fake_agy_home, model_provider="gemini")
-    assert not isolated_token.exists()
 
 
 # --- Catalog installation and permission scoping -----------------------------
@@ -1419,24 +1389,6 @@ def test_antigravity_cli_generator_configures_isolated_settings(home_dir: Path) 
     assert set(settings["permissions"]["deny"]) == set(DENIED_PERMISSION_ACTIONS)
 
 
-def test_antigravity_cli_generator_copies_oauth_token_when_present(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Verify AntigravityCliGenerator copies oauth token from user home to isolated home."""
-    fake_user_home = tmp_path / "user_home"
-    token_src = fake_user_home / ".gemini" / "antigravity-cli" / "antigravity-oauth-token"
-    token_src.parent.mkdir(parents=True, exist_ok=True)
-    token_src.write_text("oauth-token-secret", encoding="utf-8")
-    monkeypatch.setattr(Path, "home", lambda: fake_user_home)
-
-    iso_home = tmp_path / "isolated_home"
-    AntigravityCliGenerator(options=AntigravityCliOptions(home_dir=iso_home))
-    token_dst = iso_home / ".gemini" / "antigravity-cli" / "antigravity-oauth-token"
-    assert token_dst.is_file()
-    assert token_dst.read_text(encoding="utf-8") == "oauth-token-secret"
-
-
 def test_antigravity_cli_generator_build_env_syncs_keys_and_procs(home_dir: Path) -> None:
     """Verify AntigravityCliGenerator build_env sets home, synced api keys, and GOMAXPROCS."""
     generator = AntigravityCliGenerator(
@@ -1458,5 +1410,61 @@ def test_antigravity_cli_generator_cleans_owned_home_dir() -> None:
     gen = AntigravityCliGenerator()
     created_home = gen.home_dir
     assert created_home.is_dir()
-    gen.__del__()
+    gen.cleanup()
     assert not created_home.exists()
+
+
+def test_antigravity_cli_runtime_registers_atexit_for_temp_home(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify AntigravityCliRuntime registers atexit cleanup when generating a temporary home."""
+    registered: list[object] = []
+    monkeypatch.setattr("atexit.register", registered.append)
+    runtime = AntigravityCliRuntime()
+    try:
+        assert runtime.cleanup in registered
+    finally:
+        runtime.cleanup()
+
+
+def test_antigravity_cli_generator_registers_atexit_for_temp_home(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify AntigravityCliGenerator registers atexit cleanup when generating a temporary home."""
+    registered: list[object] = []
+    monkeypatch.setattr("atexit.register", registered.append)
+    gen = AntigravityCliGenerator()
+    try:
+        assert gen.cleanup in registered
+    finally:
+        gen.cleanup()
+
+
+@pytest.mark.parametrize(
+    ("max_turns", "early_exit"),
+    [
+        (1, False),
+        (3, True),
+    ],
+)
+def test_antigravity_cli_enforces_schema_in_both_single_and_multi_turn(
+    max_turns: int,
+    early_exit: bool,
+    home_dir: Path,
+) -> None:
+    """Verify AntigravityCliRuntime configures catalog response schema regardless of turn mode."""
+    rt = AntigravityCliRuntime(
+        options=AntigravityCliOptions(
+            home_dir=home_dir,
+            max_turns=max_turns,
+            early_exit=early_exit,
+        )
+    )
+    rt._resident = ("skill-a", "skill-b")
+    cmd = rt.build_command("query")
+    assert "--json-schema" in cmd
+    assert "--disable-slash-commands" in cmd
+    schema = json.loads(cmd[cmd.index("--json-schema") + 1])
+    branches = schema["properties"]["selected_skill"]["anyOf"]
+    enum = next(b["enum"] for b in branches if "enum" in b)
+    assert sorted(enum) == ["skill-a", "skill-b"]

@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING, Annotated, Any, Final
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, computed_field
 
+from reach._io import atomic_write_text
 from reach.catalog import load_skills, split_frontmatter
 from reach.config import (
     OptimizeSettings,
@@ -185,7 +186,7 @@ def update_skill_description(manifest_path: Path, new_description: str) -> bool:
             return False
         data["description"] = new_description
         new_yaml = yaml.safe_dump(data, sort_keys=False, allow_unicode=True).strip()
-        manifest_path.write_text(f"---\n{new_yaml}\n---{body}", encoding="utf-8")
+        atomic_write_text(manifest_path, f"---\n{new_yaml}\n---{body}", encoding="utf-8")
     except (OSError, yaml.YAMLError):
         return False
     return True

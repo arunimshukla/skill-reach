@@ -18,12 +18,11 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import subprocess
 from collections.abc import Iterable, Mapping, Sequence
 from math import floor
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, override
+from typing import TYPE_CHECKING, Any, ClassVar, override
 
 from pydantic import BaseModel, ConfigDict, Field, model_serializer
 from pydantic import ValidationError as PydanticValidationError
@@ -39,6 +38,7 @@ from reach.runtime import (
     SkillRoot,
     agent_default_model,
 )
+from reach.runtime._fs import safe_cleanup_isolated_dir
 from reach.runtime._subprocess import (
     iter_json_lines,
     process_failure_reason,
@@ -169,6 +169,8 @@ class ClaudeCodeOptions(CliOptions):
     tools: str | None = "Skill"
     strict_mcp_config: bool = True
     no_session_persistence: bool = True
+    config_dir: Path | None = None
+    isolation_dir_field: ClassVar[str | None] = "config_dir"
 
     @model_serializer(mode="wrap")
     def _omit_unset_listing_controls(
@@ -526,7 +528,7 @@ class ClaudeCodeRuntime(CliAgentRuntime[ClaudeCodeOptions]):
         if self.options.disable_bundled_skills:
             env["CLAUDE_CODE_DISABLE_BUNDLED_SKILLS"] = "1"
         if workdir is not None and self.options.isolate_config_dir:
-            config_dir = workdir / ".reach_claude_config"
+            config_dir = (self.options.config_dir or (workdir / ".reach_claude_config")).resolve()
             config_dir.mkdir(parents=True, exist_ok=True)
             env["CLAUDE_CONFIG_DIR"] = str(config_dir)
         return env
@@ -537,9 +539,8 @@ class ClaudeCodeRuntime(CliAgentRuntime[ClaudeCodeOptions]):
         if not self.options.auto_clean:
             return
         if self.options.isolate_config_dir:
-            config_dir = Path(workdir) / ".reach_claude_config"
-            if config_dir.exists():
-                shutil.rmtree(config_dir, ignore_errors=True)
+            config_dir = self.options.config_dir or (Path(workdir) / ".reach_claude_config")
+            safe_cleanup_isolated_dir(workdir, config_dir)
 
     @override
     def validate_outcome(

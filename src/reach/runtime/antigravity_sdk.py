@@ -18,10 +18,9 @@ from __future__ import annotations
 
 import asyncio
 import os
-import shutil
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast, override
+from typing import TYPE_CHECKING, Any, ClassVar, cast, override
 
 if TYPE_CHECKING:
     from collections.abc import Coroutine
@@ -58,6 +57,7 @@ from reach.runtime._env import (
 )
 from reach.runtime._fs import (
     resolve_skill_from_path,
+    safe_cleanup_isolated_dir,
 )
 from reach.runtime._subprocess import (
     check_tool_leak,
@@ -106,6 +106,7 @@ class AntigravitySdkOptions(AgentOptions):
         default_factory=lambda: agent_default_model("antigravity-sdk") or DEFAULT_GEMINI_MODEL,
     )
     app_data_dir: Path | None = None
+    isolation_dir_field: ClassVar[str | None] = "app_data_dir"
 
 
 class AntigravitySdkRuntime(AntigravityRuntime):
@@ -269,11 +270,8 @@ class AntigravitySdkRuntime(AntigravityRuntime):
         if not self.options.auto_clean:
             return
         if self.options.isolate_config_dir:
-            sdk_dir = (
-                self.options.app_data_dir or (Path(workdir) / ".reach_antigravity_sdk")
-            ).resolve()
-            if sdk_dir.exists():
-                shutil.rmtree(sdk_dir, ignore_errors=True)
+            sdk_dir = self.options.app_data_dir or (Path(workdir) / ".reach_antigravity_sdk")
+            safe_cleanup_isolated_dir(workdir, sdk_dir)
 
     @override
     def select(

@@ -118,6 +118,16 @@ class Skill(BaseModel):
         description="Whether the skill allows model invocation.",
     )
 
+    @field_validator("name")
+    @classmethod
+    def _require_name(cls, value: str) -> str:
+        """Validate that the skill name contains non-whitespace text."""
+        clean = value.strip()
+        if not clean:
+            msg = "name must be non-empty"
+            raise ValueError(msg)
+        return clean
+
     @field_validator("description")
     @classmethod
     def _require_description(cls, value: str) -> str:

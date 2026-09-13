@@ -464,3 +464,13 @@ def test_select_passes_env_and_cleans_when_auto_clean(
 
     # Because auto_clean=True, isolated directory should be removed in post_probe
     assert not (workdir / ".reach_goose").exists()
+
+
+def test_goose_runtime_initializes_base_attributes() -> None:
+    """Verify GooseRuntime properly calls base class __init__ and sets tracking attributes."""
+    opts = GooseOptions(auto_clean=False)
+    rt = GooseRuntime(options=opts)
+    assert rt.options == opts
+    assert rt.completions == 0
+    assert rt.completion_cost_usd == 0.0
+    assert rt.is_cli is True

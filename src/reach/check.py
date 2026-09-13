@@ -53,7 +53,6 @@ __all__ = [
     "CheckOutcome",
     "CheckStage",
     "EmpiricalMetrics",
-    "_build_check_assertions",
     "changed_skills",
     "run_check",
 ]
@@ -122,9 +121,13 @@ def changed_skills(
 ) -> tuple[str, ...]:
     """Identify skill names modified in git repository relative to a reference."""
     work_dir = Path(root).resolve() if root is not None else Path.cwd().resolve()
+    clean_since = since.strip()
+    if clean_since.startswith("-"):
+        msg = f"git reference must not begin with a dash: {since!r}"
+        raise ValueError(msg)
     try:
         completed = subprocess.run(
-            ["git", "diff", "--name-only", since],
+            ["git", "diff", "--name-only", clean_since, "--"],
             capture_output=True,
             text=True,
             cwd=work_dir,

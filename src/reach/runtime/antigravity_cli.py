@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+import atexit
+import contextlib
 import json
 import os
 import re
@@ -23,9 +25,9 @@ import shutil
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Self, override
+from typing import TYPE_CHECKING, Any, ClassVar, Self, override
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field
 from pydantic import ValidationError as PydanticValidationError
 
 from reach.config import DEFAULT_GEMINI_MODEL, RuntimeSettings, resolve_path
@@ -126,13 +128,6 @@ def _ensure_isolated_settings(
     if trust is not None:
         settings["trustedWorkspaces"] = [str(resolve_path(trust))]
     path.write_text(json.dumps(settings, sort_keys=True, indent=2))
-    user_token = Path.home() / ".gemini" / "antigravity-cli" / "antigravity-oauth-token"
-    isolated_token = path.parent / "antigravity-oauth-token"
-    if model_provider != "gemini":
-        if user_token.is_file() and not isolated_token.exists():
-            shutil.copy2(user_token, isolated_token)
-    elif isolated_token.exists():
-        isolated_token.unlink()
 
 
 class AntigravityCliOptions(CliOptions):
@@ -143,23 +138,12 @@ class AntigravityCliOptions(CliOptions):
         default_factory=lambda: agent_default_model("antigravity-cli") or DEFAULT_GEMINI_MODEL,
     )
     home_dir: Path | None = None
+    isolation_dir_field: ClassVar[str | None] = "home_dir"
     model_provider: str | None = None
     disable_slash_commands: bool = True
     dangerously_skip_permissions: bool = True
     print_timeout: str | None = None
     go_max_procs: int = 4
-
-    @field_validator("home_dir")
-    @classmethod
-    def _home_dir_is_not_the_real_one(cls, value: Path | None) -> Path | None:
-        """Validate that home_dir does not point to the user's active home directory."""
-        if value is not None and resolve_path(value) == Path.home().resolve():
-            msg = (
-                "home_dir must not be the user's active home directory; "
-                "point it at an isolated directory for agent workspace files"
-            )
-            raise ValueError(msg)
-        return value
 
 
 class ToolAttempt(BaseModel):
@@ -396,6 +380,7 @@ class AntigravityCliRuntime(CliAgentRuntime[AntigravityCliOptions], AntigravityR
             home_dir = Path(tempfile.mkdtemp(prefix="reach-agy-home-"))
             options = options.model_copy(update={"home_dir": home_dir})
             self._temp_home = True
+            atexit.register(self.cleanup)
         self.options = options
         self._resident: tuple[str, ...] = ()
         _ensure_isolated_settings(
@@ -409,6 +394,8 @@ class AntigravityCliRuntime(CliAgentRuntime[AntigravityCliOptions], AntigravityR
             if self.options.home_dir.is_dir():
                 shutil.rmtree(self.options.home_dir, ignore_errors=True)
             self._temp_home = False
+            with contextlib.suppress(Exception):
+                atexit.unregister(self.cleanup)
 
     def __del__(self) -> None:
         """Clean up resources when garbage collected."""
@@ -581,15 +568,24 @@ class AntigravityCliGenerator(BaseTextGenerator[AntigravityCliOptions]):
         super().__init__(model=opts.model or model, timeout_s=timeout_s, options=opts)
         self.home_dir = opts.home_dir or Path(tempfile.mkdtemp(prefix="reach-agy-draft-"))
         self._owns_home_dir = opts.home_dir is None
+        if self._owns_home_dir:
+            atexit.register(self.cleanup)
         _ensure_isolated_settings(
             self.home_dir,
             model_provider=self.options.model_provider,
         )
 
-    def __del__(self) -> None:
+    def cleanup(self) -> None:
         """Clean temporary home directory if created by this generator instance."""
         if getattr(self, "_owns_home_dir", False) and self.home_dir.exists():
             shutil.rmtree(self.home_dir, ignore_errors=True)
+            self._owns_home_dir = False
+            with contextlib.suppress(Exception):
+                atexit.unregister(self.cleanup)
+
+    def __del__(self) -> None:
+        """Clean temporary home directory if created by this generator instance."""
+        self.cleanup()
 
     @property
     def effective_api_key(self) -> str | None:

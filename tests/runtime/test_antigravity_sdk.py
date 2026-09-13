@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import json
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Never
 
 import pytest
@@ -152,20 +153,6 @@ def test_antigravity_sdk_options_effort() -> None:
     opts_no_effort = AntigravitySdkOptions(model="gemini-3.8-flash")
     assert opts_no_effort.model == "gemini-3.8-flash"
     assert opts_no_effort.effort is None
-
-
-def test_antigravity_sdk_effective_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Verify effective_api_key prioritizes options.api_key over environment variables."""
-    monkeypatch.setenv("GEMINI_API_KEY", "env-key")
-    runtime = AntigravitySdkRuntime(
-        options=AntigravitySdkOptions(model="gemini-3.7-flash", api_key="option-key"),
-    )
-    assert runtime.effective_api_key == "option-key"
-
-    runtime_env = AntigravitySdkRuntime(
-        options=AntigravitySdkOptions(model="gemini-3.7-flash"),
-    )
-    assert runtime_env.effective_api_key == "env-key"
 
 
 def test_select_config_sets_thinking_config(tmp_path: Path) -> None:
@@ -618,3 +605,29 @@ def test_complete_passes_env(
     assert config.env is not None
     assert config.env.get("GEMINI_API_KEY") == "complete-key"
     assert config.env.get("GOOGLE_API_KEY") == "complete-key"
+
+
+@pytest.mark.parametrize(
+    ("max_turns", "early_exit"),
+    [
+        (1, False),
+        (3, True),
+    ],
+)
+def test_antigravity_sdk_enforces_schema_in_both_single_and_multi_turn(
+    max_turns: int,
+    early_exit: bool,
+    tmp_path: Path,
+) -> None:
+    """Verify AntigravitySdkRuntime configures catalog response schema regardless of turn mode."""
+    rt = AntigravitySdkRuntime(
+        options=AntigravitySdkOptions(
+            model="test-model",
+            app_data_dir=tmp_path / "app_data",
+            max_turns=max_turns,
+            early_exit=early_exit,
+        ),
+    )
+    rt._resident = ("skill-a", "skill-b")
+    config = rt._select_config(tmp_path)
+    assert config.response_schema is not None

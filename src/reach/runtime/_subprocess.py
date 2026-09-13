@@ -156,7 +156,7 @@ def _stream_process_output(
         for line in proc.stdout:
             stdout_lines.append(line)
             if timeout_s is not None and time.monotonic() - start_time > timeout_s:
-                controller.terminate_gracefully(wait_timeout=1.0)
+                controller.terminate_gracefully(wait_timeout=_DEFAULT_TERMINATE_WAIT_TIMEOUT)
                 return stdout_lines, False, "timeout"
             if on_line is not None and on_line(line):
                 early_stopped = True
@@ -168,11 +168,11 @@ def _stream_process_output(
         if early_stopped and proc.poll() is None:
             controller.send_signal(signal.SIGTERM)
             try:
-                proc.wait(timeout=1.0)
+                proc.wait(timeout=_DEFAULT_TERMINATE_WAIT_TIMEOUT)
             except subprocess.TimeoutExpired:
                 controller.kill()
                 with contextlib.suppress(OSError, subprocess.SubprocessError):
-                    proc.wait(timeout=1.0)
+                    proc.wait(timeout=_DEFAULT_TERMINATE_WAIT_TIMEOUT)
 
             if proc.stdout and not proc.stdout.closed:
                 with contextlib.suppress(OSError, ValueError):
@@ -181,7 +181,7 @@ def _stream_process_output(
                         stdout_lines.extend(extra_out.splitlines(keepends=True))
 
     if timeout_s is not None and time.monotonic() - start_time > timeout_s:
-        controller.terminate_gracefully(wait_timeout=1.0)
+        controller.terminate_gracefully(wait_timeout=_DEFAULT_TERMINATE_WAIT_TIMEOUT)
         return stdout_lines, False, "timeout"
 
     return stdout_lines, early_stopped, None

@@ -36,7 +36,10 @@ from reach.registry import (
     RegistryManifest,
     RegistrySkillData,
     ServiceDisabledError,
+    _matches_publisher,
+    _safe_resolve_subpath,
     find_adc_path,
+    get_access_token,
     is_adc_available,
 )
 
@@ -272,6 +275,61 @@ def test_cache_manager_manifest_ttl(tmp_path: Path) -> None:
     assert stale is not None
 
 
+@pytest.mark.parametrize(
+    ("actual", "requested", "expected"),
+    [
+        (None, None, True),
+        ("google", None, True),
+        (None, "google", False),
+        ("google", "google", True),
+        ("projects/p/locations/l/publishers/google", "google", True),
+        ("google", "projects/p/locations/l/publishers/google", True),
+        ("publishers/google/", "google", True),
+        ("google", "publishers/google", True),
+        ("my-google", "google", False),
+        ("google", "my-google", False),
+        ("google", "other", False),
+    ],
+)
+def test_matches_publisher_cases(actual: str | None, requested: str | None, expected: bool) -> None:
+    """Verify publisher matching supports bidirectional and normalized identifiers."""
+    assert _matches_publisher(actual, requested) is expected
+
+
+def test_get_cached_manifest_filters_unscoped_fallback_by_publisher(tmp_path: Path) -> None:
+    """Verify unscoped fallback manifest is filtered by publisher without leaking others."""
+    cache = RegistryCacheManager(cache_root=tmp_path)
+    unscoped_manifest = RegistryManifest(
+        project="proj-a",
+        location="global",
+        publisher=None,
+        fetched_at=datetime.now(UTC),
+        skills=(
+            RegistrySkillData(
+                name="projects/proj-a/locations/global/skills/s1",
+                displayName="s1",
+                description="desc 1",
+                publisher="google",
+            ),
+            RegistrySkillData(
+                name="projects/proj-a/locations/global/skills/s2",
+                displayName="s2",
+                description="desc 2",
+                publisher="acme-corp",
+            ),
+        ),
+    )
+    cache.save_manifest(unscoped_manifest)
+
+    # Scoped query should hit unscoped fallback but ONLY return matching skills
+    loaded = cache.get_cached_manifest("proj-a", "global", publisher="google", max_age_seconds=60)
+    assert loaded is not None
+    assert loaded.publisher == "google"
+    assert len(loaded.skills) == 1
+    assert loaded.skills[0].display_name == "s1"
+    assert loaded.skills[0].publisher == "google"
+
+
 def test_cache_manager_hydration_and_resolve(tmp_path: Path) -> None:
     """Verify cache manager creates physical SKILL.md and returns valid Skill models."""
     cache = RegistryCacheManager(cache_root=tmp_path)
@@ -329,6 +387,114 @@ def test_cache_manager_clean(tmp_path: Path) -> None:
     assert bytes_cleaned > 0
     assert paths_cleaned
     assert not tmp_path.exists() or not any(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize(
+    "malicious_project",
+    [
+        "/etc",
+        "/var/target",
+        "../../escape",
+        "..",
+        ".",
+        "nested/path",
+        "nested\\winpath",
+    ],
+)
+def test_cache_manager_clean_rejects_path_traversal(
+    malicious_project: str,
+    tmp_path: Path,
+) -> None:
+    """Verify clean raises ValueError and refuses to delete paths that attempt directory escape."""
+    cache = RegistryCacheManager(cache_root=tmp_path / "cache")
+    sensitive_outside_dir = tmp_path / "outside"
+    sensitive_outside_dir.mkdir()
+    canary = sensitive_outside_dir / "canary.txt"
+    canary.write_text("protected")
+
+    with pytest.raises(ValueError, match="escapes cache directory"):
+        cache.clean(project=malicious_project)
+
+    assert canary.is_file()
+    assert canary.read_text() == "protected"
+
+
+@pytest.mark.parametrize("bad_id", ["..", ".", "  "])
+def test_cache_manager_location_dir_rejects_empty_or_dot(bad_id: str, tmp_path: Path) -> None:
+    """Verify location_dir raises ValueError when project or location resolves to dot."""
+    cache = RegistryCacheManager(cache_root=tmp_path)
+    with pytest.raises(ValueError, match="Invalid project identifier"):
+        cache.location_dir(bad_id, "global")
+    with pytest.raises(ValueError, match="Invalid location identifier"):
+        cache.location_dir("proj", bad_id)
+
+
+def test_cache_manager_skill_dir_sanitizes_path_traversal(tmp_path: Path) -> None:
+    """Verify skill_dir sanitizes remote skill names and ensures directory is within location."""
+    cache = RegistryCacheManager(cache_root=tmp_path)
+    loc_dir = cache.location_dir("proj", "global")
+    skill_path = cache.skill_dir("proj", "global", "../../malicious_name", "../../rev")
+    assert skill_path.is_relative_to(loc_dir)
+    assert not any(part == ".." for part in skill_path.parts)
+
+
+@pytest.mark.parametrize(
+    ("segments", "disallow_separators", "fallbacks", "expected_rel"),
+    [
+        (
+            [("my-proj", "project"), ("us-central1", "location")],
+            False,
+            None,
+            "my-proj/us-central1",
+        ),
+        (
+            [("skill@1", "skill"), ("..", "revision")],
+            False,
+            {"revision": "default"},
+            "skill_1/default",
+        ),
+    ],
+)
+def test_safe_resolve_subpath_valid(
+    tmp_path: Path,
+    segments: list[tuple[str, str]],
+    disallow_separators: bool,
+    fallbacks: dict[str, str] | None,
+    expected_rel: str,
+) -> None:
+    """Verify _safe_resolve_subpath resolves valid components strictly within root."""
+    resolved = _safe_resolve_subpath(
+        tmp_path,
+        *segments,
+        disallow_separators=disallow_separators,
+        fallbacks=fallbacks,
+    )
+    assert resolved == (tmp_path / expected_rel).resolve()
+    assert resolved.is_relative_to(tmp_path.resolve())
+
+
+@pytest.mark.parametrize(
+    ("segments", "disallow_separators", "error_match"),
+    [
+        ([("/etc/passwd", "project")], True, "escapes cache directory"),
+        ([("nested/dir", "project")], True, "escapes cache directory"),
+        ([("..", "project")], False, "Invalid project identifier"),
+        ([("   ", "location")], False, "Invalid location identifier"),
+    ],
+)
+def test_safe_resolve_subpath_invalid(
+    tmp_path: Path,
+    segments: list[tuple[str, str]],
+    disallow_separators: bool,
+    error_match: str,
+) -> None:
+    """Verify _safe_resolve_subpath raises ValueError on traversal or invalid segments."""
+    with pytest.raises(ValueError, match=error_match):
+        _safe_resolve_subpath(
+            tmp_path,
+            *segments,
+            disallow_separators=disallow_separators,
+        )
 
 
 def test_client_get_skill() -> None:
@@ -730,3 +896,178 @@ def test_is_adc_available_detects_windows_adc(
     monkeypatch.setenv("APPDATA", str(appdata))
 
     assert is_adc_available() is True
+
+
+def test_get_access_token_uses_cloud_platform_scope() -> None:
+    """Verify get_access_token requests the cloud-platform scope from google-auth."""
+    mock_creds = MagicMock(token="ya29.scope_test_token")  # noqa: S106
+    with patch("google.auth.default", return_value=(mock_creds, "mock-proj")) as mock_default:
+        token = get_access_token()
+        assert token == "ya29.scope_test_token"  # noqa: S105
+        mock_default.assert_called_once_with(
+            scopes=["https://www.googleapis.com/auth/cloud-platform"],
+        )
+
+
+def test_get_access_token_fails_if_gcloud_not_found(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify get_access_token raises AuthenticationError when gcloud CLI is not in PATH."""
+    monkeypatch.setattr("shutil.which", lambda _cmd: None)
+
+    # Ensure google.auth throws so it falls back to gcloud
+    with (
+        patch("google.auth.default", side_effect=Exception("No google-auth")),
+        pytest.raises(AuthenticationError, match="gcloud CLI not found in PATH"),
+    ):
+        get_access_token()
+
+
+def test_get_access_token_parses_multiline_stdout_with_warnings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify get_access_token extracts the ya29 token line amidst CLI warnings."""
+    monkeypatch.setattr("shutil.which", lambda _cmd: "/usr/bin/gcloud")
+
+    multiline_stdout = (
+        "WARNING: Your active project does not match your quota project.\n"
+        "WARNING: A new gcloud release is available.\n"
+        "\n"
+        "ya29.c.b0Aaekm12345_mocked_token\n"
+    )
+
+    fake_proc = MagicMock(stdout=multiline_stdout, returncode=0)
+    with (
+        patch("google.auth.default", side_effect=Exception("No google-auth")),
+        patch("subprocess.run", return_value=fake_proc),
+    ):
+        token = get_access_token()
+        assert token == "ya29.c.b0Aaekm12345_mocked_token"  # noqa: S105
+
+
+def test_get_access_token_accepts_non_ya29_token_format(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify get_access_token accepts valid bearer token formats without hardcoded ya29 prefix."""
+    monkeypatch.setattr("shutil.which", lambda _cmd: "/usr/bin/gcloud")
+    multiline_stdout = (
+        "WARNING: A new gcloud release is available.\n"
+        "\n"
+        "eyJhbGciOiJSUzI1NiIsImtpZCI6IjEyMzQ1In0.payload.signature\n"
+    )
+    fake_proc = MagicMock(stdout=multiline_stdout, returncode=0)
+    with (
+        patch("google.auth.default", side_effect=Exception("No google-auth")),
+        patch("subprocess.run", return_value=fake_proc),
+    ):
+        token = get_access_token()
+        assert token == "eyJhbGciOiJSUzI1NiIsImtpZCI6IjEyMzQ1In0.payload.signature"  # noqa: S105
+
+
+@pytest.mark.parametrize(
+    "bad_stdout",
+    [
+        "",
+        "   \n  \n",
+        "ERROR: (gcloud.auth.application-default.print-access-token) Credentials expired.",
+        "WARNING: Just warnings without a token\nAnother warning line",
+        "ya29.token has whitespace in the middle",
+    ],
+)
+def test_get_access_token_rejects_malformed_token_output(
+    bad_stdout: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify get_access_token raises AuthenticationError if output lacks a ya29 token."""
+    monkeypatch.setattr("shutil.which", lambda _cmd: "/usr/bin/gcloud")
+    fake_proc = MagicMock(stdout=bad_stdout, returncode=0)
+
+    with (
+        patch("google.auth.default", side_effect=Exception("No google-auth")),
+        patch("subprocess.run", return_value=fake_proc),
+        pytest.raises(AuthenticationError, match="Unexpected or invalid token format"),
+    ):
+        get_access_token()
+
+
+def test_registry_client_caches_token_across_requests() -> None:
+    """Verify RegistryClient reuses cached token across calls to prevent process churn."""
+    client = RegistryClient(base_url="http://127.0.0.1:8080")
+
+    with patch("reach.registry.get_access_token", return_value="ya29.cached_token") as mock_get:
+        tok1 = client._get_token()
+        tok2 = client._get_token()
+        tok3 = client._get_token()
+
+        assert tok1 == "ya29.cached_token"
+        assert tok2 == "ya29.cached_token"
+        assert tok3 == "ya29.cached_token"
+        assert mock_get.call_count == 1
+
+
+def test_registry_client_token_cache_refreshes_after_expiry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify RegistryClient refreshes token after token_ttl_seconds expires."""
+    client = RegistryClient(base_url="http://127.0.0.1:8080", token_ttl_seconds=60.0)
+
+    current_time = 1000.0
+    monkeypatch.setattr("time.time", lambda: current_time)
+
+    with patch("reach.registry.get_access_token", side_effect=["ya29.token_one", "ya29.token_two"]):
+        assert client._get_token() == "ya29.token_one"
+        assert client._get_token() == "ya29.token_one"
+
+        # Advance time past TTL
+        current_time += 65.0
+
+        assert client._get_token() == "ya29.token_two"
+
+
+def test_registry_client_clears_token_cache_on_401() -> None:
+    """Verify RegistryClient invalidates cached token when receiving HTTP 401 Unauthorized."""
+    client = RegistryClient(base_url="http://127.0.0.1:8080")
+    expired_token: str | None = "ya29.expired_token"  # noqa: S105
+    client._cached_token = expired_token
+    client._cached_token_expiry = 9999999999.0
+
+    with pytest.raises(AuthenticationError):
+        client._handle_http_error(401, "Unauthorized", "projects/p/skills")
+
+    assert client._cached_token is None
+    assert client._cached_token_expiry == 0.0
+
+
+@pytest.mark.parametrize(
+    "valid_url",
+    [
+        "https://agentregistry.googleapis.com/v1alpha",
+        "https://custom-region.googleapis.com/v1",
+        "https://agentregistry.google.com/v1alpha",
+        "http://127.0.0.1:8080",
+        "http://localhost:8000/v1",
+        "http://[::1]:9000",
+    ],
+)
+def test_registry_client_accepts_valid_base_urls(valid_url: str) -> None:
+    """Verify RegistryClient accepts HTTPS Google API domains and loopback URLs."""
+    client = RegistryClient(base_url=valid_url, token="ya29.mock")  # noqa: S106
+    assert client.base_url == valid_url.rstrip("/")
+
+
+@pytest.mark.parametrize(
+    ("invalid_url", "expected_err"),
+    [
+        ("http://agentregistry.googleapis.com", "must use HTTPS for non-local endpoints"),
+        ("http://insecure-remote.com/api", "must use HTTPS for non-local endpoints"),
+        ("https://evil-exfiltration.com/api", "must be a Google API domain or loopback"),
+        ("ftp://agentregistry.googleapis.com", "must use HTTP or HTTPS scheme"),
+        ("", "Invalid Agent Registry base_url"),
+        ("invalid-url-no-scheme", "Invalid Agent Registry base_url"),
+    ],
+)
+def test_registry_client_rejects_insecure_or_untrusted_base_urls(
+    invalid_url: str,
+    expected_err: str,
+) -> None:
+    """Verify RegistryClient rejects non-HTTPS URLs, untrusted domains, or invalid schemes."""
+    with pytest.raises(ValueError, match=expected_err):
+        RegistryClient(base_url=invalid_url, token="ya29.mock")  # noqa: S106

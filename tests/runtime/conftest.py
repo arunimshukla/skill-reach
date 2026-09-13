@@ -40,6 +40,27 @@ else:
         ag_types = None
 
 
+#: True when google.antigravity SDK is installed and available.
+HAS_ANTIGRAVITY: bool = ag_types is not None
+
+
+def agent_dependencies_met(agent: str) -> bool:
+    """Check whether optional dependencies for a given agent runtime are available."""
+    if agent == "antigravity-sdk":
+        return HAS_ANTIGRAVITY
+    return True
+
+
+@pytest.fixture(autouse=True)
+def require_agent_dependencies(request: pytest.FixtureRequest) -> None:
+    """Automatically skip tests when an agent's optional dependencies are missing."""
+    callspec = getattr(request.node, "callspec", None)
+    if callspec is not None:
+        agent = callspec.params.get("agent")
+        if isinstance(agent, str) and not agent_dependencies_met(agent):
+            pytest.skip(f"Optional dependencies for agent {agent!r} are not installed")
+
+
 #: Minimal required options for initializing each agent type in test suites.
 MINIMAL_OPTIONS: dict[str, dict[str, object]] = {
     "antigravity-sdk": {"model": "test-model"},
@@ -53,8 +74,8 @@ MINIMAL_OPTIONS: dict[str, dict[str, object]] = {
 
 def build_agent(agent: str, tmp_path: Path, **extra_options: object) -> AgentRuntime:
     """Instantiate a runtime instance configured for test execution."""
-    if agent == "antigravity-sdk" and ag_types is None:
-        pytest.skip("google-antigravity is not installed")
+    if not agent_dependencies_met(agent):
+        pytest.skip(f"Optional dependencies for agent {agent!r} are not installed")
     opts: dict[str, object] = dict(MINIMAL_OPTIONS.get(agent, {}))
     if agent == "antigravity-cli":
         opts["home_dir"] = tmp_path / f"home_{agent}"

@@ -87,7 +87,7 @@ def readme_text() -> str:
 @pytest.fixture(scope="module")
 def all_markdown_files() -> tuple[Path, ...]:
     """Provide all documentation and root markdown files."""
-    return (*_DOCS_DIR.rglob("*.md"), _ROOT / "README.md")
+    return (*_DOCS_DIR.rglob("*.md"), _ROOT / "README.md", _ROOT / "CONTRIBUTING.md")
 
 
 @pytest.fixture(scope="module")
@@ -245,6 +245,66 @@ def test_documented_cli_options_exist_on_commands(verb: str) -> None:
     assert not stale_flags, (
         f"Stale or unrecognized CLI options in docs/cli/{verb}.md: {sorted(stale_flags)}"
     )
+
+
+#: Deliberately unlisted or internal flags per command
+UNDOCUMENTED_CLI_FLAGS: dict[str, set[str]] = {
+    "query": {
+        "--catalog-size",
+        "--config",
+        "--draft-concurrency",
+        "--draft-only",
+        "--early-exit",
+        "--effort",
+        "--generator-arm",
+        "--global",
+        "--max-turns",
+        "--mode",
+        "--model",
+        "--opt",
+        "--partial",
+        "--quiet",
+        "--rescope",
+        "--rivals",
+        "--run-dir",
+        "--seed",
+        "--tag",
+        "--target",
+        "--timeout",
+        "--top-rivals",
+        "--workdir",
+    },
+}
+
+
+@pytest.mark.parametrize("verb", _verbs())
+def test_all_cli_options_are_documented(verb: str) -> None:
+    """Verify that every CLI option registered on a command is documented in docs/cli/{verb}.md."""
+    doc_file = _DOCS_DIR / "cli" / f"{verb}.md"
+    assert doc_file.is_file(), f"Missing CLI doc file for {verb}: {doc_file}"
+    content = doc_file.read_text(encoding="utf-8")
+    doc_flags = set(re.findall(r"`(--[a-zA-Z0-9-]+)`", content))
+    doc_positionals = set(re.findall(r"`\[?([A-Z0-9_-]+)\]?`", content))
+
+    cmd = app[verb]
+    cli_flags = {
+        name
+        for arg in cmd.assemble_argument_collection()
+        if arg.parameter.name
+        for name in arg.parameter.name
+        if name.startswith("--") and name not in {"--help", "--version"}
+    }
+
+    # Filter out flags covered by documented positionals and inverse booleans
+    covered = {
+        f
+        for f in cli_flags
+        if f.removeprefix("--").replace("-", "_").upper() in doc_positionals
+        or (f.startswith("--no-") and f.replace("--no-", "--") in doc_flags)
+    }
+
+    missing = cli_flags - doc_flags - covered - UNDOCUMENTED_CLI_FLAGS.get(verb, set())
+    assert not missing, f"Undocumented CLI options on 'reach {verb}': {sorted(missing)}"
 
 
 @pytest.mark.parametrize("agent", [a for a in known_agents() if a != FAKE_AGENT])
@@ -682,6 +742,17 @@ def test_documented_api_members_match_module_all(
         )
 
 
+@pytest.mark.parametrize("mod_name", PUBLIC_API_MODULES)
+def test_module_all_contains_no_private_symbols(mod_name: str) -> None:
+    """Verify that module __all__ does not export private or internal symbols."""
+    mod = importlib.import_module(mod_name)
+    if hasattr(mod, "__all__"):
+        private_exports = [s for s in mod.__all__ if s.startswith("_")]
+        assert not private_exports, (
+            f"Private symbol(s) {private_exports} exported in {mod_name}.__all__"
+        )
+
+
 def test_api_module_index_and_nav_parity(mkdocs_config: MkDocsConfig) -> None:
     """Verify all docs/api/*.md files are listed in docs/api/index.md and mkdocs.yml."""
     api_index_text = (_DOCS_DIR / "api" / "index.md").read_text()
@@ -1046,3 +1117,19 @@ def test_documented_environment_variables_exist_in_source(
     assert not unreferenced, (
         f"Documented env vars not referenced anywhere in src/reach: {sorted(unreferenced)}"
     )
+
+
+def test_all_reach_env_vars_are_documented(
+    config_doc_text: str,
+    reach_source_text: str,
+) -> None:
+    """Verify all REACH_* environment variables read in source code are documented."""
+    doc_vars = set(re.findall(r"`(REACH_[A-Z0-9_]+)`", config_doc_text))
+    code_vars = set(
+        re.findall(
+            r'os\.(?:environ(?:\.get)?|getenv)\(\s*["\'](REACH_[A-Z0-9_]+)["\']',
+            reach_source_text,
+        )
+    )
+    undocumented = code_vars - doc_vars
+    assert not undocumented, f"Undocumented REACH_* env vars in src/reach: {sorted(undocumented)}"

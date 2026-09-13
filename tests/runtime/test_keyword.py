@@ -116,3 +116,15 @@ def test_keyword_runtime_empty_query_and_catalog(tmp_path: Path) -> None:
     summary = runtime.parse_stream([])
     assert summary.invoked_skill is None
     assert summary.invoked_skills == ()
+
+
+def test_keyword_runtime_parse_stream_extracts_skill() -> None:
+    """Verify KeywordRuntime extracts invoked skill from stream lines."""
+    runtime = KeywordRuntime()
+    summary = runtime.parse_stream(
+        ["Model chose tool cloud-sql to proceed"],
+        resident=("cloud-sql", "gcloud"),
+    )
+    assert summary.invoked_skill == "cloud-sql"
+    assert summary.invoked_skills == ("cloud-sql",)
+    assert summary.saw_result

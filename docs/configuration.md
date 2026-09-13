@@ -443,3 +443,26 @@ Configuration values in `reach.toml` can also interpolate environment variables 
 | `REACH_NO_BROWSER`    | Set to `"1"` or `"true"` to bypass interactive browser review for drafted queries.                |
 | `GITHUB_STEP_SUMMARY` | When set (in GitHub Actions), `reach check` automatically writes markdown summaries to this file. |
 | `NO_MKDOCS_2_WARNING` | Set to `"1"` to suppress upstream MkDocs 2.0 console notices during documentation builds.         |
+
+---
+
+## Provider API Keys & Authentication
+
+Reach automatically routes model API keys to the corresponding environment variables expected by each runtime agent:
+
+| Provider | Injected Environment Variables |
+| :--- | :--- |
+| `google` / `gemini` | `GEMINI_API_KEY`, `GOOGLE_API_KEY` |
+| `anthropic` | `ANTHROPIC_API_KEY` |
+| `openai` | `OPENAI_API_KEY` |
+
+If an unrecognized provider name is specified via options, Reach raises an error rather than mapping credentials to an unintended third-party provider. For custom, local, or self-hosted model engines (such as Ollama, vLLM, or Mistral), set the provider's expected environment variables directly in your shell or CI workflow.
+
+---
+
+## Execution Security & Trust Boundary
+
+Reach executes agent command-line interfaces (CLIs) and tools directly with the host permissions of the running user. Child agent processes inherit the host environment so tools, compilers, language runtimes, and local developer configuration remain operational.
+
+> [!WARNING]
+> **Evaluating Untrusted Skills**: Agent runtimes possess tool-use capabilities that can access the local filesystem and network. When benchmarking or evaluating skills from untrusted third-party repositories, public pull requests, or external registries, run Reach inside an isolated container (such as Docker), a disposable virtual machine, or a dedicated CI runner.

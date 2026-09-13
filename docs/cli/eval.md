@@ -119,6 +119,8 @@ reach eval cloud-deploy --concurrency 4
 | Option                             | Type    | Default                  | Description                                                                                    |
 | :--------------------------------- | :------ | :----------------------- | :--------------------------------------------------------------------------------------------- |
 | `--agent`                          | Choice  | `from reach.toml`        | Target runtime: `antigravity-cli`, `antigravity-sdk`, `claude-code`, `goose`, `keyword`, `pi`. |
+| `--model`, `-m`                    | String  | Default model            | Target model identifier.                                                                       |
+| `--effort`, `-e`                   | String  | Default effort           | Reasoning effort level (e.g. `low`, `medium`, `high`).                                        |
 | `--timeout`                        | Integer | -                        | Seconds allowed per probe attempt.                                                             |
 | `--max-turns`, `-T`                | Integer | `3`                      | Maximum conversation turns to execute and evaluate.                                            |
 | `--early-exit` / `--no-early-exit` | Flag    | `true`                   | Terminate multi-turn probe immediately when target skill is invoked.                           |
@@ -138,6 +140,7 @@ reach eval cloud-deploy --concurrency 4
 
 | Option                | Type    | Default            | Description                                                                  |
 | :-------------------- | :------ | :----------------- | :--------------------------------------------------------------------------- |
+| `--skill`             | String  | All                | Specific skill name(s) to draft queries for (repeatable).                    |
 | `--count`             | Integer | `3`                | Number of queries to draft per target skill.                                 |
 | `--generator-model`   | String  | `gemini-3.8-flash` | Model used to draft synthetic queries.                                       |
 | `--generator-arm`     | String  | `content`          | Which generation prompt to use (`content`, `behavioral`, etc.).              |

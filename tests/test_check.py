@@ -230,6 +230,23 @@ def test_changed_skills_git_error_raises_value_error() -> None:
             changed_skills(since="bad-ref")
 
 
+def test_changed_skills_rejects_flag_injection() -> None:
+    """Verify changed_skills raises ValueError when since starts with a dash."""
+    with pytest.raises(ValueError, match="git reference must not begin with a dash"):
+        changed_skills(since="--output=/tmp/pwned")
+
+
+def test_changed_skills_passes_double_dash_delimiter() -> None:
+    """Verify changed_skills passes double dash to git diff to delimit revisions."""
+    with patch("subprocess.run") as mock_run:
+        mock_run.return_value.returncode = 0
+        mock_run.return_value.stdout = ""
+        changed_skills(since="HEAD~1")
+        mock_run.assert_called_once()
+        args = mock_run.call_args[0][0]
+        assert args == ["git", "diff", "--name-only", "HEAD~1", "--"]
+
+
 @pytest.mark.parametrize(
     "stderr_msg",
     [

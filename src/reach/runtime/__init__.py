@@ -24,7 +24,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable, Sequence
 from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast, override
+from typing import TYPE_CHECKING, Any, ClassVar, Self, cast, override
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -69,6 +69,7 @@ __all__ = [
     "TrajectoryTracker",
     "TwoStageRetrieverRuntime",
     "agent_default_model",
+    "antigravity_agents",
     "build_runtime",
     "build_text_generator",
     "cli_agents",
@@ -77,6 +78,7 @@ __all__ = [
     "options_model",
     "register_agent",
     "resolve_options",
+    "runtime_class",
 ]
 
 
@@ -95,6 +97,26 @@ class AgentOptions(BaseModel):
     use_symlinks: bool = True
     isolate_config_dir: bool = True
     auto_clean: bool = False
+
+    #: Name of the field configuring an explicit isolation directory, if supported.
+    isolation_dir_field: ClassVar[str | None] = None
+
+    @property
+    def custom_isolation_dir(self) -> Path | None:
+        """Return custom isolation directory path configured on this options instance, if any."""
+        if self.isolation_dir_field:
+            val = getattr(self, self.isolation_dir_field, None)
+            return Path(val) if val is not None else None
+        return None
+
+    @model_validator(mode="after")
+    def _validate_isolation_dir_boundary(self) -> Self:
+        """Validate that custom isolation directory does not point to active home or root."""
+        if self.isolation_dir_field and self.custom_isolation_dir is not None:
+            from reach.runtime._fs import validate_isolated_directory
+
+            validate_isolated_directory(self.custom_isolation_dir, self.isolation_dir_field)
+        return self
 
 
 class CliOptions(AgentOptions):
@@ -432,6 +454,15 @@ def cli_agents(config_path: Path | str | None = None) -> tuple[str, ...]:
     )
 
 
+def antigravity_agents(config_path: Path | str | None = None) -> tuple[str, ...]:
+    """Return tuple of supported agent runtime names that inherit from AntigravityRuntime."""
+    return tuple(
+        agent
+        for agent in known_agents(config_path)
+        if (cls := runtime_class(agent)) is not None and issubclass(cls, AntigravityRuntime)
+    )
+
+
 def _agent_supported_models(
     agents: dict[object, object],
 ) -> list[tuple[str, list[str]]]:
@@ -558,6 +589,16 @@ class AgentRuntime[OptionsT: AgentOptions](ABC):
     def is_cli(self) -> bool:
         """Return True if this runtime executes via a CLI subprocess."""
         return False
+
+    @property
+    def isolation_dir_field(self) -> str | None:
+        """Return the options field name used for custom directory isolation, if supported."""
+        return getattr(self.options, "isolation_dir_field", None)
+
+    @property
+    def custom_isolation_dir(self) -> Path | None:
+        """Return the configured custom isolation directory path, or None."""
+        return getattr(self.options, "custom_isolation_dir", None)
 
     def skills_dir(self, workdir: Path) -> Path:
         """Return standard skill directory path in the workspace."""
@@ -905,6 +946,18 @@ def options_model(agent: str) -> type[BaseModel] | None:
     builtin = _load_builtin_entry(agent)
     if builtin is not None:
         return builtin[1]
+    return None
+
+
+def runtime_class(agent: str) -> type[AgentRuntime] | None:
+    """Return the runtime implementation class corresponding to the named agent."""
+    if agent in _AGENT_FACTORIES:
+        factory = _AGENT_FACTORIES[agent][0]
+        return factory if isinstance(factory, type) and issubclass(factory, AgentRuntime) else None
+    builtin = _load_builtin_entry(agent)
+    if builtin is not None:
+        rt = builtin[0]
+        return rt if isinstance(rt, type) and issubclass(rt, AgentRuntime) else None
     return None
 
 

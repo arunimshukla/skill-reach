@@ -27,7 +27,7 @@ import urllib.request
 from datetime import UTC, datetime
 from http import HTTPStatus
 from pathlib import Path
-from typing import Any
+from typing import Any, Final
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
@@ -49,6 +49,10 @@ __all__ = [
     "get_access_token",
     "is_adc_available",
 ]
+
+
+#: Minimum character length for valid bearer access tokens.
+_MIN_TOKEN_LENGTH: Final = 16
 
 
 class RegistryError(RuntimeError):
@@ -170,7 +174,14 @@ def get_access_token() -> str:
             return str(creds.token)
 
     # 2. Fall back to gcloud auth application-default print-access-token
-    gcloud_bin = shutil.which("gcloud") or "gcloud"
+    gcloud_bin = shutil.which("gcloud")
+    if not gcloud_bin:
+        msg = (
+            "gcloud CLI not found in PATH. Please install Google Cloud SDK "
+            "or run 'gcloud auth application-default login'."
+        )
+        raise AuthenticationError(msg)
+
     try:
         proc = subprocess.run(  # noqa: S603
             [gcloud_bin, "auth", "application-default", "print-access-token"],
@@ -178,9 +189,6 @@ def get_access_token() -> str:
             capture_output=True,
             text=True,
         )
-        token = proc.stdout.strip()
-        if token:
-            return token
     except (subprocess.SubprocessError, FileNotFoundError) as err:
         msg = (
             "Unable to obtain Google Cloud access token. Please run "
@@ -188,11 +196,35 @@ def get_access_token() -> str:
         )
         raise AuthenticationError(msg) from err
 
-    msg = (
-        "Empty access token returned. Please run "
-        "'gcloud auth application-default login' to refresh credentials."
-    )
-    raise AuthenticationError(msg)
+    lines = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+    token = ""
+    for line in reversed(lines):
+        if (
+            not any(c.isspace() for c in line)
+            and not line.upper().startswith(("WARNING", "INFO", "ERROR", "NOTE"))
+            and len(line) >= _MIN_TOKEN_LENGTH
+        ):
+            token = line
+            break
+
+    if not token or any(c.isspace() for c in token):
+        msg = (
+            "Unexpected or invalid token format from gcloud. Please run "
+            "'gcloud auth application-default login' to refresh credentials."
+        )
+        raise AuthenticationError(msg)
+
+    return token
+
+
+def _normalize_publisher(publisher: str | None) -> str:
+    """Extract terminal publisher identifier from a resource name or slug."""
+    if not publisher:
+        return ""
+    normalized = publisher.strip().rstrip("/")
+    if "/" in normalized:
+        return normalized.rsplit("/", 1)[-1]
+    return normalized
 
 
 def _matches_publisher(actual_publisher: str | None, requested_publisher: str | None) -> bool:
@@ -201,9 +233,13 @@ def _matches_publisher(actual_publisher: str | None, requested_publisher: str | 
         return True
     if not actual_publisher:
         return False
-    if actual_publisher == requested_publisher:
+    actual_clean = actual_publisher.strip().rstrip("/")
+    requested_clean = requested_publisher.strip().rstrip("/")
+    if actual_clean == requested_clean:
         return True
-    return actual_publisher.endswith(f"/{requested_publisher}")
+    actual_norm = _normalize_publisher(actual_clean)
+    requested_norm = _normalize_publisher(requested_clean)
+    return bool(actual_norm and requested_norm and actual_norm == requested_norm)
 
 
 class RegistryClient:
@@ -215,18 +251,63 @@ class RegistryClient:
         base_url: str = "https://agentregistry.googleapis.com/v1alpha",
         max_retries: int = 3,
         backoff_factor: float = 0.5,
+        token_ttl_seconds: float = 3000.0,
+        allow_custom_host: bool = False,
     ) -> None:
         """Initialize RegistryClient with optional bearer token and retry settings."""
         self.token = token
-        self.base_url = base_url.rstrip("/")
+        self.base_url = self._validate_base_url(base_url, allow_custom_host=allow_custom_host)
         self.max_retries = max_retries
         self.backoff_factor = backoff_factor
+        self.token_ttl_seconds = token_ttl_seconds
+        self._cached_token: str | None = None
+        self._cached_token_expiry: float = 0.0
+
+    @staticmethod
+    def _validate_base_url(base_url: str, *, allow_custom_host: bool = False) -> str:
+        """Validate that base_url uses HTTPS and points to an approved Google domain or loopback."""
+        clean_url = base_url.strip().rstrip("/")
+        parsed = urllib.parse.urlsplit(clean_url)
+        if not parsed.scheme or not parsed.hostname:
+            msg = f"Invalid Agent Registry base_url: {base_url!r}"
+            raise ValueError(msg)
+
+        if parsed.scheme not in ("http", "https"):
+            msg = f"Agent Registry base_url must use HTTP or HTTPS scheme, got: {parsed.scheme!r}"
+            raise ValueError(msg)
+
+        is_loopback = parsed.hostname in ("127.0.0.1", "localhost", "::1")
+        if parsed.scheme != "https" and not is_loopback:
+            msg = f"Agent Registry base_url must use HTTPS for non-local endpoints: {base_url!r}"
+            raise ValueError(msg)
+
+        is_google_api = (
+            parsed.hostname == "googleapis.com"
+            or parsed.hostname.endswith(".googleapis.com")
+            or parsed.hostname.endswith(".google.com")
+        )
+        if not is_loopback and not is_google_api and not allow_custom_host:
+            msg = (
+                f"Agent Registry base_url host must be a Google API domain or loopback, "
+                f"got: {parsed.hostname!r}"
+            )
+            raise ValueError(msg)
+
+        return clean_url
 
     def _get_token(self) -> str:
-        """Resolve active authentication token, fetching dynamically if omitted."""
+        """Resolve active authentication token, fetching dynamically or from cache."""
         if self.token:
             return self.token
-        return get_access_token()
+
+        now = time.time()
+        if self._cached_token and now < self._cached_token_expiry:
+            return self._cached_token
+
+        token = get_access_token()
+        self._cached_token = token
+        self._cached_token_expiry = now + self.token_ttl_seconds
+        return token
 
     def _request(self, endpoint: str, params: dict[str, str] | None = None) -> dict[str, Any]:
         """Execute an authenticated GET request with rate-limit retry and error mapping."""
@@ -279,6 +360,8 @@ class RegistryClient:
                 error_details = err_dict
 
         if status == HTTPStatus.UNAUTHORIZED:
+            self._cached_token = None
+            self._cached_token_expiry = 0.0
             msg = (
                 "Authentication failed when contacting Agent Registry. "
                 "Run 'gcloud auth application-default login' to refresh credentials."
@@ -370,6 +453,75 @@ class RegistryClient:
         )
 
 
+def _sanitize_path_segment(value: str) -> str:
+    """Sanitize arbitrary string into a safe path segment slug."""
+    return re.sub(r"[^\w.-]", "_", value.strip()).lstrip(".")
+
+
+def _safe_resolve_subpath(
+    root: Path,
+    *segments: tuple[str, str],
+    disallow_separators: bool = False,
+    fallbacks: dict[str, str] | None = None,
+    empty_error_suffix: str = "",
+) -> Path:
+    """Resolve and validate a relative subpath under a root directory.
+
+    Args:
+        root: Base directory that must contain the resolved target.
+        *segments: Tuples of (value, label) for each path segment.
+        disallow_separators: If True, reject values containing path separators or absolute paths.
+        fallbacks: Optional mapping of segment label to fallback string when slug is empty.
+        empty_error_suffix: Optional suffix appended to error message when slug is empty.
+
+    Returns:
+        The validated Path strictly contained within root.
+
+    Raises:
+        ValueError: If any segment is invalid, empty without a fallback, or escapes root.
+    """
+    resolved_root = root.resolve()
+    current = resolved_root
+    fallbacks = fallbacks or {}
+
+    for value, label in segments:
+        trimmed = value.strip()
+        if disallow_separators and (
+            Path(trimmed).is_absolute() or "/" in trimmed or "\\" in trimmed
+        ):
+            msg = f"Invalid {label} identifier: {value!r} escapes cache directory"
+            raise ValueError(msg)
+
+        slug = _sanitize_path_segment(trimmed)
+        if not slug or slug in (".", ".."):
+            if label in fallbacks:
+                slug = fallbacks[label]
+            elif disallow_separators:
+                msg = f"Invalid {label} identifier: {value!r} escapes cache directory"
+                raise ValueError(msg)
+            elif empty_error_suffix:
+                msg = f"Invalid {label} {empty_error_suffix}: {value!r}"
+                raise ValueError(msg)
+            else:
+                msg = f"Invalid {label} identifier: {value!r}"
+                raise ValueError(msg)
+
+        current = current / slug
+
+    target = current.resolve()
+    if not target.is_relative_to(resolved_root) or (
+        disallow_separators and target == resolved_root
+    ):
+        if segments:
+            last_val, last_label = segments[-1]
+            msg = f"Invalid {last_label} identifier: {last_val!r} escapes cache directory"
+        else:
+            msg = f"Invalid path escapes directory: {target}"
+        raise ValueError(msg)
+
+    return target
+
+
 class RegistryCacheManager:
     """Manage local caching and payload hydration of Agent Registry skills."""
 
@@ -382,7 +534,11 @@ class RegistryCacheManager:
 
     def location_dir(self, project: str, location: str) -> Path:
         """Return the directory containing manifest and cached skills for project and location."""
-        return self.cache_root / project / location
+        return _safe_resolve_subpath(
+            self.cache_root,
+            (project, "project"),
+            (location, "location"),
+        )
 
     def manifest_path(
         self,
@@ -393,7 +549,7 @@ class RegistryCacheManager:
         """Return the path to the cached .manifest.json file, optionally scoped by publisher."""
         loc_dir = self.location_dir(project, location)
         if publisher:
-            slug = re.sub(r"[^\w.-]", "_", publisher)
+            slug = _sanitize_path_segment(publisher)
             return loc_dir / f".manifest.{slug}.json"
         return loc_dir / ".manifest.json"
 
@@ -405,7 +561,14 @@ class RegistryCacheManager:
         revision_slug: str = "default",
     ) -> Path:
         """Return the directory for an unpacked skill revision."""
-        return self.location_dir(project, location) / skill_name / revision_slug
+        loc_dir = self.location_dir(project, location)
+        return _safe_resolve_subpath(
+            loc_dir,
+            (skill_name, "skill name"),
+            (revision_slug, "revision"),
+            fallbacks={"revision": "default"},
+            empty_error_suffix="escapes cache directory",
+        )
 
     def get_cached_manifest(
         self,
@@ -435,6 +598,13 @@ class RegistryCacheManager:
                         continue
                     if not _matches_publisher(manifest.publisher, publisher):
                         continue
+                elif publisher is not None:
+                    filtered_skills = tuple(
+                        s for s in manifest.skills if _matches_publisher(s.publisher, publisher)
+                    )
+                    return manifest.model_copy(
+                        update={"skills": filtered_skills, "publisher": publisher}
+                    )
                 return manifest
             except (json.JSONDecodeError, ValidationError, OSError):
                 continue
@@ -583,7 +753,15 @@ class RegistryCacheManager:
         Returns:
             Tuple of (total_bytes_reclaimed, list_of_paths_removed).
         """
-        target_dir = self.cache_root / project if project else self.cache_root
+        if project:
+            target_dir = _safe_resolve_subpath(
+                self.cache_root,
+                (project, "project"),
+                disallow_separators=True,
+            )
+        else:
+            target_dir = self.cache_root.resolve()
+
         if not target_dir.exists():
             return 0, []
 
@@ -598,9 +776,6 @@ class RegistryCacheManager:
         removed_paths.append(target_dir)
 
         if not dry_run:
-            if project:
-                shutil.rmtree(target_dir, ignore_errors=True)
-            else:
-                shutil.rmtree(self.cache_root, ignore_errors=True)
+            shutil.rmtree(target_dir, ignore_errors=True)
 
         return total_bytes, removed_paths

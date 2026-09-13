@@ -150,3 +150,17 @@ def test_clean_all_removes_sweep_results_and_artifact_sidecars(
 
     assert [p.name for p in purged if p.exists()] == []
     assert preserved.exists()
+
+
+def test_clean_rejects_malicious_project_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Verify reach clean --project exits with 1 on path traversal."""
+    monkeypatch.chdir(tmp_path)
+    assert main(["clean", "--project", "../../escape"]) == 1
+    captured = capsys.readouterr()
+    output = captured.out + captured.err
+    assert "Error:" in output
+    assert "escapes cache directory" in output
