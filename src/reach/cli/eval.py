@@ -27,7 +27,7 @@ from cyclopts import Parameter
 from pydantic import BaseModel, ConfigDict
 
 from reach.artifact import ContestedSkill, artifact_path, write_artifact
-from reach.catalog import parse_frontmatter
+from reach.catalog import resolve_skill_target
 from reach.config import RunConfig
 from reach.generate import citations_path
 from reach.models import CatalogMode, Query, Skill
@@ -152,37 +152,17 @@ def _resolve_manifest_target(
     target: str | None,
     study: StudyFlags,
 ) -> tuple[str | None, Path | None]:
-    """Parse skill name from manifest file if target path contains SKILL.md."""
+    """Parse skill name and catalog path from target name, directory, or manifest."""
     if target is None:
         return None, None
-    named = Path(target).expanduser()
-    manifest = named / "SKILL.md"
-    if manifest.is_file():
-        skill = parse_frontmatter(manifest.read_text(encoding="utf-8"), manifest)
-        if skill is None:
-            msg = f"{manifest} has no frontmatter to take a name from"
-            raise ValueError(msg)
-        corpus = named.parent if study.skills is None else None
-        return skill.name, corpus
-    if named.is_dir():
-        contained_skills = sorted(
-            d.name for d in named.iterdir() if d.is_dir() and (d / "SKILL.md").is_file()
-        )
-        if contained_skills:
-            preview = ", ".join(f"'{s}'" for s in contained_skills[:PREVIEW_SKILL_COUNT])
-            remainder = len(contained_skills) - PREVIEW_SKILL_COUNT
-            more = f" (and {remainder} more)" if len(contained_skills) > PREVIEW_SKILL_COUNT else ""
-            msg = (
-                f"'{target}' is a directory containing {len(contained_skills)} skills "
-                f"({preview}{more}), not a single skill.\n\n"
-                "• To evaluate a single skill immediately (auto-drafts queries):\n"
-                f"    reach eval {target.rstrip('/')}/{contained_skills[0]}\n\n"
-                "• To evaluate the full catalog against a benchmark:\n"
-                f"    1. Draft queries:  reach query --skills {target} --out .reach/queries.json\n"
-                f"    2. Run evaluation: reach eval --skills {target}"
-            )
-            raise ValueError(msg)
-    return target, None
+    try:
+        resolved = resolve_skill_target(target, explicit_catalog=study.skills, command_name="eval")
+    except FileNotFoundError as err:
+        raise ValueError(str(err)) from err
+    if resolved is None:
+        return None, None
+    corpus = resolved.catalog_path if study.skills is None else None
+    return resolved.skill_name, corpus
 
 
 def _quick(

@@ -949,3 +949,57 @@ def test_overlap_positional_path(tmp_path: Path, capsys: pytest.CaptureFixture[s
         encoding="utf-8",
     )
     assert main(["overlap", str(tmp_path)]) == 0
+
+
+def test_overlap_explain_with_skill_path_infers_catalog(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Verify reach overlap explain resolves skill paths and infers parent catalog."""
+    catalog = tmp_path / "skills"
+    catalog.mkdir()
+    skill_a = catalog / "skill-a"
+    skill_a.mkdir()
+    (skill_a / "SKILL.md").write_text(
+        "---\nname: skill-a\ndescription: Manage git repositories.\n---\n",
+        encoding="utf-8",
+    )
+    skill_b = catalog / "skill-b"
+    skill_b.mkdir()
+    (skill_b / "SKILL.md").write_text(
+        "---\nname: skill-b\ndescription: Handle git branches.\n---\n",
+        encoding="utf-8",
+    )
+
+    code = main(
+        [
+            "overlap",
+            "explain",
+            "commit changes to repository",
+            "--skill",
+            str(skill_a),
+            "--format",
+            "json",
+        ]
+    )
+    assert code == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["target_skill"] == "skill-a"
+
+
+def test_overlap_multiple_skills_preserves_independent_catalogs(
+    tmp_path: Path,
+) -> None:
+    """Verify passing multiple --skill paths resolves against base catalog without loop mutation."""
+    cat = tmp_path / "skills"
+    cat.mkdir()
+    s1 = cat / "s1"
+    s1.mkdir()
+    (s1 / "SKILL.md").write_text("---\nname: s1\ndescription: Skill 1.\n---\n", encoding="utf-8")
+
+    s2 = cat / "s2"
+    s2.mkdir()
+    (s2 / "SKILL.md").write_text("---\nname: s2\ndescription: Skill 2.\n---\n", encoding="utf-8")
+
+    code = main(["overlap", "--skill", str(s1), "--skill", str(s2)])
+    assert code == 0

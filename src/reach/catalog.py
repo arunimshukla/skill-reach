@@ -16,10 +16,12 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import math
 import re
+from pathlib import Path
 from random import Random
 from typing import TYPE_CHECKING, Any, Final
 
@@ -33,11 +35,11 @@ from reach.retrieval import Bm25Scorer, Scorer, skill_text, tokenize
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
-    from pathlib import Path
 
 __all__ = [
     "DEFAULT_SWEEP_SCALES",
     "CorpusScalingPlan",
+    "ResolvedTarget",
     "build_catalogs",
     "build_corpus_scaling_catalogs",
     "build_corpus_scaling_queries",
@@ -55,6 +57,7 @@ __all__ = [
     "parse_frontmatter",
     "resident_skills",
     "resolve_catalog",
+    "resolve_skill_target",
     "resolve_sweep_scales",
     "split_frontmatter",
 ]
@@ -900,3 +903,178 @@ def resident_skills(catalog: Catalog, skills: Sequence[Skill]) -> list[Skill]:
         msg = f"catalog {catalog.id!r} names skills not loaded: {missing}"
         raise KeyError(msg)
     return [by_name[name] for name in catalog.skills]
+
+
+class ResolvedTarget(BaseModel):
+    """Structured resolution of a user-specified skill target and optional catalog."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    skill_name: str
+    catalog_path: Path | None = None
+    manifest_path: Path | None = None
+
+
+def _infer_parent_catalog(skill_dir: Path) -> Path:
+    """Infer catalog root directory containing resident and rival skills."""
+    resolved_dir = skill_dir.resolve()
+    parent = resolved_dir.parent
+    home = Path.home().resolve()
+    if parent in (home, parent.parent):
+        return resolved_dir
+
+    if parent.name in ("skills", ".skills"):
+        return parent
+
+    with contextlib.suppress(OSError):
+        peer_skills = [d for d in parent.iterdir() if d.is_dir() and (d / "SKILL.md").is_file()]
+        if len(peer_skills) > 1:
+            return parent
+
+    return resolved_dir
+
+
+def _resolve_manifest_file(
+    named: Path,
+    catalog_path: Path | None,
+    *,
+    looks_like_path: bool,
+    target: str | Path,
+    raw_str: str,
+) -> ResolvedTarget:
+    if named.name != "SKILL.md":
+        if not looks_like_path:
+            return ResolvedTarget(skill_name=raw_str, catalog_path=catalog_path)
+        msg = (
+            f"'{target}' is not a SKILL.md file; "
+            f"expected a SKILL.md file or skill directory containing one"
+        )
+        raise ValueError(msg)
+    skill = parse_frontmatter(named.read_text(encoding="utf-8"), named)
+    if skill is None or not skill.name:
+        msg = f"'{named}' does not contain valid YAML frontmatter"
+        raise ValueError(msg)
+    catalog = catalog_path or _infer_parent_catalog(named.parent)
+    return ResolvedTarget(skill_name=skill.name, catalog_path=catalog, manifest_path=named)
+
+
+def _resolve_skill_directory(
+    named: Path,
+    catalog_path: Path | None,
+    *,
+    looks_like_path: bool,
+    target: str | Path,
+    raw_str: str,
+    command_name: str,
+) -> ResolvedTarget:
+    manifest = named / "SKILL.md"
+    if manifest.is_file():
+        skill = parse_frontmatter(manifest.read_text(encoding="utf-8"), manifest)
+        if skill is None or not skill.name:
+            msg = f"'{manifest}' does not contain valid YAML frontmatter"
+            raise ValueError(msg)
+        catalog = catalog_path or _infer_parent_catalog(named)
+        return ResolvedTarget(skill_name=skill.name, catalog_path=catalog, manifest_path=manifest)
+
+    contained_skills = sorted(
+        d.name for d in named.iterdir() if d.is_dir() and (d / "SKILL.md").is_file()
+    )
+    max_preview = 3
+    if contained_skills:
+        preview = ", ".join(f"'{s}'" for s in contained_skills[:max_preview])
+        more = (
+            f" (and {len(contained_skills) - max_preview} more)"
+            if len(contained_skills) > max_preview
+            else ""
+        )
+        label = "skill" if len(contained_skills) == 1 else "skills"
+        hint = (
+            f"reach {command_name} --skill {raw_str.rstrip('/')}/{contained_skills[0]}"
+            if "explain" in command_name
+            else f"reach {command_name} {raw_str.rstrip('/')}/{contained_skills[0]}"
+        )
+        msg = (
+            f"'{target}' is a directory containing {len(contained_skills)} {label} "
+            f"({preview}{more}), not a single skill.\n\n"
+            f"• To {command_name} a single skill immediately:\n"
+            f"    {hint}"
+        )
+        raise ValueError(msg)
+
+    if looks_like_path:
+        msg = f"directory '{target}' does not contain a SKILL.md file"
+        raise ValueError(msg)
+
+    # Fall back to raw name if an unrelated cwd directory matched target
+    return ResolvedTarget(skill_name=raw_str, catalog_path=catalog_path)
+
+
+def resolve_skill_target(
+    target: str | Path | None,
+    explicit_catalog: Path | str | None = None,
+    *,
+    command_name: str = "eval",
+) -> ResolvedTarget | None:
+    """Resolve a skill name and catalog path from a name, directory, or SKILL.md file.
+
+    Args:
+        target: Skill name, directory path, or SKILL.md file path.
+        explicit_catalog: Explicit catalog path if specified by user flag (e.g. --skills).
+        command_name: CLI command name for formatting multi-skill error remedies.
+
+    Returns:
+        ResolvedTarget with canonical skill_name and inferred catalog_path,
+        or None if target is None.
+
+    Raises:
+        FileNotFoundError: If target looks like a path but does not exist on disk.
+        ValueError: If target is a non-SKILL.md file, a directory containing skills,
+            a directory with no SKILL.md, or a SKILL.md with invalid frontmatter.
+    """
+    if not target or not (raw_str := str(target).strip()):
+        return None
+
+    catalog_path = resolve_path(explicit_catalog) if explicit_catalog else None
+
+    looks_like_path = (
+        isinstance(target, Path)
+        or "/" in raw_str
+        or "\\" in raw_str
+        or raw_str.startswith(("~", "."))
+    )
+
+    # If an explicit catalog was provided and the target is a raw name, don't probe cwd
+    if catalog_path is not None and not looks_like_path:
+        return ResolvedTarget(skill_name=raw_str, catalog_path=catalog_path)
+
+    named = resolve_path(target)
+
+    # 1. Path does not exist
+    if not named.exists():
+        if looks_like_path:
+            msg = f"skill path does not exist: '{target}'"
+            raise FileNotFoundError(msg)
+        return ResolvedTarget(skill_name=raw_str, catalog_path=catalog_path)
+
+    # 2. Path is a file
+    if named.is_file():
+        return _resolve_manifest_file(
+            named,
+            catalog_path,
+            looks_like_path=looks_like_path,
+            target=target,
+            raw_str=raw_str,
+        )
+
+    # 3. Path is a directory
+    if named.is_dir():
+        return _resolve_skill_directory(
+            named,
+            catalog_path,
+            looks_like_path=looks_like_path,
+            target=target,
+            raw_str=raw_str,
+            command_name=command_name,
+        )
+
+    return None

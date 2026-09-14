@@ -262,6 +262,21 @@ def _sweep(
     console = build_console()
     run_config: RunConfig | None = RunConfig.from_toml(config) if config is not None else None
 
+    if target is not None:
+        from reach.catalog import resolve_skill_target
+
+        try:
+            resolved_target = resolve_skill_target(
+                target, explicit_catalog=skills, command_name="sweep"
+            )
+            if resolved_target is not None:
+                target = resolved_target.skill_name
+                if skills is None and resolved_target.catalog_path:
+                    skills = resolved_target.catalog_path
+        except (FileNotFoundError, ValueError) as err:
+            console.print(f"[red]Error:[/] {err}")
+            return 2
+
     effective_config, driver = _resolve_sweep_effective_config(
         run_config=run_config,
         agent=agent,
