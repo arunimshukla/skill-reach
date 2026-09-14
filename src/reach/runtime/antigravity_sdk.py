@@ -44,7 +44,10 @@ else:
         LocalAgentConfig = None
         ag_hooks = None
         ag_types = None
-        AntigravityValidationError = ()
+
+        class AntigravityValidationError(Exception):
+            """Stub exception when google-antigravity is not installed."""
+
         _HAS_ANTIGRAVITY = False
 
 from pydantic import BaseModel, Field
@@ -114,8 +117,8 @@ def _build_model_spec(
     api_key: str | None = None,
 ) -> str | ag_types.ModelTarget:
     """Construct model target with reasoning effort endpoint options when configured."""
-    if ag_types is not None and effort:
-        options = ag_types.GeminiModelOptions(thinking_level=effort)
+    if ag_types is not None and (effort or vertex):
+        options = ag_types.GeminiModelOptions(thinking_level=effort) if effort else None
         endpoint = (
             ag_types.VertexEndpoint(
                 project=project,
@@ -187,6 +190,8 @@ class _AntigravitySdkConfigMixin:
     @property
     def effective_project(self) -> str | None:
         """Resolve GCP project ID for Vertex AI execution."""
+        if not self.effective_vertex:
+            return None
         if self.options.api_key:
             return self.options.project
         return self.options.project or os.environ.get("GOOGLE_CLOUD_PROJECT")
@@ -194,13 +199,11 @@ class _AntigravitySdkConfigMixin:
     @property
     def effective_location(self) -> str | None:
         """Resolve GCP region/location for Vertex AI execution."""
+        if not self.effective_vertex:
+            return None
         if self.options.api_key:
             return self.options.location
-        return (
-            self.options.location
-            or os.environ.get("GOOGLE_CLOUD_LOCATION")
-            or ("global" if self.effective_vertex else None)
-        )
+        return self.options.location or os.environ.get("GOOGLE_CLOUD_LOCATION") or "global"
 
     @property
     def effective_api_key(self) -> str | None:
@@ -220,8 +223,10 @@ class _AntigravitySdkConfigMixin:
             env.pop("GEMINI_API_KEY", None)
             env.pop("GOOGLE_API_KEY", None)
 
+        blocked = getattr(self, "blocked_env_vars", None) or ()
         if (
             self.effective_vertex
+            and "GOOGLE_APPLICATION_CREDENTIALS" not in blocked
             and "GOOGLE_APPLICATION_CREDENTIALS" in os.environ
             and "GOOGLE_APPLICATION_CREDENTIALS" not in env
         ):
@@ -481,22 +486,16 @@ class AntigravitySdkGenerator(_AntigravitySdkConfigMixin, BaseTextGenerator[Anti
                 location=self.effective_location,
                 env=self.build_env(),
             )
-            try:
-                async with Agent(config) as agent:
-                    response = await agent.chat(prompt)
-                    return await response.text()
-            except (AntigravityValidationError, Exception) as err:
-                msg = f"generation failed: {err}"
-                raise RuntimeError(msg) from err
+            async with Agent(config) as agent:
+                response = await agent.chat(prompt)
+                return await response.text()
 
         try:
             text = _run_sync(asyncio.wait_for(_complete_async(), timeout=self.timeout_s))
         except TimeoutError as err:
             msg = f"generation failed: timed out after {self.timeout_s}s"
             raise RuntimeError(msg) from err
-        except Exception as err:
-            if isinstance(err, RuntimeError):
-                raise
+        except (AntigravityValidationError, Exception) as err:
             msg = f"generation failed: {err}"
             raise RuntimeError(msg) from err
         self.completions += 1

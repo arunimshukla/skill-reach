@@ -142,6 +142,8 @@ def main(argv: list[str] | None = None) -> int:
             exit_on_error=False,
             error_formatter=lambda error: error_panel(_explain(error)),
         )
+    except BrokenPipeError:
+        return 0
     except CycloptsError:
         return 2
     except (

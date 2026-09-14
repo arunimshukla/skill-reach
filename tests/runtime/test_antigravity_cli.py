@@ -1087,6 +1087,25 @@ def test_complete_raises_when_the_runtime_fails(
         generator.complete("draft me a query")
 
 
+def test_complete_extracts_structured_error_from_stdout_when_stderr_empty(
+    monkeypatch: pytest.MonkeyPatch,
+    generator: AntigravityCliGenerator,
+) -> None:
+    """Verify complete parses error field from stdout JSON when stderr is empty."""
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *a, **_kw: subprocess.CompletedProcess(
+            args=a,
+            returncode=1,
+            stdout=json.dumps({"error": "model quota exceeded"}),
+            stderr="",
+        ),
+    )
+    with pytest.raises(RuntimeError, match="model quota exceeded"):
+        generator.complete("draft me a query")
+
+
 @pytest.mark.parametrize(
     ("input_model", "expected_model"),
     [

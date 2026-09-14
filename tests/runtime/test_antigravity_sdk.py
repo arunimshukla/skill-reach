@@ -875,3 +875,55 @@ def test_complete_converts_antigravity_validation_error_to_runtime_error(
     gen = AntigravitySdkGenerator()
     with pytest.raises(RuntimeError, match=r"generation failed: A Gemini API key is required\."):
         gen.complete("test prompt")
+
+
+def test_build_model_spec_vertex_endpoint_without_effort() -> None:
+    """Verify _build_model_spec instantiates VertexEndpoint when vertex=True and effort=None."""
+    target = _build_model_spec(
+        "gemini-3.8-flash",
+        effort=None,
+        vertex=True,
+        project="p1",
+        location="us-central1",
+    )
+    assert isinstance(target, ag_types.ModelTarget)
+    assert target.name == "gemini-3.8-flash"
+    assert isinstance(target.endpoint, ag_types.VertexEndpoint)
+    assert target.endpoint.project == "p1"
+    assert target.endpoint.location == "us-central1"
+    assert target.endpoint.options is None
+
+
+def test_effective_project_and_location_none_when_vertex_is_false(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify effective_project and effective_location return None when vertex is disabled."""
+    monkeypatch.delenv("GOOGLE_GENAI_USE_ENTERPRISE", raising=False)
+    monkeypatch.delenv("GOOGLE_GENAI_USE_VERTEXAI", raising=False)
+    monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "ambient-project")
+    monkeypatch.setenv("GOOGLE_CLOUD_LOCATION", "us-east1")
+
+    rt = AntigravitySdkRuntime(options=AntigravitySdkOptions(vertex=False))
+    assert rt.effective_vertex is False
+    assert rt.effective_project is None
+    assert rt.effective_location is None
+
+
+def test_blocked_env_vars_strips_google_application_credentials_in_vertex(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify build_env does not restore GOOGLE_APPLICATION_CREDENTIALS when explicitly blocked."""
+    monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", "/path/to/creds.json")
+    rt = AntigravitySdkRuntime(
+        settings=RuntimeSettings(blocked_env_vars=("GOOGLE_APPLICATION_CREDENTIALS",)),
+        options=AntigravitySdkOptions(vertex=True),
+    )
+    env = rt.build_env()
+    assert "GOOGLE_APPLICATION_CREDENTIALS" not in env
+
+
+def test_antigravity_validation_error_stub_is_exception_subclass() -> None:
+    """Verify AntigravityValidationError is a valid Exception subclass."""
+    from reach.runtime.antigravity_sdk import AntigravityValidationError
+
+    assert issubclass(AntigravityValidationError, Exception)

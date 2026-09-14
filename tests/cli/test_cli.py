@@ -492,6 +492,22 @@ def test_main_catches_pydantic_validation_error_and_renders_error_panel(
     assert "validation error" in err.lower()
 
 
+def test_main_catches_broken_pipe_error_and_exits_zero(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Verify BrokenPipeError exits cleanly with 0 and without printing an error panel."""
+
+    def _broken_pipe(*_a: object, **_kw: object) -> Never:
+        raise BrokenPipeError(32, "Broken pipe")
+
+    monkeypatch.setattr("reach.cli.app", _broken_pipe)
+    exit_code = main(["check", "."])
+    assert exit_code == 0
+    err = capsys.readouterr().err
+    assert err == ""
+
+
 def test_opt_replaces_rather_than_merges_into_a_config_files_options_table(
     write_reach_toml: Callable[..., Path],
     skill_repo: Path,

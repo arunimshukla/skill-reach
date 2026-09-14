@@ -674,7 +674,14 @@ class AntigravityCliGenerator(BaseTextGenerator[AntigravityCliOptions]):
             env=self.build_env(),
         )
         if completed.returncode != 0:
-            reason = completed.stderr.strip() or f"exit code {completed.returncode}"
+            reason = completed.stderr.strip()
+            if not reason and completed.stdout:
+                try:
+                    data = json.loads(completed.stdout)
+                    reason = data.get("error", "") if isinstance(data, dict) else ""
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    reason = ""
+            reason = reason or f"exit code {completed.returncode}"
             msg = f"generation failed: {reason}"
             raise RuntimeError(msg)
         try:
