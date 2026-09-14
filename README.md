@@ -23,6 +23,7 @@ While standard evaluation suites measure skill execution after invocation, `skil
 - [Reproducibility and Provenance](#reproducibility-and-provenance)
 - [Development and Testing](#development-and-testing)
 - [Repository Layout](#repository-layout)
+- [Support and Feedback](#support-and-feedback)
 
 ## Installation
 
@@ -572,6 +573,10 @@ tests/
 └── runtime/      # Agent runtime contracts, subprocess drivers, and listing budgets
 docs/             # MkDocs documentation, concept guides, and API reference
 ```
+
+## Support and Feedback
+
+If you have questions, encounter bugs, or have feature requests, please report them through [GitHub Issues](https://github.com/google/skill-reach/issues). This repository is maintained on a best-effort basis.
 
 ---
 
