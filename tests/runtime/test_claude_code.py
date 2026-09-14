@@ -777,6 +777,21 @@ def test_a_generation_prompt_travels_on_stdin(mock_subprocess, generator) -> Non
     assert "draft me a query" not in command
 
 
+def test_complete_appends_schema_to_prompt(mock_subprocess, generator) -> None:
+    """Verify prompt receives schema instructions when schema is provided."""
+    seen: dict[str, object] = {}
+
+    def record(args: Any, **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        del args
+        seen.update(kwargs)
+        return subprocess.CompletedProcess(args=[], returncode=0, stdout="{}", stderr="")
+
+    mock_subprocess(handler=record)
+    generator.complete("draft", schema={"type": "object"})
+    assert "draft" in str(seen["input"])
+    assert '{"type": "object"}' in str(seen["input"])
+
+
 def test_generation_banks_what_it_cost(mock_subprocess, generator) -> None:
     """Verify completion_cost_usd accumulates cost across multiple completions."""
     mock_subprocess(stdout=json.dumps({"result": "a query", "total_cost_usd": 0.25}))

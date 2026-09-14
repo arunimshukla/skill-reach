@@ -423,6 +423,18 @@ def test_complete_uses_no_isolation(
     assert config.skills_paths == []
 
 
+def test_complete_passes_response_schema(
+    monkeypatch: pytest.MonkeyPatch,
+    generator: AntigravitySdkGenerator,
+) -> None:
+    """Verify complete populates response_schema on agent config when schema is provided."""
+    instances = _fake_agent(monkeypatch, _FakeResponse(text="{}"))
+    schema = {"type": "object", "properties": {"queries": {"type": "array"}}}
+    generator.complete("q", schema=schema)
+    config = instances[0].config
+    assert config.response_schema == json.dumps(schema)
+
+
 def test_complete_uses_thinking_config_when_effort_configured(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -927,3 +939,71 @@ def test_antigravity_validation_error_stub_is_exception_subclass() -> None:
     from reach.runtime.antigravity_sdk import AntigravityValidationError
 
     assert issubclass(AntigravityValidationError, Exception)
+
+
+@pytest.mark.parametrize(
+    ("model_name", "expected_thinking"),
+    [
+        ("gemini-2.5-flash", False),
+        ("gemini-2.5-pro", False),
+        ("gemini-2.0-flash", False),
+        ("gemini-1.5-pro", False),
+        ("gemini-3.8-flash", True),
+        ("gemini-3.7-flash", True),
+        ("gemini-3-flash-preview", True),
+        ("claude-sonnet-5", True),
+    ],
+)
+def test_model_supports_thinking(model_name: str, expected_thinking: bool) -> None:
+    """Verify _model_supports_thinking flags models that do not support thinking levels."""
+    from reach.runtime.antigravity_sdk import _model_supports_thinking
+
+    assert _model_supports_thinking(model_name) is expected_thinking
+
+
+def test_build_model_spec_drops_effort_for_non_thinking_models() -> None:
+    """Verify _build_model_spec does not set thinking_level on models that do not support it."""
+    spec25 = _build_model_spec("gemini-2.5-flash", effort="low")
+    assert spec25 == "gemini-2.5-flash"
+
+    spec38 = _build_model_spec("gemini-3.8-flash", effort="low")
+    if ag_types is not None:
+        assert isinstance(spec38, ag_types.ModelTarget)
+        assert isinstance(spec38.endpoint, ag_types.GeminiAPIEndpoint)
+        assert spec38.endpoint.options is not None
+        assert spec38.endpoint.options.thinking_level == "low"
+
+
+def test_generator_effective_effort_guards_against_unsupported_models() -> None:
+    """Verify AntigravitySdkGenerator.effective_effort avoids fallback effort on 2.5 models."""
+    gen25 = AntigravitySdkGenerator(model="gemini-2.5-flash")
+    assert gen25.effective_effort is None
+
+    gen38 = AntigravitySdkGenerator(model="gemini-3.8-flash")
+    assert gen38.effective_effort == "low"
+
+
+def test_generator_complete_uses_structured_output_when_available(
+    monkeypatch: pytest.MonkeyPatch,
+    generator: AntigravitySdkGenerator,
+) -> None:
+    """Verify AntigravitySdkGenerator.complete extracts structured output as JSON."""
+    canned = {"queries": [{"text": "deploy a job", "citation": "cloud-run docs"}]}
+    agents = _fake_agent(monkeypatch, _FakeResponse(structured=canned, text="Finished"))
+    out = generator.complete("generate", schema={"type": "object"})
+    assert json.loads(out) == canned
+    assert json.loads(agents[0].config.response_schema) == {"type": "object"}
+    assert agents[0].config.capabilities is not None
+    assert agents[0].config.capabilities.enabled_tools == []
+    assert agents[0].config.capabilities.enable_subagents is False
+
+
+def test_generator_complete_returns_text_when_no_schema(
+    monkeypatch: pytest.MonkeyPatch,
+    generator: AntigravitySdkGenerator,
+) -> None:
+    """Verify AntigravitySdkGenerator.complete falls back to text when no schema provided."""
+    agents = _fake_agent(monkeypatch, _FakeResponse(text="plain completion"))
+    out = generator.complete("hello")
+    assert out == "plain completion"
+    assert getattr(agents[0].config, "response_schema", None) is None

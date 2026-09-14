@@ -24,6 +24,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, Self, override
 
@@ -638,7 +639,12 @@ class AntigravityCliGenerator(BaseTextGenerator[AntigravityCliOptions]):
         except (KeyError, ValueError):
             return None
 
-    def build_completion_command(self, prompt: str = "") -> list[str]:
+    def build_completion_command(
+        self,
+        prompt: str = "",
+        *,
+        schema: str | None = None,
+    ) -> list[str]:
         """Assemble command-line arguments for raw text completion."""
         del prompt  # Prompt is passed via stdin to avoid Linux MAX_ARG_STRLEN limits
         options = self.options
@@ -657,15 +663,24 @@ class AntigravityCliGenerator(BaseTextGenerator[AntigravityCliOptions]):
         timeout_s = self.timeout_s or 200
         timeout_val = options.print_timeout or f"{round(timeout_s)}s"
         cmd += ["--print-timeout", timeout_val]
+        effective_schema = schema if schema is not None else options.json_schema
+        if effective_schema:
+            cmd += ["--json-schema", effective_schema]
         if self.effective_effort:
             cmd += ["--effort", self.effective_effort]
         return [*cmd, *options.extra_args]
 
     @override
-    def complete(self, prompt: str) -> str:
+    def complete(
+        self,
+        prompt: str,
+        *,
+        schema: str | Mapping[str, Any] | None = None,
+    ) -> str:
         """Execute text completion subprocess and return response string."""
+        schema_str = self.resolve_schema(schema)
         completed = subprocess.run(
-            self.build_completion_command(prompt),
+            self.build_completion_command(prompt, schema=schema_str),
             input=prompt,
             capture_output=True,
             text=True,

@@ -44,6 +44,7 @@ reach query --queries .reach/queries.json --leaks --citations
 | `--skill`             | String  | All                | Specific skill name(s) to draft queries for (repeatable).                                            |
 | `--count`             | Integer | `3`                | Number of queries to draft per target skill.                                                         |
 | `--generator-model`   | String  | `gemini-3.8-flash` | Model used to draft synthetic queries.                                                               |
+| `--generator-agent`   | String  | Auto-detected      | Agent driver used to draft synthetic queries, overriding the probe agent.                            |
 | `--adversarial`       | Flag    | `false`            | Synthesize near-miss negative queries sharing target vocabulary.                                     |
 | `--adversarial-count` | Integer | `1`                | Number of adversarial negative queries per target.                                                   |
 | `--review`            | Flag    | `false`            | Launch interactive browser review for drafted queries before saving.                                 |
@@ -54,6 +55,7 @@ reach query --queries .reach/queries.json --leaks --citations
 | :--------------- | :----- | :-------------------- | :----------------------------------------------------------------------------------------------------------------------------- |
 | `--out`, `-o`    | Path   | `.reach/queries.json` | Where to write the query set (format auto-inferred from `.json`, `.jsonl`, or `.csv`).                                         |
 | `--format`, `-f` | Choice | `json`                | Explicit output format: `json`, `jsonl`, or `csv`. When `--out` is omitted with `csv` or `jsonl`, output is printed to stdout. |
+| `--force`, `-f`  | Flag   | `false`               | Overwrite destination query set file if it already exists.                                                                     |
 | `--dry-run`      | Flag   | `false`               | Preview prompts and token budget without making model calls.                                                                   |
 
 ### Inspection & View

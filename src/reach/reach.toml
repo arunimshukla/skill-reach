@@ -79,10 +79,8 @@ effort = "low"
 effort = "low"
 
 [models.gemini-2-5-flash]
-effort = "low"
 
 [models.gemini-2-5-pro]
-effort = "low"
 
 
 

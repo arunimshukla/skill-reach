@@ -370,6 +370,7 @@ def _handle_draft_query_generation(
     registry: RegistryFlags | None = None,
     dry_run: bool = False,
     review: bool = False,
+    force: bool = False,
 ) -> int:
     """Synthesize new synthetic benchmark queries for discovered skills."""
     if target is not None and target.is_dir():
@@ -387,10 +388,10 @@ def _handle_draft_query_generation(
     settings = _build_draft_settings(config, catalog, runtime, resolved_study, registry=registry)
 
     destination = settings.require_queries()
-    if destination.exists():
+    if destination.exists() and not force:
         msg = (
             f"Query set already exists at {destination}. Move it aside, "
-            "or point --out / --queries somewhere else to avoid overwriting it."
+            "use --force to overwrite, or point --out / --queries somewhere else."
         )
         raise ValueError(msg)
     skills_found, _roots, _found = _corpus(console, build_runtime(settings.runtime), settings)
@@ -506,6 +507,14 @@ def _query(
             help="Launch interactive browser review for drafted queries",
         ),
     ] = False,
+    force: Annotated[
+        bool,
+        SWITCH,
+        Parameter(
+            name=["--force", "-f"],
+            help="Overwrite destination query set file if it already exists",
+        ),
+    ] = False,
     draft_only: Annotated[bool, Parameter(show=False)] = False,
 ) -> int:
     """Synthesize benchmark queries for skills, convert formats, or inspect query datasets."""
@@ -565,6 +574,7 @@ def _query(
         registry=registry,
         dry_run=dry_run,
         review=review,
+        force=force,
     )
 
 
@@ -631,6 +641,14 @@ def _query_draft(
             help="Launch interactive browser review for drafted queries",
         ),
     ] = False,
+    force: Annotated[
+        bool,
+        SWITCH,
+        Parameter(
+            name=["--force", "-f"],
+            help="Overwrite destination query set file if it already exists",
+        ),
+    ] = False,
     quiet: Quiet = False,
 ) -> int:
     """Generate synthetic query set for target catalog from skill markdown bodies."""
@@ -648,6 +666,7 @@ def _query_draft(
         generate=generate,
         dry_run=dry_run,
         review=review,
+        force=force,
         quiet=quiet,
         draft_only=True,
     )
