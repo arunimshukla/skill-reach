@@ -453,6 +453,45 @@ def test_an_invalid_opt_value_type_is_refused_with_the_same_clarity(
     assert "ClaudeCodeOptions" in complaint
 
 
+def test_main_catches_oserror_and_renders_error_panel(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Verify unhandled OSError is caught and rendered in error_panel with exit code 2."""
+
+    def _bomb(*_a: object, **_kw: object) -> Never:
+        msg = "Argument list too long"
+        raise OSError(7, msg, "agy")
+
+    monkeypatch.setattr("reach.cli.app", _bomb)
+    exit_code = main(["check", "."])
+    assert exit_code == 2
+    err = capsys.readouterr().err
+    assert "Argument list too long" in err
+
+
+def test_main_catches_pydantic_validation_error_and_renders_error_panel(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Verify unhandled PydanticValidationError is caught and rendered in error_panel."""
+    from pydantic import BaseModel, Field
+
+    class _SampleModel(BaseModel):
+        val: int = Field(...)
+
+    def _bomb(*_a: object, **_kw: object) -> Never:
+        _SampleModel.model_validate({"val": "not-an-int"})
+        msg = "unreachable"
+        raise AssertionError(msg)
+
+    monkeypatch.setattr("reach.cli.app", _bomb)
+    exit_code = main(["check", "."])
+    assert exit_code == 2
+    err = capsys.readouterr().err
+    assert "validation error" in err.lower()
+
+
 def test_opt_replaces_rather_than_merges_into_a_config_files_options_table(
     write_reach_toml: Callable[..., Path],
     skill_repo: Path,

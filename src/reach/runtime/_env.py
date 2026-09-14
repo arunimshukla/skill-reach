@@ -61,9 +61,12 @@ def sanitize_subprocess_env(
 ) -> dict[str, str]:
     """Strip sensitive ambient credentials and tokens from child process environment."""
     keep_set = set(keep)
-    if blocked_env_vars is None and (
-        env.get("CLAUDE_CODE_USE_VERTEX") == "1" or env.get("GOOGLE_GENAI_USE_ENTERPRISE") == "true"
-    ):
+    vertex_env_active = (
+        env.get("CLAUDE_CODE_USE_VERTEX") == "1"
+        or env.get("GOOGLE_GENAI_USE_ENTERPRISE", "").lower() in ("true", "1")
+        or env.get("GOOGLE_GENAI_USE_VERTEXAI", "").lower() in ("true", "1")
+    )
+    if blocked_env_vars is None and vertex_env_active:
         keep_set.add("GOOGLE_APPLICATION_CREDENTIALS")
 
     effective_blocked = (
