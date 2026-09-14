@@ -28,6 +28,7 @@ if TYPE_CHECKING:
     from google.antigravity import Agent, LocalAgentConfig
     from google.antigravity import hooks as ag_hooks
     from google.antigravity import types as ag_types
+    from google.antigravity.types import AntigravityValidationError
 
     _HAS_ANTIGRAVITY = True
 else:
@@ -35,6 +36,7 @@ else:
         from google.antigravity import Agent, LocalAgentConfig
         from google.antigravity import hooks as ag_hooks
         from google.antigravity import types as ag_types
+        from google.antigravity.types import AntigravityValidationError
 
         _HAS_ANTIGRAVITY = True
     except ImportError:
@@ -42,6 +44,10 @@ else:
         LocalAgentConfig = None
         ag_hooks = None
         ag_types = None
+
+        class AntigravityValidationError(Exception):
+            """Stub exception when google-antigravity is not installed."""
+
         _HAS_ANTIGRAVITY = False
 
 from pydantic import BaseModel, Field
@@ -101,15 +107,32 @@ def _tool_name(name: ag_types.BuiltinTools | str) -> str:
     )
 
 
-def _build_model_spec(model: str, effort: str | None = None) -> str | ag_types.ModelTarget:
+def _build_model_spec(
+    model: str,
+    effort: str | None = None,
+    *,
+    vertex: bool = False,
+    project: str | None = None,
+    location: str | None = None,
+    api_key: str | None = None,
+) -> str | ag_types.ModelTarget:
     """Construct model target with reasoning effort endpoint options when configured."""
-    if ag_types is not None and effort:
-        return ag_types.ModelTarget(
-            name=model,
-            endpoint=ag_types.GeminiAPIEndpoint(
-                options=ag_types.GeminiModelOptions(thinking_level=effort),
-            ),
+    if ag_types is not None and (effort or vertex):
+        options = ag_types.GeminiModelOptions(thinking_level=effort) if effort else None
+        endpoint = (
+            ag_types.VertexEndpoint(
+                project=project,
+                location=location,
+                api_key=api_key,
+                options=options,
+            )
+            if vertex
+            else ag_types.GeminiAPIEndpoint(
+                api_key=api_key,
+                options=options,
+            )
         )
+        return ag_types.ModelTarget(name=model, endpoint=endpoint)
     return model
 
 
@@ -142,9 +165,88 @@ class AntigravitySdkOptions(AgentOptions):
     )
     app_data_dir: Path | None = None
     isolation_dir_field: ClassVar[str | None] = "app_data_dir"
+    vertex: bool | None = None
+    project: str | None = None
+    location: str | None = None
 
 
-class AntigravitySdkRuntime(AntigravityRuntime):
+class _AntigravitySdkConfigMixin:
+    """Consolidate shared Vertex AI and ADC resolution for SDK runtime and generator."""
+
+    options: AntigravitySdkOptions
+
+    @property
+    def effective_vertex(self) -> bool:
+        """Determine whether Vertex AI backend is active."""
+        if self.options.vertex is not None:
+            return self.options.vertex
+        if getattr(self.options, "provider", None) == "vertex":
+            return True
+        return os.environ.get("GOOGLE_GENAI_USE_ENTERPRISE", "").lower() in (
+            "true",
+            "1",
+        ) or os.environ.get("GOOGLE_GENAI_USE_VERTEXAI", "").lower() in ("true", "1")
+
+    @property
+    def effective_project(self) -> str | None:
+        """Resolve GCP project ID for Vertex AI execution."""
+        if not self.effective_vertex:
+            return None
+        if self.options.api_key:
+            return self.options.project
+        return self.options.project or os.environ.get("GOOGLE_CLOUD_PROJECT")
+
+    @property
+    def effective_location(self) -> str | None:
+        """Resolve GCP region/location for Vertex AI execution."""
+        if not self.effective_vertex:
+            return None
+        if self.options.api_key:
+            return self.options.location
+        return self.options.location or os.environ.get("GOOGLE_CLOUD_LOCATION") or "global"
+
+    @property
+    def effective_api_key(self) -> str | None:
+        """Return configured API key or fallback to environment variables."""
+        if self.options.api_key:
+            return self.options.api_key
+        if self.effective_vertex:
+            return None
+        return os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+
+    def _sync_sdk_env(self, env: dict[str, str]) -> dict[str, str]:
+        """Apply API key synchronization and Vertex credential preservation to environment."""
+        if (api_key := self.effective_api_key) is not None:
+            env["GEMINI_API_KEY"] = api_key
+            env["GOOGLE_API_KEY"] = api_key
+        elif self.effective_vertex and not self.options.api_key:
+            env.pop("GEMINI_API_KEY", None)
+            env.pop("GOOGLE_API_KEY", None)
+
+        blocked = getattr(self, "blocked_env_vars", None) or ()
+        if (
+            self.effective_vertex
+            and "GOOGLE_APPLICATION_CREDENTIALS" not in blocked
+            and "GOOGLE_APPLICATION_CREDENTIALS" in os.environ
+            and "GOOGLE_APPLICATION_CREDENTIALS" not in env
+        ):
+            env["GOOGLE_APPLICATION_CREDENTIALS"] = os.environ["GOOGLE_APPLICATION_CREDENTIALS"]
+
+        return sync_google_and_gemini_keys(env)
+
+    def _target_model_spec(self, model: str, effort: str | None) -> str | ag_types.ModelTarget:
+        """Construct model target with reasoning effort and endpoint options when configured."""
+        return _build_model_spec(
+            model,
+            effort,
+            vertex=self.effective_vertex,
+            project=self.effective_project,
+            location=self.effective_location,
+            api_key=self.effective_api_key,
+        )
+
+
+class AntigravitySdkRuntime(_AntigravitySdkConfigMixin, AntigravityRuntime):
     """Execute evaluation queries using the Google Antigravity Python SDK."""
 
     name = "antigravity-sdk"
@@ -170,15 +272,11 @@ class AntigravitySdkRuntime(AntigravityRuntime):
     def build_env(self, workdir: Path | None = None) -> dict[str, str]:
         """Assemble environment variables with API key synchronization."""
         env = super().build_env(workdir)
-        if (api_key := self.effective_api_key) is not None:
-            env["GEMINI_API_KEY"] = api_key
-            env["GOOGLE_API_KEY"] = api_key
-
-        return sync_google_and_gemini_keys(env)
+        return self._sync_sdk_env(env)
 
     def _model_spec(self) -> str | ag_types.ModelTarget:
         """Construct model target with reasoning effort endpoint options when configured."""
-        return _build_model_spec(self.options.model, self.effective_effort)
+        return self._target_model_spec(self.options.model, self.effective_effort)
 
     def _select_config(
         self,
@@ -203,6 +301,9 @@ class AntigravitySdkRuntime(AntigravityRuntime):
             budget_config=ag_types.BudgetConfig(max_model_calls=self.options.max_turns),
             response_schema=self.selection_schema(self._resident),
             api_key=self.effective_api_key,
+            vertex=self.effective_vertex,
+            project=self.effective_project,
+            location=self.effective_location,
             app_data_dir=app_data_dir,
             env=self.build_env(workdir),
             hooks=hooks,
@@ -240,13 +341,19 @@ class AntigravitySdkRuntime(AntigravityRuntime):
 
         config = self._select_config(workdir, hooks=hooks_list)
 
-        async with Agent(config) as agent:
-            response = await agent.chat(query_text)
-            data = await response.structured_output()
-            observed_tools = tuple(
-                [_tool_name(call.name) async for call in response.tool_calls],
-            )
-            stop_reason = response.stop_reason
+        try:
+            async with Agent(config) as agent:
+                response = await agent.chat(query_text)
+                data = await response.structured_output()
+                observed_tools = tuple(
+                    [_tool_name(call.name) async for call in response.tool_calls],
+                )
+                stop_reason = response.stop_reason
+        except (AntigravityValidationError, Exception) as err:
+            if isinstance(err, RuntimeError):
+                raise
+            msg = f"Antigravity SDK execution error: {err}"
+            raise RuntimeError(msg) from err
 
         error = None
         if stop_reason not in EXPECTED_STOP_REASONS:
@@ -310,7 +417,7 @@ class AntigravitySdkRuntime(AntigravityRuntime):
             self.post_probe(workdir)
 
 
-class AntigravitySdkGenerator(BaseTextGenerator[AntigravitySdkOptions]):
+class AntigravitySdkGenerator(_AntigravitySdkConfigMixin, BaseTextGenerator[AntigravitySdkOptions]):
     """Generate text completions using the Antigravity SDK."""
 
     name: str = "antigravity-sdk"
@@ -345,21 +452,11 @@ class AntigravitySdkGenerator(BaseTextGenerator[AntigravitySdkOptions]):
         super().__init__(model=opts.model or model, timeout_s=timeout_s, options=opts)
         self.settings = settings
 
-    @property
-    def effective_api_key(self) -> str | None:
-        """Return configured API key or resolve from environment."""
-        if self.options.api_key:
-            return self.options.api_key
-        return os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
-
     @override
     def build_env(self) -> dict[str, str]:
         """Assemble environment variables with API key synchronization."""
         env = super().build_env()
-        if api_key := self.effective_api_key:
-            env["GEMINI_API_KEY"] = api_key
-            env["GOOGLE_API_KEY"] = api_key
-        return sync_google_and_gemini_keys(env)
+        return self._sync_sdk_env(env)
 
     @property
     def effective_effort(self) -> str | None:
@@ -374,7 +471,7 @@ class AntigravitySdkGenerator(BaseTextGenerator[AntigravitySdkOptions]):
 
     def _model_spec(self) -> str | ag_types.ModelTarget:
         """Construct model target with reasoning effort endpoint options when configured."""
-        return _build_model_spec(self.options.model or self.model, self.effective_effort)
+        return self._target_model_spec(self.options.model or self.model, self.effective_effort)
 
     @override
     def complete(self, prompt: str) -> str:
@@ -384,12 +481,22 @@ class AntigravitySdkGenerator(BaseTextGenerator[AntigravitySdkOptions]):
             config = LocalAgentConfig(
                 model=self._model_spec(),
                 api_key=self.effective_api_key,
+                vertex=self.effective_vertex,
+                project=self.effective_project,
+                location=self.effective_location,
                 env=self.build_env(),
             )
             async with Agent(config) as agent:
                 response = await agent.chat(prompt)
                 return await response.text()
 
-        text = _run_sync(asyncio.wait_for(_complete_async(), timeout=self.timeout_s))
+        try:
+            text = _run_sync(asyncio.wait_for(_complete_async(), timeout=self.timeout_s))
+        except TimeoutError as err:
+            msg = f"generation failed: timed out after {self.timeout_s}s"
+            raise RuntimeError(msg) from err
+        except (AntigravityValidationError, Exception) as err:
+            msg = f"generation failed: {err}"
+            raise RuntimeError(msg) from err
         self.completions += 1
         return text

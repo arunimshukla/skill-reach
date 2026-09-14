@@ -1009,10 +1009,10 @@ def test_the_completion_command_still_asks_for_a_new_project(
     assert "--new-project" in generator.build_completion_command()
 
 
-def test_build_completion_command_embeds_prompt_and_passes_effort(
+def test_build_completion_command_omits_prompt_and_passes_effort(
     home_dir: Path,
 ) -> None:
-    """Verify build_completion_command passes prompt to -p and includes effort."""
+    """Verify build_completion_command omits prompt from argv and includes effort."""
     generator = AntigravityCliGenerator(
         options=AntigravityCliOptions(
             model=DEFAULT_GEMINI_MODEL,
@@ -1021,8 +1021,8 @@ def test_build_completion_command_embeds_prompt_and_passes_effort(
         ),
     )
     cmd = generator.build_completion_command("test prompt")
-    p_idx = cmd.index("-p")
-    assert cmd[p_idx + 1] == "test prompt"
+    assert "-p" not in cmd
+    assert "test prompt" not in cmd
     assert "--effort" in cmd
     assert cmd[cmd.index("--effort") + 1] == "low"
 
@@ -1038,8 +1038,34 @@ def test_build_completion_command_resolves_profile_effort(
         ),
     )
     cmd = generator.build_completion_command("test prompt")
+    assert "-p" not in cmd
+    assert "test prompt" not in cmd
     assert "--effort" in cmd
     assert cmd[cmd.index("--effort") + 1] == "low"
+
+
+def test_complete_pipes_prompt_via_stdin_and_handles_large_payload(
+    monkeypatch: pytest.MonkeyPatch,
+    generator: AntigravityCliGenerator,
+) -> None:
+    """Verify complete pipes prompt via stdin and succeeds with payloads exceeding 128 KB."""
+    captured_input: str | None = None
+
+    def fake_run(*args: Any, **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        nonlocal captured_input
+        captured_input = kwargs.get("input")
+        return subprocess.CompletedProcess(
+            args=args,
+            returncode=0,
+            stdout=json.dumps({"response": "completion result"}),
+            stderr="",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    large_prompt = "x" * 150_000  # Exceeds Linux 128 KB MAX_ARG_STRLEN
+    res = generator.complete(large_prompt)
+    assert res == "completion result"
+    assert captured_input == large_prompt
 
 
 def test_complete_raises_when_the_runtime_fails(
@@ -1058,6 +1084,25 @@ def test_complete_raises_when_the_runtime_fails(
         ),
     )
     with pytest.raises(RuntimeError, match="authentication failed"):
+        generator.complete("draft me a query")
+
+
+def test_complete_extracts_structured_error_from_stdout_when_stderr_empty(
+    monkeypatch: pytest.MonkeyPatch,
+    generator: AntigravityCliGenerator,
+) -> None:
+    """Verify complete parses error field from stdout JSON when stderr is empty."""
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *a, **_kw: subprocess.CompletedProcess(
+            args=a,
+            returncode=1,
+            stdout=json.dumps({"error": "model quota exceeded"}),
+            stderr="",
+        ),
+    )
+    with pytest.raises(RuntimeError, match="model quota exceeded"):
         generator.complete("draft me a query")
 
 

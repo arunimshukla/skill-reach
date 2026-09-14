@@ -640,11 +640,10 @@ class AntigravityCliGenerator(BaseTextGenerator[AntigravityCliOptions]):
 
     def build_completion_command(self, prompt: str = "") -> list[str]:
         """Assemble command-line arguments for raw text completion."""
+        del prompt  # Prompt is passed via stdin to avoid Linux MAX_ARG_STRLEN limits
         options = self.options
         cmd = [
             options.executable,
-            "-p",
-            prompt,
             "--model",
             self.normalized_model,
             "--output-format",
@@ -667,15 +666,22 @@ class AntigravityCliGenerator(BaseTextGenerator[AntigravityCliOptions]):
         """Execute text completion subprocess and return response string."""
         completed = subprocess.run(
             self.build_completion_command(prompt),
+            input=prompt,
             capture_output=True,
             text=True,
             timeout=self.timeout_s,
             check=False,
-            stdin=subprocess.DEVNULL,
             env=self.build_env(),
         )
         if completed.returncode != 0:
-            reason = completed.stderr.strip() or f"exit code {completed.returncode}"
+            reason = completed.stderr.strip()
+            if not reason and completed.stdout:
+                try:
+                    data = json.loads(completed.stdout)
+                    reason = data.get("error", "") if isinstance(data, dict) else ""
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    reason = ""
+            reason = reason or f"exit code {completed.returncode}"
             msg = f"generation failed: {reason}"
             raise RuntimeError(msg)
         try:

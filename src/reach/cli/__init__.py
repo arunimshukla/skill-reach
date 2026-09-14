@@ -21,6 +21,7 @@ from functools import cache
 from typing import TYPE_CHECKING
 
 from cyclopts.exceptions import CycloptsError
+from pydantic import ValidationError as PydanticValidationError
 
 if TYPE_CHECKING:
     from collections.abc import Iterator, Sequence
@@ -141,14 +142,16 @@ def main(argv: list[str] | None = None) -> int:
             exit_on_error=False,
             error_formatter=lambda error: error_panel(_explain(error)),
         )
+    except BrokenPipeError:
+        return 0
     except CycloptsError:
         return 2
     except (
         ValueError,
         KeyError,
-        FileNotFoundError,
-        NotADirectoryError,
+        OSError,
         RuntimeError,
+        PydanticValidationError,
     ) as error:
         said = error.args[0] if isinstance(error, KeyError) else str(error)
         build_console().print(error_panel([str(said)]))

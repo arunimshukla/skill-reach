@@ -1575,7 +1575,7 @@ def test_cli_generator_receives_prompt(agent: str) -> None:
     cmd = cmd_fn(prompt)
     assert isinstance(cmd, list)
     in_command = any(prompt in token for token in cmd)
-    assert in_command or gen.name == "claude-code"
+    assert in_command or gen.name in ("claude-code", "antigravity-cli")
 
 
 @pytest.mark.parametrize("agent", [a for a in known_agents() if agent_default_model(a)])
