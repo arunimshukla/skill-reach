@@ -1624,3 +1624,8 @@ def test_eval_direct_skill_md_path(
     """Verify reach eval succeeds when passed a direct SKILL.md manifest file path."""
     manifest = bodied_corpus / "gke-basics" / "SKILL.md"
     assert main(["eval", str(manifest), "--agent", "fake", "--yes"]) == 0
+
+
+def test_eval_nonexistent_path_fails_cleanly() -> None:
+    """Verify reach eval exits 2 when given a nonexistent skill path."""
+    assert main(["eval", "./nonexistent/path/to/skill", "--agent", "fake"]) == 2

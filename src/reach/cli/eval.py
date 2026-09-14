@@ -155,7 +155,10 @@ def _resolve_manifest_target(
     """Parse skill name and catalog path from target name, directory, or manifest."""
     if target is None:
         return None, None
-    resolved = resolve_skill_target(target, explicit_catalog=study.skills, command_name="eval")
+    try:
+        resolved = resolve_skill_target(target, explicit_catalog=study.skills, command_name="eval")
+    except FileNotFoundError as err:
+        raise ValueError(str(err)) from err
     if resolved is None:
         return None, None
     corpus = resolved.catalog_path if study.skills is None else None

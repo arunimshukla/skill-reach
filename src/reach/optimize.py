@@ -16,7 +16,6 @@
 
 from __future__ import annotations
 
-import contextlib
 import difflib
 import random
 import shutil
@@ -1054,13 +1053,12 @@ def _resolve_target_and_rivals(
     """Locate target skill and calculate rival relationships within resolved skill catalog."""
     from reach.catalog import resolve_skill_target
 
-    with contextlib.suppress(FileNotFoundError, ValueError):
-        if resolved := resolve_skill_target(
-            skill_name, explicit_catalog=skills_path, command_name="optimize"
-        ):
-            skill_name = resolved.skill_name
-            if resolved.catalog_path and skills_path is None:
-                skills_path = resolved.catalog_path
+    if resolved := resolve_skill_target(
+        skill_name, explicit_catalog=skills_path, command_name="optimize"
+    ):
+        skill_name = resolved.skill_name
+        if resolved.catalog_path and skills_path is None:
+            skills_path = resolved.catalog_path
 
     if skills_path is not None:
         resolved_root = resolve_path(skills_path)

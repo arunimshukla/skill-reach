@@ -985,3 +985,21 @@ def test_overlap_explain_with_skill_path_infers_catalog(
     assert code == 0
     data = json.loads(capsys.readouterr().out)
     assert data["target_skill"] == "skill-a"
+
+
+def test_overlap_multiple_skills_preserves_independent_catalogs(
+    tmp_path: Path,
+) -> None:
+    """Verify passing multiple --skill paths resolves against base catalog without loop mutation."""
+    cat = tmp_path / "skills"
+    cat.mkdir()
+    s1 = cat / "s1"
+    s1.mkdir()
+    (s1 / "SKILL.md").write_text("---\nname: s1\ndescription: Skill 1.\n---\n", encoding="utf-8")
+
+    s2 = cat / "s2"
+    s2.mkdir()
+    (s2 / "SKILL.md").write_text("---\nname: s2\ndescription: Skill 2.\n---\n", encoding="utf-8")
+
+    code = main(["overlap", "--skill", str(s1), "--skill", str(s2)])
+    assert code == 0

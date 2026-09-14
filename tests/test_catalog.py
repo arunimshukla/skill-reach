@@ -1154,7 +1154,7 @@ def test_resolve_skill_target_smart_parent_catalog(tmp_path: Path) -> None:
     """Verify resolve_skill_target infers parent catalog when parent has peer skills."""
     from reach.catalog import resolve_skill_target
 
-    catalog_dir = tmp_path / "skills"
+    catalog_dir = tmp_path / "custom-catalog"
     catalog_dir.mkdir()
     skill1 = catalog_dir / "skill1"
     skill1.mkdir()
@@ -1213,7 +1213,7 @@ def test_resolve_skill_target_contained_skills_raises_with_guidance(tmp_path: Pa
     """Verify resolve_skill_target raises ValueError with guidance when target contains skills."""
     from reach.catalog import resolve_skill_target
 
-    catalog_dir = tmp_path / "my-catalog"
+    catalog_dir = tmp_path / "skills-box"
     catalog_dir.mkdir()
     child1 = catalog_dir / "child1"
     child1.mkdir()
@@ -1234,3 +1234,55 @@ def test_resolve_skill_target_contained_skills_raises_with_guidance(tmp_path: Pa
 
     with pytest.raises(ValueError, match=r"(?s)containing 2 skills.*reach eval"):
         resolve_skill_target(catalog_dir, command_name="eval")
+
+
+def test_resolve_skill_target_raw_name_matches_cwd_dir_without_skill_md(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify raw skill name matching a cwd folder without SKILL.md does not trigger error."""
+    from reach.catalog import resolve_skill_target
+
+    monkeypatch.chdir(tmp_path)
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir()
+
+    # Plain name without explicit catalog should resolve as raw name, not crash on cwd docs/
+    res = resolve_skill_target("docs")
+    assert res is not None
+    assert res.skill_name == "docs"
+    assert res.catalog_path is None
+
+    # Plain name with explicit catalog should resolve against explicit catalog
+    other_cat = tmp_path / "my-skills"
+    other_cat.mkdir()
+    res_cat = resolve_skill_target("docs", explicit_catalog=other_cat)
+    assert res_cat is not None
+    assert res_cat.skill_name == "docs"
+    assert res_cat.catalog_path == other_cat.resolve()
+
+    # Explicit path './docs' should still raise ValueError because user explicitly asked for path
+    with pytest.raises(ValueError, match=r"does not contain a SKILL\.md file"):
+        resolve_skill_target("./docs")
+
+
+def test_infer_parent_catalog_relative_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify _infer_parent_catalog handles relative 1-level paths without short-circuiting."""
+    from pathlib import Path
+
+    from reach.catalog import _infer_parent_catalog
+
+    catalog = tmp_path / "custom-cat"
+    catalog.mkdir()
+    s1 = catalog / "s1"
+    s1.mkdir()
+    (s1 / "SKILL.md").write_text("---\nname: s1\ndescription: S1.\n---\n", encoding="utf-8")
+    s2 = catalog / "s2"
+    s2.mkdir()
+    (s2 / "SKILL.md").write_text("---\nname: s2\ndescription: S2.\n---\n", encoding="utf-8")
+
+    monkeypatch.chdir(catalog)
+    # Pass 1-level relative path
+    inferred = _infer_parent_catalog(Path("s1"))
+    assert inferred == catalog.resolve()

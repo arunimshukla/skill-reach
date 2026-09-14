@@ -289,10 +289,11 @@ def _overlap(
     if skill:
         from reach.catalog import resolve_skill_target
 
+        base_catalog = skills
         resolved_skills_list: list[str] = []
         for s in skill:
             try:
-                res = resolve_skill_target(s, explicit_catalog=skills, command_name="overlap")
+                res = resolve_skill_target(s, explicit_catalog=base_catalog, command_name="overlap")
                 resolved_skills_list.append(res.skill_name if res else s)
                 if skills is None and res and res.catalog_path:
                     skills = res.catalog_path
