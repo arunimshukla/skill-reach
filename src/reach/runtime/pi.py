@@ -402,9 +402,8 @@ class PiGenerator(BaseTextGenerator[PiOptions]):
             cmd += ["--model", self.model]
         cmd += self.options.provider_args("--provider")
         cmd += self.options.api_key_args("--api-key")
-        effective_thinking = self.options.effort or self.options.thinking or self.effective_effort
-        if effective_thinking:
-            cmd += ["--thinking", effective_thinking]
+        if self.effective_effort:
+            cmd += ["--thinking", self.effective_effort]
         return [*cmd, *self.options.extra_args]
 
     @override

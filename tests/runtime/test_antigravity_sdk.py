@@ -1007,3 +1007,42 @@ def test_generator_complete_returns_text_when_no_schema(
     out = generator.complete("hello")
     assert out == "plain completion"
     assert getattr(agents[0].config, "response_schema", None) is None
+
+
+def test_generator_complete_handles_non_callable_structured_output(
+    monkeypatch: pytest.MonkeyPatch,
+    generator: AntigravitySdkGenerator,
+) -> None:
+    """Verify AntigravitySdkGenerator.complete handles non-callable structured_output."""
+    canned = {"queries": [{"text": "deploy a job", "citation": "cloud-run docs"}]}
+
+    class PropertyResponse:
+        structured_output = canned
+        stop_reason = "STOP"
+
+        async def text(self) -> str:
+            return ""
+
+    _fake_agent(monkeypatch, PropertyResponse())  # type: ignore[arg-type]
+    out = generator.complete("generate", schema={"type": "object"})
+    assert json.loads(out) == canned
+
+
+def test_generator_complete_handles_pydantic_structured_output(
+    monkeypatch: pytest.MonkeyPatch,
+    generator: AntigravitySdkGenerator,
+) -> None:
+    """Verify AntigravitySdkGenerator.complete serializes Pydantic model structured output."""
+    from pydantic import BaseModel
+
+    class QueryItem(BaseModel):
+        text: str
+        citation: str
+
+    class QuerySet(BaseModel):
+        queries: list[QueryItem]
+
+    model_obj = QuerySet(queries=[QueryItem(text="deploy a job", citation="cloud-run docs")])
+    _fake_agent(monkeypatch, _FakeResponse(structured=model_obj, text="Finished"))
+    out = generator.complete("generate", schema={"type": "object"})
+    assert json.loads(out) == {"queries": [{"text": "deploy a job", "citation": "cloud-run docs"}]}

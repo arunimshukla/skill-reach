@@ -511,7 +511,7 @@ def _query(
         bool,
         SWITCH,
         Parameter(
-            name=["--force", "-f"],
+            name="--force",
             help="Overwrite destination query set file if it already exists",
         ),
     ] = False,
@@ -645,7 +645,7 @@ def _query_draft(
         bool,
         SWITCH,
         Parameter(
-            name=["--force", "-f"],
+            name="--force",
             help="Overwrite destination query set file if it already exists",
         ),
     ] = False,

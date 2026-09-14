@@ -487,18 +487,23 @@ class AntigravitySdkGenerator(_AntigravitySdkConfigMixin, BaseTextGenerator[Anti
     @override
     def complete(self, prompt: str, *, schema: str | Mapping[str, Any] | None = None) -> str:
         """Execute text completion using the Antigravity SDK."""
-        effective_schema = self.resolve_schema(schema)
         schema_dict: dict[str, Any] | None = None
-        if effective_schema is not None:
-            if isinstance(effective_schema, Mapping):
-                schema_dict = dict(effective_schema)
-            elif isinstance(effective_schema, str):
-                try:
-                    parsed = json.loads(effective_schema)
-                    if isinstance(parsed, dict):
-                        schema_dict = parsed
-                except json.JSONDecodeError:
-                    schema_dict = None
+        if isinstance(schema, Mapping):
+            schema_dict = dict(schema)
+        elif isinstance(schema, str):
+            try:
+                parsed = json.loads(schema)
+                if isinstance(parsed, dict):
+                    schema_dict = parsed
+            except json.JSONDecodeError:
+                schema_dict = None
+        elif self.options.json_schema:
+            try:
+                parsed = json.loads(self.options.json_schema)
+                if isinstance(parsed, dict):
+                    schema_dict = parsed
+            except json.JSONDecodeError:
+                schema_dict = None
 
         caps = (
             ag_types.CapabilitiesConfig(enabled_tools=[], enable_subagents=False)
@@ -524,10 +529,15 @@ class AntigravitySdkGenerator(_AntigravitySdkConfigMixin, BaseTextGenerator[Anti
             async with Agent(config) as agent:
                 response = await agent.chat(prompt)
                 if schema_dict is not None and hasattr(response, "structured_output"):
-                    structured = response.structured_output()
+                    attr = response.structured_output
+                    structured = attr() if callable(attr) else attr
                     if asyncio.iscoroutine(structured):
                         structured = await structured
                     if structured is not None:
+                        if hasattr(structured, "model_dump_json"):
+                            return structured.model_dump_json()
+                        if hasattr(structured, "model_dump"):
+                            return json.dumps(structured.model_dump())
                         return json.dumps(structured)
                 return await response.text()
 

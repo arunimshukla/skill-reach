@@ -587,11 +587,10 @@ def _dispatch_generation(
                 if drafts:
                     return drafts
                 last_err = None
-            except (ValueError, ValidationError, RuntimeError) as err:
+            except (ValueError, ValidationError) as err:
                 last_err = err
-
-        if isinstance(last_err, RuntimeError):
-            raise last_err
+            except RuntimeError:
+                raise
 
         if last_err is not None:
             logger.warning(
@@ -690,11 +689,10 @@ def generate_query_set(
                     if adv_queries:
                         break
                     last_adv_err = None
-                except (ValueError, ValidationError, RuntimeError) as err:
+                except (ValueError, ValidationError) as err:
                     last_adv_err = err
-
-            if isinstance(last_adv_err, RuntimeError):
-                raise last_adv_err
+                except RuntimeError:
+                    raise
 
             if not adv_queries:
                 if last_adv_err is not None:

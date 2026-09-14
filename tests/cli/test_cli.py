@@ -2256,6 +2256,24 @@ def test_query_draft_destination_collision_and_force(
     assert outcome == 0
     assert out.exists()
 
+    # Verify -f format works alongside --force without short-flag collision
+    out_jsonl = tmp_path / "existing_queries.jsonl"
+    out_jsonl.write_text("{}", encoding="utf-8")
+    outcome = main(
+        [
+            "query",
+            str(skill_repo),
+            "--out",
+            str(out_jsonl),
+            "-f",
+            "jsonl",
+            "--force",
+            "--agent",
+            "fake",
+        ]
+    )
+    assert outcome == 0
+
 
 def test_build_drafter_runtime_resolution() -> None:
     """Verify _build_drafter_runtime respects generator_agent override and defaults."""
@@ -2281,8 +2299,15 @@ def test_build_drafter_runtime_selects_agent_default_model_for_non_gemini() -> N
     from reach.cli.flags import GenerateFlags
     from reach.config import RunConfig, RuntimeSettings
 
+    # Explicit generator_agent switch
     flags = GenerateFlags(generator_agent="claude-code")
     cfg = RunConfig(runtime=RuntimeSettings(agent="antigravity-cli"))
     drafter = _build_drafter_runtime(cfg, flags)
     assert drafter.name == "claude-code"
     assert "claude" in drafter.model
+
+    # Inherited from runtime settings without explicit generator_agent flag
+    cfg_inherited = RunConfig(runtime=RuntimeSettings(agent="claude-code"))
+    drafter_inherited = _build_drafter_runtime(cfg_inherited, GenerateFlags())
+    assert drafter_inherited.name == "claude-code"
+    assert "claude" in drafter_inherited.model

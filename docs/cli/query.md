@@ -55,7 +55,7 @@ reach query --queries .reach/queries.json --leaks --citations
 | :--------------- | :----- | :-------------------- | :----------------------------------------------------------------------------------------------------------------------------- |
 | `--out`, `-o`    | Path   | `.reach/queries.json` | Where to write the query set (format auto-inferred from `.json`, `.jsonl`, or `.csv`).                                         |
 | `--format`, `-f` | Choice | `json`                | Explicit output format: `json`, `jsonl`, or `csv`. When `--out` is omitted with `csv` or `jsonl`, output is printed to stdout. |
-| `--force`, `-f`  | Flag   | `false`               | Overwrite destination query set file if it already exists.                                                                     |
+| `--force`        | Flag   | `false`               | Overwrite destination query set file if it already exists.                                                                     |
 | `--dry-run`      | Flag   | `false`               | Preview prompts and token budget without making model calls.                                                                   |
 
 ### Inspection & View

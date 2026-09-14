@@ -596,3 +596,19 @@ def test_pi_generator_command_and_env() -> None:
     assert env["GEMINI_API_KEY"] == "secret-key"
     assert env["PI_TELEMETRY"] == "0"
     assert env["PI_SKIP_VERSION_CHECK"] == "1"
+
+
+@pytest.mark.parametrize("effort", ["none", "off", "None", "OFF"])
+def test_pi_generator_suppresses_disabled_thinking(effort: str) -> None:
+    """Verify PiGenerator omits --thinking when reasoning effort is disabled."""
+    gen = PiGenerator(options=PiOptions(effort=effort))
+    cmd = gen.build_completion_command("test")
+    assert "--thinking" not in cmd
+
+
+def test_pi_generator_includes_valid_thinking() -> None:
+    """Verify PiGenerator includes --thinking when valid effort or thinking is set."""
+    gen = PiGenerator(options=PiOptions(effort="low"))
+    cmd = gen.build_completion_command("test")
+    assert "--thinking" in cmd
+    assert cmd[cmd.index("--thinking") + 1] == "low"

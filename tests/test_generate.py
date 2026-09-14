@@ -986,15 +986,18 @@ def test_generate_warns_and_continues_on_exhausted_value_errors(
     assert "Failed drafting queries for 'target-skill'" in caplog.text
 
 
-def test_generate_reraises_runtime_error_on_exhaustion(
+def test_generate_reraises_runtime_error_immediately(
     target: Skill,
     rival: Skill,
 ) -> None:
-    """Verify fatal RuntimeError is re-raised after retry exhaustion to protect checkpoints."""
+    """Verify fatal RuntimeError is re-raised immediately to protect checkpoints."""
+    attempts = 0
 
     class FatalFailingRuntime(FakeGenerator):
         def complete(self, prompt: str, *args: Any, **kwargs: Any) -> str:
             del prompt, args, kwargs
+            nonlocal attempts
+            attempts += 1
             msg = "subprocess crashed with exit code 1"
             raise RuntimeError(msg)
 
@@ -1005,6 +1008,7 @@ def test_generate_reraises_runtime_error_on_exhaustion(
             [target, rival],
             runtime=runtime,
         )
+    assert attempts == 1
 
 
 def test_generate_discards_earlier_exception_when_subsequent_attempt_succeeds_without_citations(
@@ -1021,8 +1025,8 @@ def test_generate_discards_earlier_exception_when_subsequent_attempt_succeeds_wi
             nonlocal attempts
             attempts += 1
             if attempts == 1:
-                msg = "transient engine glitch"
-                raise RuntimeError(msg)
+                msg = "transient malformed JSON response"
+                raise ValueError(msg)
             return json.dumps(
                 {"queries": [{"text": "q", "citation": "Nonexistent passage", "reason": ""}]},
             )
@@ -1057,8 +1061,8 @@ def test_adversarial_discards_earlier_exception_when_subsequent_attempt_succeeds
                     {"queries": [{"text": "q", "citation": "Overview", "reason": ""}]},
                 )
             if attempts == 2:
-                msg = "transient adversarial glitch"
-                raise RuntimeError(msg)
+                msg = "transient adversarial malformed payload"
+                raise ValueError(msg)
             return json.dumps(
                 {
                     "queries": [

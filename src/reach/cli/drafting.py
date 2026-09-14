@@ -142,10 +142,9 @@ def _effective_generator_model(settings: RunConfig, generate: GenerateFlags) -> 
     generator_agent = generate.generator_agent or settings.runtime.agent
     model = generate.generator_model
     if (
-        generate.generator_agent
+        generator_agent
         and model == DEFAULT_GEMINI_MODEL
         and (agent_default := agent_default_model(generator_agent))
-        and not agent_default.startswith("gemini")
     ):
         return agent_default
     return model

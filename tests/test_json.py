@@ -147,3 +147,35 @@ def test_extract_json_payload() -> None:
     """Verify extract_json_payload unwraps outer code fence and trims text."""
     raw = 'Preamble\n```json\n{"key": "value"}\n```\nPostamble'
     assert extract_json_payload(raw) == '{"key": "value"}'
+
+
+def test_parse_model_json_with_citation_tag_preamble() -> None:
+    """Verify preamble citation tag like [1] does not confuse bracket extraction."""
+    raw = 'Here are the drafted queries [1]: {"queries": [{"text": "deploy", "citation": "guide"}]}'
+    data = parse_model_json(raw)
+    assert len(data["queries"]) == 1
+    assert data["queries"][0]["text"] == "deploy"
+
+
+def test_parse_model_json_with_subsequent_code_fence() -> None:
+    """Verify closing fence matches opening fence without capturing subsequent blocks."""
+    raw = (
+        "Here is the query set:\n"
+        "```json\n"
+        '{"queries": [{"text": "run app"}]}\n'
+        "```\n"
+        "You can evaluate it with:\n"
+        "```bash\n"
+        "reach eval --queries queries.json\n"
+        "```\n"
+        "Done!"
+    )
+    data = parse_model_json(raw)
+    assert data["queries"][0]["text"] == "run app"
+
+
+def test_parse_model_json_raw_trailing_comma_prior_to_fence_extraction() -> None:
+    """Verify raw JSON with trailing comma succeeds without fence extraction."""
+    raw = '{"queries": [{"text": "q1", }], }'
+    data = parse_model_json(raw)
+    assert data["queries"][0]["text"] == "q1"
