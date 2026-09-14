@@ -53,16 +53,33 @@ def _confirm_optimize_safety(
     *,
     yes: bool,
     run_config: RunConfig | None,
+    config: Path | None = None,
+    global_scope: bool = False,
 ) -> int:
     """Prompt for safety confirmation before launching live optimization probes."""
     from reach.catalog import load_skills
     from reach.cli.safety import confirm_skill_execution
+    from reach.config import resolve_discovery_candidates
 
-    roots = [skills] if skills is not None else [Path.cwd()]
-    loaded_skills = 1
-    if roots[0].is_dir():
-        with contextlib.suppress(OSError, ValueError):
-            loaded_skills = len(load_skills(roots[0]))
+    if skills is not None:
+        roots = [skills]
+    else:
+        workdir = Path.home() if global_scope else Path.cwd().resolve()
+        candidates = resolve_discovery_candidates(
+            workdir,
+            agent=resolved_agent,
+            config_path=config,
+            global_scope=global_scope,
+        )
+        roots = candidates or [workdir]
+
+    loaded_skills = 0
+    for root in roots:
+        if root.is_dir():
+            with contextlib.suppress(OSError, ValueError):
+                loaded_skills += len(load_skills(root))
+    if loaded_skills == 0:
+        loaded_skills = 1
 
     trusted = run_config.study.trusted if run_config is not None else False
     return confirm_skill_execution(
@@ -82,7 +99,7 @@ def _optimize(
         str,
         Parameter(
             name=["skill", "--skill"],
-            help="Name of the target skill to optimize",
+            help="Name of the target skill to optimize, or path to skill directory / SKILL.md",
         ),
     ],
     *,
@@ -199,11 +216,7 @@ def _optimize(
 ) -> int:
     """Optimize a skill's description using candidate synthesis and empirical probes."""
     from reach.optimize import optimize_skill
-    from reach.views import (
-        build_console,
-        print_optimization,
-        render_optimization_diff,
-    )
+    from reach.views import build_console
 
     console = build_console()
 
@@ -226,30 +239,47 @@ def _optimize(
         auto_queries=auto_queries if not auto_queries or run_config is None else None,
     )
 
+    from reach.catalog import resolve_skill_target
+
+    try:
+        resolved = resolve_skill_target(skill, explicit_catalog=skills, command_name="optimize")
+    except (FileNotFoundError, ValueError) as err:
+        console.print(f"[red]Error:[/] {err}")
+        return 2
+
+    effective_skill = resolved.skill_name if resolved else skill
+    effective_skills = skills or (resolved.catalog_path if resolved else None)
+
     if eff_settings.budget < 1:
         console.print("[red]Error:[/] Probe budget must be at least 1")
         return 2
 
     if code := _confirm_optimize_safety(
-        console, skills, resolved_agent, yes=yes, run_config=run_config
+        console,
+        effective_skills,
+        resolved_agent,
+        yes=yes,
+        run_config=run_config,
+        config=config,
+        global_scope=global_,
     ):
         return code
 
     from contextlib import nullcontext
 
+    status_msg = (
+        f"[cyan]Optimizing skill [bold]{effective_skill}[/bold] "
+        f"(budget: {eff_settings.budget})...[/cyan]"
+    )
     status_ctx = (
-        console.status(
-            f"[cyan]Optimizing skill [bold]{skill}[/bold] (budget: {eff_settings.budget})...[/cyan]"
-        )
-        if format == "text" and sys.stderr.isatty()
-        else nullcontext()
+        console.status(status_msg) if format == "text" and sys.stderr.isatty() else nullcontext()
     )
 
     try:
         with status_ctx:
             report = optimize_skill(
-                skill_name=skill,
-                skills_path=skills,
+                skill_name=effective_skill,
+                skills_path=effective_skills,
                 queries_path=queries,
                 agent=resolved_agent,
                 candidates_count=candidates,
@@ -266,6 +296,28 @@ def _optimize(
     except (OSError, RuntimeError) as err:
         console.print(f"[red]Runtime Error:[/] {err}")
         return 3
+
+    return _render_optimization_output(
+        console,
+        report,
+        format=format,
+        candidate=candidate,
+        auto_apply=auto_apply,
+        force=force,
+    )
+
+
+def _render_optimization_output(
+    console: Console,
+    report: OptimizationReport,
+    *,
+    format: OptimizeFormat,
+    candidate: int,
+    auto_apply: bool,
+    force: bool,
+) -> int:
+    """Render optimization report in requested format or launch interactive prompt."""
+    from reach.views import print_optimization, render_optimization_diff
 
     match format:
         case "json":

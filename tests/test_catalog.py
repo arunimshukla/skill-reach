@@ -1045,3 +1045,192 @@ def test_skill_name_accepts_non_empty(valid_name: str, tmp_path: Path) -> None:
         path=tmp_path,
     )
     assert skill.name == valid_name
+
+
+def test_resolve_skill_target_none_returns_none() -> None:
+    """Verify resolve_skill_target returns None when target is None or empty."""
+    from reach.catalog import resolve_skill_target
+
+    assert resolve_skill_target(None) is None
+    assert resolve_skill_target("") is None
+    assert resolve_skill_target("   ") is None
+
+
+def test_resolve_skill_target_raw_name() -> None:
+    """Verify resolve_skill_target accepts plain skill names without filesystem paths."""
+    from reach.catalog import resolve_skill_target
+
+    res = resolve_skill_target("my-skill")
+    assert res is not None
+    assert res.skill_name == "my-skill"
+    assert res.catalog_path is None
+    assert res.manifest_path is None
+
+
+def test_resolve_skill_target_raw_name_with_explicit_catalog(tmp_path: Path) -> None:
+    """Verify resolve_skill_target preserves explicit catalog when given raw skill name."""
+    from reach.catalog import resolve_skill_target
+
+    res = resolve_skill_target("my-skill", explicit_catalog=tmp_path)
+    assert res is not None
+    assert res.skill_name == "my-skill"
+    assert res.catalog_path == tmp_path.resolve()
+
+
+def test_resolve_skill_target_typo_path_raises_file_not_found() -> None:
+    """Verify resolve_skill_target raises FileNotFoundError when a path does not exist."""
+    from reach.catalog import resolve_skill_target
+
+    with pytest.raises(FileNotFoundError, match="skill path does not exist"):
+        resolve_skill_target("./nonexistent/path/to/skill")
+
+    with pytest.raises(FileNotFoundError, match="skill path does not exist"):
+        resolve_skill_target("~/.agents/skills/missing-skill")
+
+
+def test_resolve_skill_target_non_skill_file_raises_value_error(tmp_path: Path) -> None:
+    """Verify resolve_skill_target raises ValueError when given a non-SKILL.md file."""
+    from reach.catalog import resolve_skill_target
+
+    text_file = tmp_path / "notes.txt"
+    text_file.write_text("just some notes", encoding="utf-8")
+
+    with pytest.raises(ValueError, match=r"expected a SKILL\.md file or skill directory"):
+        resolve_skill_target(text_file)
+
+
+def test_resolve_skill_target_invalid_frontmatter_raises_value_error(tmp_path: Path) -> None:
+    """Verify resolve_skill_target raises ValueError when SKILL.md lacks valid frontmatter."""
+    from reach.catalog import resolve_skill_target
+
+    skill_dir = tmp_path / "corrupt-skill"
+    skill_dir.mkdir()
+    manifest = skill_dir / "SKILL.md"
+    manifest.write_text("No frontmatter at all", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="does not contain valid YAML frontmatter"):
+        resolve_skill_target(skill_dir)
+
+    with pytest.raises(ValueError, match="does not contain valid YAML frontmatter"):
+        resolve_skill_target(manifest)
+
+
+def test_resolve_skill_target_skill_directory_path(tmp_path: Path) -> None:
+    """Verify resolve_skill_target parses name from directory containing SKILL.md."""
+    from reach.catalog import resolve_skill_target
+
+    skill_dir = tmp_path / "dir-skill"
+    skill_dir.mkdir()
+    manifest = skill_dir / "SKILL.md"
+    manifest.write_text(
+        "---\nname: parsed-dir-skill\ndescription: A test skill.\n---\n# Body\n", encoding="utf-8"
+    )
+
+    res = resolve_skill_target(skill_dir)
+    assert res is not None
+    assert res.skill_name == "parsed-dir-skill"
+    assert res.manifest_path == manifest.resolve()
+
+
+def test_resolve_skill_target_direct_skill_md_path(tmp_path: Path) -> None:
+    """Verify resolve_skill_target parses name directly from SKILL.md file path."""
+    from reach.catalog import resolve_skill_target
+
+    skill_dir = tmp_path / "direct-skill"
+    skill_dir.mkdir()
+    manifest = skill_dir / "SKILL.md"
+    manifest.write_text(
+        "---\nname: parsed-direct-skill\ndescription: Direct file test.\n---\n# Body\n",
+        encoding="utf-8",
+    )
+
+    res = resolve_skill_target(manifest)
+    assert res is not None
+    assert res.skill_name == "parsed-direct-skill"
+    assert res.manifest_path == manifest.resolve()
+
+
+def test_resolve_skill_target_smart_parent_catalog(tmp_path: Path) -> None:
+    """Verify resolve_skill_target infers parent catalog when parent has peer skills."""
+    from reach.catalog import resolve_skill_target
+
+    catalog_dir = tmp_path / "skills"
+    catalog_dir.mkdir()
+    skill1 = catalog_dir / "skill1"
+    skill1.mkdir()
+    (skill1 / "SKILL.md").write_text(
+        "---\nname: skill-one\ndescription: First.\n---\n", encoding="utf-8"
+    )
+    skill2 = catalog_dir / "skill2"
+    skill2.mkdir()
+    (skill2 / "SKILL.md").write_text(
+        "---\nname: skill-two\ndescription: Second.\n---\n", encoding="utf-8"
+    )
+
+    # Pass skill directory
+    res1 = resolve_skill_target(skill1)
+    assert res1 is not None
+    assert res1.skill_name == "skill-one"
+    assert res1.catalog_path == catalog_dir.resolve()
+
+    # Pass manifest file
+    res2 = resolve_skill_target(skill2 / "SKILL.md")
+    assert res2 is not None
+    assert res2.skill_name == "skill-two"
+    assert res2.catalog_path == catalog_dir.resolve()
+
+
+def test_resolve_skill_target_standalone_repo_bounds(tmp_path: Path) -> None:
+    """Verify standalone skill directory does not escape to arbitrary parent directory."""
+    from reach.catalog import resolve_skill_target
+
+    # A standalone directory with no peer skills and not named 'skills'
+    repo_dir = tmp_path / "my-standalone-project"
+    repo_dir.mkdir()
+    (repo_dir / "SKILL.md").write_text(
+        "---\nname: standalone-tool\ndescription: Alone.\n---\n", encoding="utf-8"
+    )
+
+    res = resolve_skill_target(repo_dir)
+    assert res is not None
+    assert res.skill_name == "standalone-tool"
+    # Should be repo_dir, NOT tmp_path
+    assert res.catalog_path == repo_dir.resolve()
+
+
+def test_resolve_skill_target_empty_dir_raises_value_error(tmp_path: Path) -> None:
+    """Verify resolve_skill_target raises ValueError when directory has no SKILL.md or children."""
+    from reach.catalog import resolve_skill_target
+
+    empty_dir = tmp_path / "empty-dir"
+    empty_dir.mkdir()
+
+    with pytest.raises(ValueError, match=r"does not contain a SKILL\.md file"):
+        resolve_skill_target(empty_dir)
+
+
+def test_resolve_skill_target_contained_skills_raises_with_guidance(tmp_path: Path) -> None:
+    """Verify resolve_skill_target raises ValueError with guidance when target contains skills."""
+    from reach.catalog import resolve_skill_target
+
+    catalog_dir = tmp_path / "my-catalog"
+    catalog_dir.mkdir()
+    child1 = catalog_dir / "child1"
+    child1.mkdir()
+    (child1 / "SKILL.md").write_text(
+        "---\nname: child-one\ndescription: C1.\n---\n", encoding="utf-8"
+    )
+
+    # Single child skill
+    with pytest.raises(ValueError, match=r"(?s)containing 1 skill.*reach optimize"):
+        resolve_skill_target(catalog_dir, command_name="optimize")
+
+    # Multiple child skills
+    child2 = catalog_dir / "child2"
+    child2.mkdir()
+    (child2 / "SKILL.md").write_text(
+        "---\nname: child-two\ndescription: C2.\n---\n", encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError, match=r"(?s)containing 2 skills.*reach eval"):
+        resolve_skill_target(catalog_dir, command_name="eval")

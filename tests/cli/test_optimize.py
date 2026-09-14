@@ -725,3 +725,88 @@ def test_optimize_cli_explicit_candidate_prompts_even_without_improvement(
         assert ret == 0
 
     assert "Candidate 2 chosen by user." in manifest.read_text(encoding="utf-8")
+
+
+def test_optimize_positional_skill_directory_path(
+    write_skill: Callable[..., Path],
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Verify reach optimize succeeds when passed a skill directory path positionally."""
+    skill_dir = write_skill(name="path-tool", description="Old description.")
+    ret = main(["optimize", str(skill_dir), "--agent", "fake", "--format", "json"])
+    assert ret == 0
+    captured = capsys.readouterr()
+    data = json.loads(captured.out)
+    assert data["skill_name"] == "path-tool"
+
+
+def test_optimize_positional_skill_manifest_path(
+    write_skill: Callable[..., Path],
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Verify reach optimize succeeds when passed a SKILL.md file path positionally."""
+    skill_dir = write_skill(name="manifest-tool", description="Old description.")
+    manifest = skill_dir / "SKILL.md"
+    ret = main(["optimize", str(manifest), "--agent", "fake", "--format", "json"])
+    assert ret == 0
+    captured = capsys.readouterr()
+    data = json.loads(captured.out)
+    assert data["skill_name"] == "manifest-tool"
+
+
+def test_optimize_multi_skill_directory_fails_with_guidance(
+    write_skill: Callable[..., Path],
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Verify reach optimize on a catalog directory fails fast with single-skill guidance."""
+    write_skill(name="skill-a", description="A.")
+    write_skill(name="skill-b", description="B.")
+    ret = main(["optimize", str(tmp_path), "--agent", "fake"])
+    assert ret == 2
+    captured = capsys.readouterr()
+    clean = " ".join((captured.err + captured.out).split())
+    assert "is a directory containing" in clean
+    assert "reach optimize" in clean
+
+
+def test_optimize_typo_path_fails_cleanly(capsys: pytest.CaptureFixture[str]) -> None:
+    """Verify reach optimize on a non-existent path exits 2 with a clear error."""
+    ret = main(["optimize", "./nonexistent/path/to/skill", "--agent", "fake"])
+    assert ret == 2
+    captured = capsys.readouterr()
+    output = captured.err + captured.out
+    assert "skill path does not exist" in output
+
+
+def test_optimize_safety_notice_displays_inferred_catalog_count(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Verify safety notice reflects inferred catalog root count rather than 0 skills in ./.."""
+    skills_root = tmp_path / "skills"
+    skills_root.mkdir()
+    skill_a = skills_root / "skill-a"
+    skill_a.mkdir()
+    (skill_a / "SKILL.md").write_text(
+        "---\nname: skill-a\ndescription: A.\n---\n", encoding="utf-8"
+    )
+    skill_b = skills_root / "skill-b"
+    skill_b.mkdir()
+    (skill_b / "SKILL.md").write_text(
+        "---\nname: skill-b\ndescription: B.\n---\n", encoding="utf-8"
+    )
+
+    with (
+        patch("sys.stdin.isatty", return_value=True),
+        patch("sys.stdout.isatty", return_value=True),
+        patch("builtins.input", return_value="n"),
+    ):
+        ret = main(["optimize", str(skill_a), "--agent", "antigravity-cli"])
+        assert ret == 1
+
+    captured = capsys.readouterr()
+    output = captured.err + captured.out
+    assert "Target Catalog: 2 skills" in output

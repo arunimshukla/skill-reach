@@ -1615,3 +1615,12 @@ def test_query_range_validators_reject_invalid_flags(capsys) -> None:
 
     assert main(["query", "draft", "--count", "0"]) == 2
     assert "Must be >= 1" in capsys.readouterr().err
+
+
+def test_eval_direct_skill_md_path(
+    bodied_corpus: Path,
+    generator: FakeGenerator,
+) -> None:
+    """Verify reach eval succeeds when passed a direct SKILL.md manifest file path."""
+    manifest = bodied_corpus / "gke-basics" / "SKILL.md"
+    assert main(["eval", str(manifest), "--agent", "fake", "--yes"]) == 0

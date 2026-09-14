@@ -16,10 +16,12 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import math
 import re
+from pathlib import Path
 from random import Random
 from typing import TYPE_CHECKING, Any, Final
 
@@ -33,11 +35,11 @@ from reach.retrieval import Bm25Scorer, Scorer, skill_text, tokenize
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
-    from pathlib import Path
 
 __all__ = [
     "DEFAULT_SWEEP_SCALES",
     "CorpusScalingPlan",
+    "ResolvedTarget",
     "build_catalogs",
     "build_corpus_scaling_catalogs",
     "build_corpus_scaling_queries",
@@ -55,6 +57,7 @@ __all__ = [
     "parse_frontmatter",
     "resident_skills",
     "resolve_catalog",
+    "resolve_skill_target",
     "resolve_sweep_scales",
     "split_frontmatter",
 ]
@@ -900,3 +903,131 @@ def resident_skills(catalog: Catalog, skills: Sequence[Skill]) -> list[Skill]:
         msg = f"catalog {catalog.id!r} names skills not loaded: {missing}"
         raise KeyError(msg)
     return [by_name[name] for name in catalog.skills]
+
+
+class ResolvedTarget(BaseModel):
+    """Structured resolution of a user-specified skill target and optional catalog."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    skill_name: str
+    catalog_path: Path | None = None
+    manifest_path: Path | None = None
+
+
+def _infer_parent_catalog(skill_dir: Path) -> Path:
+    """Infer catalog root directory containing resident and rival skills."""
+    parent = skill_dir.parent
+    home = Path.home().resolve()
+    if parent.resolve() in (home, parent.parent.resolve()):
+        return skill_dir
+
+    if parent.name in ("skills", ".skills") or parent.parts[-2:] == (".agents", "skills"):
+        return parent
+
+    with contextlib.suppress(OSError):
+        peer_skills = [d for d in parent.iterdir() if d.is_dir() and (d / "SKILL.md").is_file()]
+        if len(peer_skills) > 1:
+            return parent
+
+    return skill_dir
+
+
+def resolve_skill_target(
+    target: str | Path | None,
+    explicit_catalog: Path | str | None = None,
+    *,
+    command_name: str = "eval",
+) -> ResolvedTarget | None:
+    """Resolve a skill name and catalog path from a name, directory, or SKILL.md file.
+
+    Args:
+        target: Skill name, directory path, or SKILL.md file path.
+        explicit_catalog: Explicit catalog path if specified by user flag (e.g. --skills).
+        command_name: CLI command name for formatting multi-skill error remedies.
+
+    Returns:
+        ResolvedTarget with canonical skill_name and inferred catalog_path,
+        or None if target is None.
+
+    Raises:
+        FileNotFoundError: If target looks like a path but does not exist on disk.
+        ValueError: If target is a non-SKILL.md file, a directory containing skills,
+            a directory with no SKILL.md, or a SKILL.md with invalid frontmatter.
+    """
+    if target is None:
+        return None
+
+    raw_str = str(target).strip()
+    if not raw_str:
+        return None
+
+    looks_like_path = (
+        isinstance(target, Path)
+        or "/" in raw_str
+        or "\\" in raw_str
+        or raw_str.startswith(("~", "."))
+    )
+
+    named = resolve_path(target)
+
+    # 1. Path does not exist
+    if not named.exists():
+        if looks_like_path:
+            msg = f"skill path does not exist: '{target}'"
+            raise FileNotFoundError(msg)
+        catalog = resolve_path(explicit_catalog) if explicit_catalog else None
+        return ResolvedTarget(skill_name=raw_str, catalog_path=catalog)
+
+    # 2. Path is a file
+    if named.is_file():
+        if named.name != "SKILL.md":
+            msg = (
+                f"'{target}' is not a SKILL.md file; "
+                f"expected a SKILL.md file or skill directory containing one"
+            )
+            raise ValueError(msg)
+        skill = parse_frontmatter(named.read_text(encoding="utf-8"), named)
+        if skill is None or not skill.name:
+            msg = f"'{named}' does not contain valid YAML frontmatter"
+            raise ValueError(msg)
+        catalog = explicit_catalog or _infer_parent_catalog(named.parent)
+        return ResolvedTarget(skill_name=skill.name, catalog_path=catalog, manifest_path=named)
+
+    # 3. Path is a directory
+    if named.is_dir():
+        manifest = named / "SKILL.md"
+        if manifest.is_file():
+            skill = parse_frontmatter(manifest.read_text(encoding="utf-8"), manifest)
+            if skill is None or not skill.name:
+                msg = f"'{manifest}' does not contain valid YAML frontmatter"
+                raise ValueError(msg)
+            catalog = explicit_catalog or _infer_parent_catalog(named)
+            return ResolvedTarget(
+                skill_name=skill.name, catalog_path=catalog, manifest_path=manifest
+            )
+
+        contained_skills = sorted(
+            d.name for d in named.iterdir() if d.is_dir() and (d / "SKILL.md").is_file()
+        )
+        max_preview = 3
+        if contained_skills:
+            preview = ", ".join(f"'{s}'" for s in contained_skills[:max_preview])
+            more = (
+                f" (and {len(contained_skills) - max_preview} more)"
+                if len(contained_skills) > max_preview
+                else ""
+            )
+            label = "skill" if len(contained_skills) == 1 else "skills"
+            msg = (
+                f"'{target}' is a directory containing {len(contained_skills)} {label} "
+                f"({preview}{more}), not a single skill.\n\n"
+                f"• To {command_name} a single skill immediately:\n"
+                f"    reach {command_name} {raw_str.rstrip('/')}/{contained_skills[0]}"
+            )
+            raise ValueError(msg)
+
+        msg = f"directory '{target}' does not contain a SKILL.md file"
+        raise ValueError(msg)
+
+    return None

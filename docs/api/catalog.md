@@ -26,5 +26,7 @@ Filesystem scanning, discovery, and YAML frontmatter parsing routines.
         - parse_frontmatter
         - resident_skills
         - resolve_catalog
+        - resolve_skill_target
         - resolve_sweep_scales
+        - ResolvedTarget
         - split_frontmatter

@@ -654,3 +654,32 @@ publisher = "base-publisher"
     assert captured_config is not None
     assert captured_config.registry.location == "europe-west1"
     assert captured_config.registry.publisher == "cli-publisher"
+
+
+def test_sweep_with_target_skill_path(
+    sweep_corpus: tuple[Path, Path],
+    capsys,
+) -> None:
+    """Verify reach sweep accepts a path to a skill directory as --target."""
+    corpus_dir, queries_file = sweep_corpus
+    skill_dir = corpus_dir / "skill-00"
+
+    code = main(
+        [
+            "sweep",
+            "--target",
+            str(skill_dir),
+            "--queries",
+            str(queries_file),
+            "--scales",
+            "2",
+            "--agent",
+            "fake",
+            "--no-early-stop",
+            "--format",
+            "json",
+        ]
+    )
+    assert code == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["target_skill"] == "skill-00"

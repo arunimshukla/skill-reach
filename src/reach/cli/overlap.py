@@ -285,6 +285,22 @@ def _overlap(
     if suggest and not skill:
         msg = "--suggest needs --skill NAME: specify a target skill to analyze"
         raise ValueError(msg)
+
+    if skill:
+        from reach.catalog import resolve_skill_target
+
+        resolved_skills_list: list[str] = []
+        for s in skill:
+            try:
+                res = resolve_skill_target(s, explicit_catalog=skills, command_name="overlap")
+                resolved_skills_list.append(res.skill_name if res else s)
+                if skills is None and res and res.catalog_path:
+                    skills = res.catalog_path
+            except (FileNotFoundError, ValueError) as err:
+                console.print(f"[red]Error:[/] {err}")
+                return 2
+        skill = tuple(resolved_skills_list)
+
     driver = build_runtime(RuntimeSettings(agent=agent) if agent is not None else RuntimeSettings())
 
     run_config: RunConfig | None = None
@@ -374,6 +390,31 @@ def _explain_cmd(
 ) -> int:
     """Explain token-level BM25 contributions driving a query toward a rival skill."""
     console = build_console()
+    from reach.catalog import resolve_skill_target
+
+    try:
+        resolved_skill = resolve_skill_target(
+            skill, explicit_catalog=skills, command_name="overlap explain"
+        )
+        if resolved_skill is not None:
+            skill = resolved_skill.skill_name
+            if skills is None and resolved_skill.catalog_path:
+                skills = resolved_skill.catalog_path
+        if rival is not None and rival.lower() not in (
+            "none",
+            "(no selection)",
+            "(no skill)",
+            "",
+        ):
+            resolved_rival = resolve_skill_target(
+                rival, explicit_catalog=skills, command_name="overlap explain"
+            )
+            if resolved_rival is not None:
+                rival = resolved_rival.skill_name
+    except (FileNotFoundError, ValueError) as err:
+        console.print(f"[red]Error:[/] {err}")
+        return 2
+
     driver = build_runtime(RuntimeSettings(agent=agent) if agent is not None else RuntimeSettings())
 
     found, _roots, discovered = resolve_corpus(

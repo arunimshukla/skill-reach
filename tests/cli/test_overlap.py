@@ -949,3 +949,39 @@ def test_overlap_positional_path(tmp_path: Path, capsys: pytest.CaptureFixture[s
         encoding="utf-8",
     )
     assert main(["overlap", str(tmp_path)]) == 0
+
+
+def test_overlap_explain_with_skill_path_infers_catalog(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Verify reach overlap explain resolves skill paths and infers parent catalog."""
+    catalog = tmp_path / "skills"
+    catalog.mkdir()
+    skill_a = catalog / "skill-a"
+    skill_a.mkdir()
+    (skill_a / "SKILL.md").write_text(
+        "---\nname: skill-a\ndescription: Manage git repositories.\n---\n",
+        encoding="utf-8",
+    )
+    skill_b = catalog / "skill-b"
+    skill_b.mkdir()
+    (skill_b / "SKILL.md").write_text(
+        "---\nname: skill-b\ndescription: Handle git branches.\n---\n",
+        encoding="utf-8",
+    )
+
+    code = main(
+        [
+            "overlap",
+            "explain",
+            "commit changes to repository",
+            "--skill",
+            str(skill_a),
+            "--format",
+            "json",
+        ]
+    )
+    assert code == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["target_skill"] == "skill-a"
