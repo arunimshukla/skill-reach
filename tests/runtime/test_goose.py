@@ -518,4 +518,3 @@ def test_goose_generator_command_and_env(monkeypatch: pytest.MonkeyPatch) -> Non
     # Verify schema instruction was appended to the prompt in command arguments
     prompt_arg = captured["command"][captured["command"].index("-t") + 1]
     assert "Respond with valid JSON adhering to this JSON schema:" in prompt_arg
-
