@@ -550,7 +550,7 @@ class FakeSdkResponse:
 class FakeSdkAgent:
     """Mock SDK Agent context manager tracking configurations and queries."""
 
-    response: FakeSdkResponse | None = None
+    response: Any = None
 
     def __init__(self, config: Any) -> None:
         """Initialize mock agent with configuration."""
@@ -565,7 +565,7 @@ class FakeSdkAgent:
         """Exit the asynchronous agent context manager."""
         return False
 
-    async def chat(self, query_text: str) -> FakeSdkResponse | None:
+    async def chat(self, query_text: str) -> Any:
         """Record the query text and return canned response."""
         self.sent = query_text
         return self.response
@@ -573,7 +573,7 @@ class FakeSdkAgent:
 
 def patch_sdk_agent(
     monkeypatch: pytest.MonkeyPatch,
-    response: FakeSdkResponse,
+    response: Any,
 ) -> list[FakeSdkAgent]:
     """Patch SDK Agent class with mock agent answering scripted response."""
     instances: list[FakeSdkAgent] = []

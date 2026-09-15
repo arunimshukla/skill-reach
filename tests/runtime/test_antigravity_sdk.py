@@ -1023,7 +1023,7 @@ def test_generator_complete_handles_non_callable_structured_output(
         async def text(self) -> str:
             return ""
 
-    _fake_agent(monkeypatch, PropertyResponse())  # type: ignore[arg-type]
+    _fake_agent(monkeypatch, PropertyResponse())
     out = generator.complete("generate", schema={"type": "object"})
     assert json.loads(out) == canned
 
