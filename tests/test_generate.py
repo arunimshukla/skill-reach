@@ -17,9 +17,11 @@
 from __future__ import annotations
 
 import json
+import logging
 import threading
 from collections.abc import Sequence
 from pathlib import Path
+from typing import Any
 
 import pytest
 from pydantic import ValidationError
@@ -264,6 +266,24 @@ def test_parse_response_handles_preamble_and_postamble_with_braces() -> None:
     queries = parse_response(raw)
     assert len(queries) == 1
     assert queries[0].text.startswith("Our incident response")
+
+
+def test_parse_response_handles_trailing_commas() -> None:
+    """Verify parse_response succeeds on JSON responses containing trailing commas."""
+    raw = """
+    {
+      "queries": [
+        {
+          "text": "How do I deploy an endpoint?",
+          "citation": "gcloud ai endpoints create",
+          "reason": "Target covers endpoint creation.",
+        },
+      ],
+    }
+    """
+    queries = parse_response(raw)
+    assert len(queries) == 1
+    assert queries[0].text == "How do I deploy an endpoint?"
 
 
 def test_a_response_that_is_not_json_is_rejected() -> None:
@@ -833,7 +853,7 @@ class _ConcurrencyProbe(FakeGenerator):
         self.active = 0
         self.peak = 0
 
-    def complete(self, prompt: str) -> str:
+    def complete(self, prompt: str, *args: Any, **kwargs: Any) -> str:
         with self._lock:
             self.active += 1
             self.peak = max(self.peak, self.active)
@@ -843,7 +863,7 @@ class _ConcurrencyProbe(FakeGenerator):
             threading.Event().wait(self._delay)
         with self._lock:
             self.active -= 1
-        return super().complete(prompt)
+        return super().complete(prompt, *args, **kwargs)
 
 
 def _catalog_of(*names: str) -> Catalog:
@@ -909,6 +929,185 @@ def test_checkpoint_lands_once_per_target_under_concurrency(target: Skill, rival
     )
     assert landed == [1, 2]
     assert len(query_set.queries) == 2
+
+
+def test_generate_retries_transient_value_error_and_succeeds(
+    target: Skill,
+    rival: Skill,
+) -> None:
+    """Verify generation retries when completion raises ValueError and recovers."""
+    attempts = 0
+
+    class TransientFailingRuntime(FakeGenerator):
+        def complete(self, prompt: str, *args: Any, **kwargs: Any) -> str:
+            del prompt, args, kwargs
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                return "not valid json at all"
+            return json.dumps(
+                {"queries": [{"text": "q", "citation": "Overview", "reason": ""}]},
+            )
+
+    runtime = TransientFailingRuntime()
+    query_set = generate_query_set(
+        _catalog_of("target-skill"),
+        [target, rival],
+        runtime=runtime,
+    )
+    assert attempts == 2
+    assert len(query_set.queries) == 1
+
+
+def test_generate_warns_and_continues_on_exhausted_value_errors(
+    target: Skill,
+    rival: Skill,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Verify generation logs warning and yields empty queries when retries are exhausted."""
+    attempts = 0
+
+    class AlwaysFailingRuntime(FakeGenerator):
+        def complete(self, prompt: str, *args: Any, **kwargs: Any) -> str:
+            del prompt, args, kwargs
+            nonlocal attempts
+            attempts += 1
+            return "broken json response"
+
+    runtime = AlwaysFailingRuntime()
+    with caplog.at_level(logging.WARNING):
+        query_set = generate_query_set(
+            _catalog_of("target-skill"),
+            [target, rival],
+            runtime=runtime,
+        )
+    assert attempts == 3
+    assert query_set.queries == ()
+    assert "Failed drafting queries for 'target-skill'" in caplog.text
+
+
+def test_generate_reraises_runtime_error_immediately(
+    target: Skill,
+    rival: Skill,
+) -> None:
+    """Verify fatal RuntimeError is re-raised immediately to protect checkpoints."""
+    attempts = 0
+
+    class FatalFailingRuntime(FakeGenerator):
+        def complete(self, prompt: str, *args: Any, **kwargs: Any) -> str:
+            del prompt, args, kwargs
+            nonlocal attempts
+            attempts += 1
+            msg = "subprocess crashed with exit code 1"
+            raise RuntimeError(msg)
+
+    runtime = FatalFailingRuntime()
+    with pytest.raises(RuntimeError, match="subprocess crashed with exit code 1"):
+        generate_query_set(
+            _catalog_of("target-skill"),
+            [target, rival],
+            runtime=runtime,
+        )
+    assert attempts == 1
+
+
+def test_generate_discards_earlier_exception_when_subsequent_attempt_succeeds_without_citations(
+    target: Skill,
+    rival: Skill,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Verify prior transient exception is cleared when a subsequent attempt runs without error."""
+    attempts = 0
+
+    class TransientThenEmptyRuntime(FakeGenerator):
+        def complete(self, prompt: str, *args: Any, **kwargs: Any) -> str:
+            del prompt, args, kwargs
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                msg = "transient malformed JSON response"
+                raise ValueError(msg)
+            return json.dumps(
+                {"queries": [{"text": "q", "citation": "Nonexistent passage", "reason": ""}]},
+            )
+
+    runtime = TransientThenEmptyRuntime()
+    with caplog.at_level(logging.WARNING):
+        query_set = generate_query_set(
+            _catalog_of("target-skill"),
+            [target, rival],
+            runtime=runtime,
+        )
+    assert attempts == 3
+    assert query_set.queries == ()
+    assert "yielded no verified citations after 3 attempts" in caplog.text
+
+
+def test_adversarial_discards_earlier_exception_when_subsequent_attempt_succeeds(
+    target: Skill,
+    rival: Skill,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Verify prior transient exception is cleared in adversarial loop on retry."""
+    attempts = 0
+
+    class TransientThenEmptyAdversarialRuntime(FakeGenerator):
+        def complete(self, prompt: str, *args: Any, **kwargs: Any) -> str:
+            del prompt, args, kwargs
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                return json.dumps(
+                    {"queries": [{"text": "q", "citation": "Overview", "reason": ""}]},
+                )
+            if attempts == 2:
+                msg = "transient adversarial malformed payload"
+                raise ValueError(msg)
+            return json.dumps(
+                {
+                    "queries": [
+                        {"text": "adv", "citation": "Nonexistent", "rival_index": 1, "reason": ""}
+                    ]
+                },
+            )
+
+    runtime = TransientThenEmptyAdversarialRuntime()
+    with caplog.at_level(logging.WARNING):
+        query_set = generate_query_set(
+            _catalog_of("target-skill"),
+            [target, rival],
+            runtime=runtime,
+            adversarial=True,
+            adversarial_count=1,
+        )
+    assert len(query_set.queries) == 1
+    assert (
+        "Drafting adversarial queries for 'target-skill' yielded no verified citations"
+        in caplog.text
+    )
+
+
+def test_generate_passes_schema_to_runtime(
+    target: Skill,
+    rival: Skill,
+) -> None:
+    """Verify generate_for_skill passes Response json schema to runtime complete."""
+    runtime = FakeGenerator(
+        completion=json.dumps(
+            {"queries": [{"text": "q", "citation": "Overview", "reason": ""}]},
+        ),
+    )
+    generate_for_skill(
+        "target-skill",
+        _catalog_of("target-skill"),
+        [target, rival],
+        runtime=runtime,
+    )
+    assert len(runtime.schemas) == 1
+    assert runtime.schemas[0] is not None
+    schema_dict = json.loads(runtime.schemas[0])
+    assert "properties" in schema_dict
+    assert "queries" in schema_dict["properties"]
 
 
 def borrowed_set() -> QuerySet:
@@ -1187,7 +1386,8 @@ def test_generate_query_set_includes_adversarial_queries_when_flagged(
             super().__init__()
             self._call_count = 0
 
-        def complete(self, prompt: str) -> str:
+        def complete(self, prompt: str, *args: Any, **kwargs: Any) -> str:
+            del prompt, args, kwargs
             resp = responses[self._call_count % len(responses)]
             self._call_count += 1
             return resp

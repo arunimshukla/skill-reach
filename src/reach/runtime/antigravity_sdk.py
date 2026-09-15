@@ -17,13 +17,15 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
+from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, cast, override
 
 if TYPE_CHECKING:
-    from collections.abc import Coroutine
+    from collections.abc import Coroutine, Mapping
 
     from google.antigravity import Agent, LocalAgentConfig
     from google.antigravity import hooks as ag_hooks
@@ -107,6 +109,12 @@ def _tool_name(name: ag_types.BuiltinTools | str) -> str:
     )
 
 
+def _model_supports_thinking(model: str) -> bool:
+    """Return whether a model supports reasoning effort or thinking level."""
+    lower = model.lower()
+    return not any(p in lower for p in ("gemini-2.5", "gemini-2.0", "gemini-1.5", "gemini-1.0"))
+
+
 def _build_model_spec(
     model: str,
     effort: str | None = None,
@@ -117,8 +125,9 @@ def _build_model_spec(
     api_key: str | None = None,
 ) -> str | ag_types.ModelTarget:
     """Construct model target with reasoning effort endpoint options when configured."""
-    if ag_types is not None and (effort or vertex):
-        options = ag_types.GeminiModelOptions(thinking_level=effort) if effort else None
+    valid_effort = effort if (effort and _model_supports_thinking(model)) else None
+    if ag_types is not None and (valid_effort or vertex):
+        options = ag_types.GeminiModelOptions(thinking_level=valid_effort) if valid_effort else None
         endpoint = (
             ag_types.VertexEndpoint(
                 project=project,
@@ -464,6 +473,8 @@ class AntigravitySdkGenerator(_AntigravitySdkConfigMixin, BaseTextGenerator[Anti
         if self.options.effort:
             effort = self.options.effort
             return None if effort.lower() in ("none", "off") else effort
+        if not _model_supports_thinking(self.model):
+            return None
         try:
             return model_profile(self.model).effort
         except (KeyError, ValueError):
@@ -474,20 +485,60 @@ class AntigravitySdkGenerator(_AntigravitySdkConfigMixin, BaseTextGenerator[Anti
         return self._target_model_spec(self.options.model or self.model, self.effective_effort)
 
     @override
-    def complete(self, prompt: str) -> str:
+    def complete(self, prompt: str, *, schema: str | Mapping[str, Any] | None = None) -> str:
         """Execute text completion using the Antigravity SDK."""
+        schema_dict: dict[str, Any] | None = None
+        if isinstance(schema, Mapping):
+            schema_dict = dict(schema)
+        elif isinstance(schema, str):
+            try:
+                parsed = json.loads(schema)
+                if isinstance(parsed, dict):
+                    schema_dict = parsed
+            except json.JSONDecodeError:
+                schema_dict = None
+        elif self.options.json_schema:
+            try:
+                parsed = json.loads(self.options.json_schema)
+                if isinstance(parsed, dict):
+                    schema_dict = parsed
+            except json.JSONDecodeError:
+                schema_dict = None
+
+        caps = (
+            ag_types.CapabilitiesConfig(enabled_tools=[], enable_subagents=False)
+            if ag_types is not None and hasattr(ag_types, "CapabilitiesConfig")
+            else None
+        )
 
         async def _complete_async() -> str:
-            config = LocalAgentConfig(
-                model=self._model_spec(),
-                api_key=self.effective_api_key,
-                vertex=self.effective_vertex,
-                project=self.effective_project,
-                location=self.effective_location,
-                env=self.build_env(),
-            )
+            kwargs: dict[str, Any] = {
+                "model": self._model_spec(),
+                "api_key": self.effective_api_key,
+                "vertex": self.effective_vertex,
+                "project": self.effective_project,
+                "location": self.effective_location,
+                "env": self.build_env(),
+            }
+            if schema_dict is not None:
+                kwargs["response_schema"] = schema_dict
+            if caps is not None:
+                kwargs["capabilities"] = caps
+
+            config = LocalAgentConfig(**kwargs)
             async with Agent(config) as agent:
                 response = await agent.chat(prompt)
+                if schema_dict is not None and hasattr(response, "structured_output"):
+                    attr = response.structured_output
+                    structured = attr() if callable(attr) else attr
+                    if asyncio.iscoroutine(structured):
+                        structured = await structured
+                    if structured is not None:
+                        if hasattr(structured, "model_dump_json"):
+                            return structured.model_dump_json()
+                        if hasattr(structured, "model_dump"):
+                            return json.dumps(structured.model_dump())
+                        return json.dumps(structured)
                 return await response.text()
 
         try:

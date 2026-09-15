@@ -526,6 +526,10 @@ class GenerateFlags(BaseModel):
         str,
         Parameter(help="Model that drafts the queries, not the one probed"),
     ] = DEFAULT_GEMINI_MODEL
+    generator_agent: Annotated[
+        str | None,
+        Parameter(help="Agent driver that drafts the queries, overriding the probe agent"),
+    ] = None
 
     generator_arm: Annotated[
         GeneratorArm,

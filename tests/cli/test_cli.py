@@ -2233,3 +2233,81 @@ def test_agent_cli_literal_matches_known_agents() -> None:
     assert cli_agents == registered_agents, (
         f"AgentName choices {cli_agents} do not match known_agents {registered_agents}"
     )
+
+
+def test_query_draft_destination_collision_and_force(
+    skill_repo: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Verify query drafting rejects existing destination unless --force is supplied."""
+    out = tmp_path / "existing_queries.json"
+    out.write_text("{}", encoding="utf-8")
+
+    # Without --force: exits with error code 2 and informs user
+    outcome = main(["query", str(skill_repo), "--out", str(out), "--agent", "fake"])
+    assert outcome == 2
+    err = capsys.readouterr().err
+    assert "already exists" in err
+    assert "--force" in err
+
+    # With --force: overwrites destination file
+    outcome = main(["query", str(skill_repo), "--out", str(out), "--force", "--agent", "fake"])
+    assert outcome == 0
+    assert out.exists()
+
+    # Verify -f format works alongside --force without short-flag collision
+    out_jsonl = tmp_path / "existing_queries.jsonl"
+    out_jsonl.write_text("{}", encoding="utf-8")
+    outcome = main(
+        [
+            "query",
+            str(skill_repo),
+            "--out",
+            str(out_jsonl),
+            "-f",
+            "jsonl",
+            "--force",
+            "--agent",
+            "fake",
+        ]
+    )
+    assert outcome == 0
+
+
+def test_build_drafter_runtime_resolution() -> None:
+    """Verify _build_drafter_runtime respects generator_agent override and defaults."""
+    from reach.cli.drafting import _build_drafter_runtime
+    from reach.cli.flags import GenerateFlags
+    from reach.config import RunConfig, RuntimeSettings
+
+    # Inherits settings.runtime.agent by default
+    cfg = RunConfig(runtime=RuntimeSettings(agent="fake"))
+    drafter = _build_drafter_runtime(cfg, GenerateFlags())
+    assert drafter.name == "fake"
+
+    # Explicit generator_agent overrides runtime agent
+    flags = GenerateFlags(generator_agent="fake")
+    cfg_cli = RunConfig(runtime=RuntimeSettings(agent="antigravity-cli"))
+    drafter_override = _build_drafter_runtime(cfg_cli, flags)
+    assert drafter_override.name == "fake"
+
+
+def test_build_drafter_runtime_selects_agent_default_model_for_non_gemini() -> None:
+    """Verify _build_drafter_runtime switches default model when non-Gemini agent is chosen."""
+    from reach.cli.drafting import _build_drafter_runtime
+    from reach.cli.flags import GenerateFlags
+    from reach.config import RunConfig, RuntimeSettings
+
+    # Explicit generator_agent switch
+    flags = GenerateFlags(generator_agent="claude-code")
+    cfg = RunConfig(runtime=RuntimeSettings(agent="antigravity-cli"))
+    drafter = _build_drafter_runtime(cfg, flags)
+    assert drafter.name == "claude-code"
+    assert "claude" in drafter.model
+
+    # Inherited from runtime settings without explicit generator_agent flag
+    cfg_inherited = RunConfig(runtime=RuntimeSettings(agent="claude-code"))
+    drafter_inherited = _build_drafter_runtime(cfg_inherited, GenerateFlags())
+    assert drafter_inherited.name == "claude-code"
+    assert "claude" in drafter_inherited.model

@@ -50,9 +50,10 @@ from reach.runtime._subprocess import (
     run_subprocess_probe,
 )
 from reach.runtime.generator import BaseTextGenerator
+from reach.runtime.profiles import model_profile
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Sequence
+    from collections.abc import Iterable, Mapping, Sequence
 
 #: Workdir-relative root holding one session slot per concurrent probe worker.
 SESSION_DIRNAME = ".reach_pi_sessions"
@@ -370,6 +371,19 @@ class PiGenerator(BaseTextGenerator[PiOptions]):
             opts = PiOptions()
         super().__init__(model=opts.model or model, timeout_s=timeout_s, options=opts)
 
+    @property
+    def effective_effort(self) -> str | None:
+        """Return configured reasoning effort or default from model profile."""
+        if self.options.effort:
+            effort = self.options.effort
+            return None if effort.lower() in ("none", "off") else effort
+        if self.options.thinking:
+            return self.options.thinking
+        try:
+            return model_profile(self.model).effort
+        except (KeyError, ValueError):
+            return None
+
     def build_completion_command(self, prompt: str = "") -> list[str]:
         """Assemble command-line arguments for raw text completion."""
         cmd = [
@@ -386,18 +400,38 @@ class PiGenerator(BaseTextGenerator[PiOptions]):
             cmd.append("--no-themes")
         if self.model:
             cmd += ["--model", self.model]
+        cmd += self.options.provider_args("--provider")
+        cmd += self.options.api_key_args("--api-key")
+        if self.effective_effort:
+            cmd += ["--thinking", self.effective_effort]
         return [*cmd, *self.options.extra_args]
 
     @override
-    def complete(self, prompt: str) -> str:
+    def build_env(self) -> dict[str, str]:
+        """Assemble process environment with API keys and telemetry suppression."""
+        env = super().build_env()
+        env["PI_TELEMETRY"] = "0"
+        env["PI_SKIP_VERSION_CHECK"] = "1"
+        apply_provider_api_key(
+            env,
+            provider=self.options.provider,
+            api_key=self.options.api_key,
+            default_provider="google",
+        )
+        return sync_google_and_gemini_keys(env)
+
+    @override
+    def complete(self, prompt: str, *, schema: str | Mapping[str, Any] | None = None) -> str:
         """Execute text completion subprocess and return response string."""
+        effective_prompt = self.format_prompt_with_schema(prompt, schema)
         completed = subprocess.run(
-            self.build_completion_command(prompt),
+            self.build_completion_command(effective_prompt),
             capture_output=True,
             text=True,
             timeout=self.timeout_s,
             check=False,
             stdin=subprocess.DEVNULL,
+            env=self.build_env(),
         )
         if completed.returncode != 0:
             reason = completed.stderr.strip() or f"exit code {completed.returncode}"

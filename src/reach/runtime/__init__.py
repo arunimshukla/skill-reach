@@ -107,6 +107,7 @@ class AgentOptions(BaseModel):
     use_symlinks: bool = True
     isolate_config_dir: bool = True
     auto_clean: bool = False
+    json_schema: str | None = None
 
     #: Name of the field configuring an explicit isolation directory, if supported.
     isolation_dir_field: ClassVar[str | None] = None

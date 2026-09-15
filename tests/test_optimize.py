@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -1073,7 +1074,9 @@ def test_multi_round_hill_climbing_preserves_best_incumbent(
     class MultiRoundDriver(FakeGenerator):
         name = "custom-llm"
 
-        def complete(self, prompt: str, system: str | None = None) -> str:
+        def complete(
+            self, prompt: str, system: str | None = None, *args: Any, **kwargs: Any
+        ) -> str:
             nonlocal round_calls
             round_calls += 1
             if round_calls == 1:
@@ -1397,7 +1400,9 @@ def test_multi_round_deduplicates_identical_descriptions(
     class DuplicateGeneratingDriver(FakeGenerator):
         name = "mock-llm"
 
-        def complete(self, prompt: str, system: str | None = None) -> str:
+        def complete(
+            self, prompt: str, system: str | None = None, *args: Any, **kwargs: Any
+        ) -> str:
             # Returns identical description on every round
             return (
                 '{"candidates": [{"description": "Identical candidate description across rounds.", '
@@ -1434,7 +1439,9 @@ def test_multi_round_prefers_later_round_on_score_tie(
     class TieDriver(FakeGenerator):
         name = "mock-llm"
 
-        def complete(self, prompt: str, system: str | None = None) -> str:
+        def complete(
+            self, prompt: str, system: str | None = None, *args: Any, **kwargs: Any
+        ) -> str:
             nonlocal round_calls
             round_calls += 1
             return (

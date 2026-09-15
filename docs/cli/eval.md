@@ -148,6 +148,7 @@ reach eval cloud-deploy --concurrency 4
 | `--skill`             | String  | All                | Specific skill name(s) to draft queries for (repeatable).                    |
 | `--count`             | Integer | `3`                | Number of queries to draft per target skill.                                 |
 | `--generator-model`   | String  | `gemini-3.8-flash` | Model used to draft synthetic queries.                                       |
+| `--generator-agent`   | String  | Auto-detected      | Agent driver used to draft synthetic queries, overriding the probe agent.    |
 | `--generator-arm`     | String  | `content`          | Which generation prompt to use (`content`, `behavioral`, etc.).              |
 | `--top-rivals`        | Integer | `3`                | Maximum number of top-ranked rival skills to include in generation prompts.  |
 | `--draft-concurrency` | Integer | `1`                | Targets to draft concurrently.                                               |
