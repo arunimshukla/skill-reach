@@ -216,6 +216,7 @@ class SessionSummary(BaseModel):
 
     cost_usd: float | None = None
     duration_ms: int | None = None
+    prompt_tokens: int | None = None
     error: str | None = None
     invoked_skills: tuple[str, ...] = ()
     early_exit: bool = False
@@ -280,6 +281,7 @@ class SessionSummary(BaseModel):
         return SelectionOutcome(
             cost_usd=self.cost_usd,
             duration_ms=self.duration_ms,
+            prompt_tokens=self.prompt_tokens,
             error=self.error,
             invoked_skills=self.invoked_skills,
             early_exit=effective_early_exit,

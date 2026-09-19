@@ -19,7 +19,8 @@ from __future__ import annotations
 import importlib
 import json
 import os
-from abc import ABC, abstractmethod
+import subprocess
+from abc import ABC
 from collections.abc import Mapping
 from math import floor
 from typing import Any, Protocol, cast, runtime_checkable
@@ -151,10 +152,30 @@ class BaseTextGenerator[OptionsT](ABC):
             return prompt
         return f"{prompt}\n\nRespond with valid JSON adhering to this JSON schema:\n{schema_str}"
 
-    @abstractmethod
+    def build_completion_command(self, prompt: str = "") -> list[str]:
+        """Assemble command-line arguments for raw text completion."""
+        del prompt
+        msg = f"{type(self).__name__} does not implement build_completion_command()"
+        raise NotImplementedError(msg)
+
     def complete(self, prompt: str, *, schema: str | Mapping[str, Any] | None = None) -> str:
-        """Generate a raw text completion for an arbitrary prompt."""
-        ...
+        """Execute text completion subprocess piping prompt via stdin and return response string."""
+        effective_prompt = self.format_prompt_with_schema(prompt, schema)
+        completed = subprocess.run(
+            self.build_completion_command(effective_prompt),
+            input=effective_prompt,
+            capture_output=True,
+            text=True,
+            timeout=self.timeout_s,
+            check=False,
+            env=self.build_env(),
+        )
+        if completed.returncode != 0:
+            reason = completed.stderr.strip() or f"exit code {completed.returncode}"
+            msg = f"generation failed: {reason}"
+            raise RuntimeError(msg)
+        self.completions += 1
+        return completed.stdout.strip()
 
 
 def _build_agent_generator(

@@ -272,6 +272,7 @@ class ProbeResult(BaseModel):
     observed_tools: tuple[str, ...] = ()
     cost_usd: float | None = None
     duration_ms: int | None = None
+    prompt_tokens: int | None = None
     error: str | None = None
     disclosure_state: DisclosureState = DisclosureState.FULL
     invocation_pattern: InvocationPattern | None = None
@@ -344,6 +345,7 @@ class ProbeResult(BaseModel):
             observed_tools=outcome.observed_tools,
             cost_usd=outcome.cost_usd,
             duration_ms=outcome.duration_ms,
+            prompt_tokens=outcome.prompt_tokens,
             error=final_error,
             disclosure_state=disc_state,
             invocation_pattern=pattern,

@@ -222,6 +222,18 @@ def test_changed_skills_parsing() -> None:
         assert len(changed) == 5
 
 
+def test_changed_skills_bare_skill_md_in_root_uses_work_dir_name(tmp_path: Path) -> None:
+    """Verify changed_skills infers skill name from work_dir when modified file is root SKILL.md."""
+    skill_root = tmp_path / "standalone-my-skill"
+    skill_root.mkdir()
+    with patch("subprocess.run") as mock_run:
+        mock_run.return_value.returncode = 0
+        mock_run.return_value.stdout = "SKILL.md\n"
+
+        changed = changed_skills(root=skill_root, since="HEAD~1")
+        assert changed == ("standalone-my-skill",)
+
+
 def test_changed_skills_git_error_raises_value_error() -> None:
     """Verify changed_skills raises ValueError when git diff fails."""
     with patch("subprocess.run") as mock_run:

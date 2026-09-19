@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import contextlib
 import shutil
-import subprocess
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, override
 
@@ -53,7 +52,7 @@ from reach.runtime.generator import BaseTextGenerator
 from reach.runtime.profiles import model_profile
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Mapping, Sequence
+    from collections.abc import Iterable, Sequence
 
 #: Workdir-relative root holding one session slot per concurrent probe worker.
 SESSION_DIRNAME = ".reach_pi_sessions"
@@ -384,12 +383,13 @@ class PiGenerator(BaseTextGenerator[PiOptions]):
         except (KeyError, ValueError):
             return None
 
+    @override
     def build_completion_command(self, prompt: str = "") -> list[str]:
         """Assemble command-line arguments for raw text completion."""
+        del prompt  # Prompt is passed via stdin to avoid Linux MAX_ARG_STRLEN limits
         cmd = [
             self.options.executable,
             "-p",
-            prompt,
             "--no-session",
             "--no-skills",
             "--no-context-files",
@@ -420,22 +420,4 @@ class PiGenerator(BaseTextGenerator[PiOptions]):
         )
         return sync_google_and_gemini_keys(env)
 
-    @override
-    def complete(self, prompt: str, *, schema: str | Mapping[str, Any] | None = None) -> str:
-        """Execute text completion subprocess and return response string."""
-        effective_prompt = self.format_prompt_with_schema(prompt, schema)
-        completed = subprocess.run(
-            self.build_completion_command(effective_prompt),
-            capture_output=True,
-            text=True,
-            timeout=self.timeout_s,
-            check=False,
-            stdin=subprocess.DEVNULL,
-            env=self.build_env(),
-        )
-        if completed.returncode != 0:
-            reason = completed.stderr.strip() or f"exit code {completed.returncode}"
-            msg = f"generation failed: {reason}"
-            raise RuntimeError(msg)
-        self.completions += 1
-        return completed.stdout.strip()
+

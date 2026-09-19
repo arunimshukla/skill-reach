@@ -125,6 +125,8 @@ class SkillScore(BaseModel):
     probes: int = Field(ge=0)
     reached: int = Field(ge=0)
     recall: float | None = None
+    trajectory_reached: int = Field(default=0, ge=0)
+    trajectory_recall: float | None = None
     absorbed: int = Field(default=0, ge=0)
     precision: float | None = None
 
@@ -135,6 +137,23 @@ class SkillScore(BaseModel):
             msg = (
                 f"{self.skill}: recall is defined exactly when a query named the "
                 f"skill; got recall={self.recall} over {self.probes} probes"
+            )
+            raise ValueError(
+                msg,
+            )
+        if self.trajectory_reached < self.reached:
+            object.__setattr__(self, "trajectory_reached", self.reached)
+        if self.probes > 0 and self.trajectory_recall is None:
+            object.__setattr__(
+                self,
+                "trajectory_recall",
+                self.trajectory_reached / self.probes,
+            )
+        if (self.probes > 0) != (self.trajectory_recall is not None):
+            msg = (
+                f"{self.skill}: trajectory_recall is defined exactly when a query "
+                f"named the skill; got trajectory_recall={self.trajectory_recall} "
+                f"over {self.probes} probes"
             )
             raise ValueError(
                 msg,
@@ -184,6 +203,8 @@ class SkillScore(BaseModel):
             probes=metrics.support,
             reached=metrics.true_positives,
             recall=metrics.recall if metrics.support else None,
+            trajectory_reached=metrics.trajectory_true_positives,
+            trajectory_recall=metrics.trajectory_recall if metrics.support else None,
             absorbed=metrics.false_positives,
             precision=metrics.precision if selected else None,
         )
@@ -489,8 +510,13 @@ class Artifact(BaseModel):
 
     @property
     def unreached(self) -> tuple[SkillScore, ...]:
-        """Return the skills that were asked for and never arrived at."""
-        return tuple(s for s in self.skills if s.recall is not None and s.recall == 0.0)
+        """Return the skills that were asked for and never arrived at across any turn."""
+        return tuple(
+            s
+            for s in self.skills
+            if s.recall is not None
+            and (s.trajectory_recall if s.trajectory_recall is not None else s.recall) == 0.0
+        )
 
     @property
     def attractors(self) -> tuple[SkillScore, ...]:

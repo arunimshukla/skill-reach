@@ -240,7 +240,7 @@ def _check_agent_registry(workdir: Path) -> CheckResult:
     project = resolve_registry_project(config_path=config_path if config_path.is_file() else None)
     has_adc = is_adc_available()
 
-    cache_mgr = RegistryCacheManager()
+    cache_mgr = RegistryCacheManager.for_workdir(workdir)
     total_bytes, _ = cache_mgr.clean(dry_run=True)
 
     cache_info = f" ({total_bytes} bytes cached)" if total_bytes > 0 else ""

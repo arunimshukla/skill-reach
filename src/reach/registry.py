@@ -14,6 +14,8 @@
 
 """Provide client access, authentication, and two-tier caching for Google Cloud Agent Registry."""
 
+from __future__ import annotations
+
 import contextlib
 import json
 import os
@@ -27,7 +29,7 @@ import urllib.request
 from datetime import UTC, datetime
 from http import HTTPStatus
 from pathlib import Path
-from typing import Any, Final
+from typing import Any, Final, Self
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
@@ -521,12 +523,19 @@ def _safe_resolve_subpath(
 class RegistryCacheManager:
     """Manage local caching and payload hydration of Agent Registry skills."""
 
+    REGISTRY_CACHE_RELPATH = Path(".reach") / "cache" / "registry"
+
     def __init__(self, cache_root: Path | str | None = None) -> None:
         """Initialize RegistryCacheManager with optional root directory."""
         if cache_root is not None:
             self.cache_root = resolve_path(cache_root)
         else:
-            self.cache_root = resolve_path(".reach") / "cache" / "registry"
+            self.cache_root = resolve_path(self.REGISTRY_CACHE_RELPATH)
+
+    @classmethod
+    def for_workdir(cls, workdir: Path | str) -> Self:
+        """Instantiate a RegistryCacheManager rooted inside a specific workspace directory."""
+        return cls(cache_root=resolve_path(workdir) / cls.REGISTRY_CACHE_RELPATH)
 
     def location_dir(self, project: str, location: str) -> Path:
         """Return the directory containing manifest and cached skills for project and location."""

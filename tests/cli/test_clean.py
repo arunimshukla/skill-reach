@@ -139,6 +139,7 @@ def test_clean_all_removes_sweep_results_and_artifact_sidecars(
             "sweep.json",
             "sweep.json.artifact.json",
             "custom-run.json.artifact.json",
+            "custom-eval.config.json",
         )
     ]
     for path in purged:

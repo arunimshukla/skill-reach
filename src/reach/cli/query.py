@@ -520,20 +520,6 @@ def _query(
     """Synthesize benchmark queries for skills, convert formats, or inspect query datasets."""
     console = build_console(quiet=quiet)
 
-    if (
-        not draft_only
-        and target is None
-        and config is None
-        and (study is None or (study.skills is None and study.queries is None))
-    ):
-        console.print("[bold red]error:[/] no target specified.")
-        console.print("Usage:")
-        console.print("  reach query <queries.json>   Inspect or export an existing query set")
-        console.print("  reach query <skills-dir>     Draft synthetic queries for a skill corpus")
-        console.print("  reach query draft [OPTIONS]  Draft queries with options")
-        console.print("See 'reach query --help' for more details.")
-        return 2
-
     source_file = _resolve_query_source_file(
         target,
         study,

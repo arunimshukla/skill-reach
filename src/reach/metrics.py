@@ -19,9 +19,9 @@ from __future__ import annotations
 import random
 import statistics
 from collections import Counter, defaultdict
-from typing import TYPE_CHECKING, Final, NamedTuple
+from typing import TYPE_CHECKING, Final, NamedTuple, Self
 
-from pydantic import BaseModel, ConfigDict, computed_field
+from pydantic import BaseModel, ConfigDict, computed_field, model_validator
 
 from reach.models import (
     NO_SKILL,
@@ -36,7 +36,7 @@ from reach.uncertainty import Interval, wilson_interval
 MIN_TRANSITION_STEPS: Final = 2
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Mapping, Sequence
 
 type PrecursorTransitions = dict[tuple[str, str], list[int]]
 type RequirementSynonyms = frozenset[str]
@@ -159,6 +159,14 @@ class ClassMetrics(BaseModel):
     predicted: int
     support: int
     true_positives: int
+    trajectory_true_positives: int = 0
+
+    @model_validator(mode="after")
+    def _ensure_trajectory_at_least_top1(self) -> Self:
+        """Ensure trajectory true positives are at least top-1 true positives."""
+        if self.trajectory_true_positives < self.true_positives:
+            object.__setattr__(self, "trajectory_true_positives", self.true_positives)
+        return self
 
     @property
     def precision(self) -> float:
@@ -171,6 +179,11 @@ class ClassMetrics(BaseModel):
         """Calculate recall (true positives / ground truth support)."""
         denominator = self.true_positives + self.false_negatives
         return self.true_positives / denominator if denominator else 0.0
+
+    @property
+    def trajectory_recall(self) -> float:
+        """Calculate trajectory recall (trajectory true positives / ground truth support)."""
+        return self.trajectory_true_positives / self.support if self.support else 0.0
 
     @property
     def f1(self) -> float:
@@ -351,6 +364,7 @@ def _class_metrics(
     label: str,
     y_true: Sequence[str],
     y_pred: Sequence[str],
+    trajectory_tp: int | None = None,
 ) -> ClassMetrics:
     """Compute precision, recall, and support metrics for a single label."""
     tp = sum(t == label and p == label for t, p in zip(y_true, y_pred, strict=True))
@@ -361,6 +375,7 @@ def _class_metrics(
         support=sum(t == label for t in y_true),
         predicted=sum(p == label for p in y_pred),
         true_positives=tp,
+        trajectory_true_positives=trajectory_tp if trajectory_tp is not None else tp,
         false_positives=fp,
         false_negatives=fn,
     )
@@ -370,9 +385,20 @@ def _build_per_class(
     y_true: Sequence[str],
     y_pred: Sequence[str],
     universe: Sequence[str],
+    trajectory_hits_by_label: Mapping[str, int] | None = None,
 ) -> tuple[ClassMetrics, ...]:
     """Compute per-class metrics across all labels in the universe."""
-    return tuple(_class_metrics(label, y_true, y_pred) for label in universe)
+    return tuple(
+        _class_metrics(
+            label,
+            y_true,
+            y_pred,
+            trajectory_tp=trajectory_hits_by_label.get(label, 0)
+            if trajectory_hits_by_label is not None
+            else None,
+        )
+        for label in universe
+    )
 
 
 def _mean(values: Sequence[float]) -> float:
@@ -414,11 +440,19 @@ def classification_report(
     y_true = [q.truth_label for q, _ in pairs]
     y_pred = [q.effective_predicted_label(r.predicted_label) for q, r in pairs]
     universe = _label_universe(y_true, y_pred, labels)
-    per_class = _build_per_class(y_true, y_pred, universe)
+    traj_scores = [score_trajectory(q, r.invoked_skills) for q, r in pairs]
+    traj_hits_by_label = Counter(
+        t for t, s in zip(y_true, traj_scores, strict=True) if s.trajectory_hit
+    )
+    per_class = _build_per_class(
+        y_true,
+        y_pred,
+        universe,
+        trajectory_hits_by_label=traj_hits_by_label,
+    )
     precision, recall, f1 = _macro_averages(per_class)
     in_count, false_abs, out_count, out_detected = _scope_metrics(y_true, y_pred)
 
-    traj_scores = [score_trajectory(q, r.invoked_skills) for q, r in pairs]
     entrypoint_hits = sum(1 for s in traj_scores if s.entrypoint_hit)
     trajectory_hits = sum(1 for s in traj_scores if s.trajectory_hit)
     step_eff = _mean([s.step_efficiency for s in traj_scores])

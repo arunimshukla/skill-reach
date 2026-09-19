@@ -302,11 +302,11 @@ def test_select_no_session_file_returns_error(
 
 
 def test_pi_build_completion_command() -> None:
-    """Verify build_completion_command constructs arguments correctly."""
+    """Verify build_completion_command constructs arguments correctly without CLI prompt."""
     gen = PiGenerator()
     cmd = gen.build_completion_command("test prompt")
-    assert cmd[:3] == ["pi", "-p", "test prompt"]
-    assert "--no-session" in cmd
+    assert cmd[:3] == ["pi", "-p", "--no-session"]
+    assert "test prompt" not in cmd
     assert "--no-skills" in cmd
     assert "--no-themes" in cmd
 
@@ -587,6 +587,7 @@ def test_pi_generator_command_and_env() -> None:
     opts = PiOptions(model="gemini-3.8-flash", provider="google", api_key="secret-key")
     gen = PiGenerator(options=opts)
     cmd = gen.build_completion_command("test prompt")
+    assert cmd[:3] == ["pi", "-p", "--no-session"]
     assert "--provider" in cmd
     assert cmd[cmd.index("--provider") + 1] == "google"
     assert "--api-key" in cmd

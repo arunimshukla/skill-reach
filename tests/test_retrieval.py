@@ -214,6 +214,39 @@ def test_hybrid_scorer_fuses_lexical_and_dense() -> None:
     assert set(ranked_names[:2]) == {"pdf-tool", "sheet-parser"}
 
 
+def test_hybrid_scorer_no_alphabetical_rrf_bias_for_zero_bm25_matches() -> None:
+    """Verify zero-BM25 candidates receive 0 lexical RRF points regardless of alphabetical order."""
+    target = _make_skill("cloud-orchestrator", "Deploy and manage container workloads.")
+    # Lexical match (shares keywords "deploy", "workloads")
+    cand_lex = _make_skill("workload-deployer", "Deploy serverless workloads.")
+    # Pure semantic match (no keyword overlap at all, but vector close)
+    cand_sem = _make_skill("provision-compute", "Setup virtual machines, host hypervisors.")
+    # Irrelevant skills with alphabetically early names and zero keyword overlap
+    distractors = [
+        _make_skill(f"aaa-{i}", f"Irrelevant unrelated topic {i}.") for i in range(5)
+    ]
+
+    skills = [target, cand_lex, cand_sem, *distractors]
+    vectors = {
+        "cloud-orchestrator": [1.0, 0.9, 0.0],
+        "provision-compute": [0.95, 0.85, 0.0],
+        "workload-deployer": [0.7, 0.6, 0.0],
+    }
+    for i, d in enumerate(distractors):
+        vectors[d.name] = [0.0, 0.0, float(i + 1)]
+
+    hybrid = HybridScorer.from_skills_and_vectors(skills, vectors, rrf_k=60)
+    ranked = hybrid.rank(target, [cand_lex, cand_sem, *distractors])
+    ranked_names = [name for name, _ in ranked]
+
+    # cand_sem should strictly outrank all zero-match distractors
+    for d in distractors:
+        assert ranked_names.index("provision-compute") < ranked_names.index(d.name)
+    assert set(ranked_names[:2]) == {"provision-compute", "workload-deployer"}
+
+
+
+
 def test_build_scorer_factory() -> None:
     """Verify build_scorer constructs requested scorer variants."""
     skills = [

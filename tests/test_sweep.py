@@ -857,3 +857,162 @@ def test_run_scaling_sweep_shares_probe_harness_cache_across_identical_scales(
     assert res1[0].invoked_skills == ("skill-00",)
     assert res2[0].invoked_skills == ("skill-00",)
     assert res2[0].catalog_id == "scale-3b"
+
+
+@pytest.mark.parametrize(
+    (
+        "positive_invocations",
+        "negative_specs",
+        "expected_recall",
+        "expected_internal_prec",
+        "expected_ext_prec",
+        "expected_overall_prec",
+        "expected_abstention",
+    ),
+    [
+        pytest.param(
+            ["my-skill"] * 5 + ["rival-skill"] * 5,
+            [],
+            0.5,
+            1.0,
+            None,
+            1.0,
+            None,
+            id="target-fn-misroute-not-penalized-as-fp",
+        ),
+        pytest.param(
+            ["my-skill"] * 5,
+            [((), None), ((), None), (("rival-skill",), None), (("my-skill",), None)],
+            1.0,
+            1.0,
+            round(5 / 6, 4),
+            5 / 6,
+            0.5,
+            id="negative-rival-hijack-excluded-from-target-fp-and-tn",
+        ),
+        pytest.param(
+            ["my-skill"] * 5,
+            [((), None), ((), "timeout")],
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            0.5,
+            id="negative-errored-probe-not-counted-as-tn",
+        ),
+    ],
+)
+def test_single_skill_sweep_classification_metrics(
+    positive_invocations: list[str],
+    negative_specs: list[tuple[tuple[str, ...], str | None]],
+    expected_recall: float,
+    expected_internal_prec: float,
+    expected_ext_prec: float | None,
+    expected_overall_prec: float,
+    expected_abstention: float | None,
+) -> None:
+    """Verify targeted sweep metrics handle FNs, rival hijacks, and errored probes."""
+    from reach.models import CatalogMode, ProbeResult, Query, QueryKind
+    from reach.queries import Origin, QuerySet, QuerySetProvenance
+    from reach.sweep import _build_scaling_point
+
+    pos_queries = [
+        Query(id=f"q{i}", text=f"query {i}", expected_skill="my-skill", kind=QueryKind.IMPLICIT)
+        for i in range(len(positive_invocations))
+    ]
+    neg_queries = [
+        Query(id=f"neg{j}", text=f"neg {j}", expected_skill=None, kind=QueryKind.OUT_OF_SCOPE)
+        for j in range(len(negative_specs))
+    ]
+    query_set = QuerySet(
+        catalog_id="c",
+        queries=tuple(pos_queries + neg_queries),
+        provenance=QuerySetProvenance(origin=Origin.AUTHORED),
+    )
+
+    pos_results = [
+        ProbeResult(
+            query_id=f"q{i}",
+            catalog_id="c",
+            invoked_skills=(inv,),
+            catalog_mode=CatalogMode.SWEEP,
+            catalog_size=10,
+            model="mock-model",
+            runtime="mock-runtime",
+        )
+        for i, inv in enumerate(positive_invocations)
+    ]
+    neg_results = [
+        ProbeResult(
+            query_id=f"neg{j}",
+            catalog_id="c",
+            invoked_skills=invoked,
+            error=err,
+            catalog_mode=CatalogMode.SWEEP,
+            catalog_size=10,
+            model="mock-model",
+            runtime="mock-runtime",
+        )
+        for j, (invoked, err) in enumerate(negative_specs)
+    ]
+
+    point, _ = _build_scaling_point(
+        scale=10,
+        catalog_id="sweep:my-skill:10",
+        results=tuple(pos_results + neg_results),
+        resolved_query_set=query_set,
+        baseline_results=(),
+        installed_skills={"my-skill", "rival-skill"},
+        target_skill="my-skill",
+    )
+
+    assert point.recall == pytest.approx(expected_recall, abs=1e-4)
+    assert point.internal_precision == pytest.approx(expected_internal_prec, abs=1e-4)
+    assert point.external_distractor_precision == expected_ext_prec
+    assert point.precision == pytest.approx(expected_overall_prec, abs=1e-4)
+    assert point.abstention_rate == expected_abstention
+
+
+def test_prompt_tokens_telemetry_propagates_from_outcome_to_scaling_point() -> None:
+    """Verify prompt_tokens flows from SessionSummary through ProbeResult to ScalingPoint."""
+    from reach.models import Catalog, CatalogMode, ProbeResult, Query, QueryKind
+    from reach.queries import Origin, QuerySet, QuerySetProvenance
+    from reach.runtime import SessionSummary
+    from reach.sweep import _build_scaling_point
+
+    summary = SessionSummary(
+        invoked_skills=("my-skill",),
+        prompt_tokens=1250,
+        duration_ms=420,
+    )
+    outcome = summary.to_outcome(observed_catalog=("my-skill",))
+    assert outcome.prompt_tokens == 1250
+
+    query = Query(id="q1", text="use my-skill", expected_skill="my-skill", kind=QueryKind.IMPLICIT)
+    cat = Catalog(
+        id="sweep:my-skill:5",
+        mode=CatalogMode.SWEEP,
+        skills=("my-skill",),
+        target="my-skill",
+    )
+    result = ProbeResult.from_outcome(outcome, query, cat, runtime_name="mock", model="mock")
+    assert result.prompt_tokens == 1250
+
+    query_set = QuerySet(
+        catalog_id=cat.id,
+        queries=(query,),
+        provenance=QuerySetProvenance(origin=Origin.AUTHORED),
+    )
+    point, _ = _build_scaling_point(
+        scale=5,
+        catalog_id=cat.id,
+        results=(result,),
+        resolved_query_set=query_set,
+        baseline_results=(),
+        installed_skills={"my-skill"},
+        target_skill="my-skill",
+    )
+    assert point.prompt_tokens_mean == 1250.0
+
+
+

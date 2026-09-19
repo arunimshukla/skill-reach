@@ -804,6 +804,8 @@ class RunConfig(BaseModel):
                         else {}
                     )
                 )
+                if "options" in active_overrides and isinstance(active_overrides["options"], dict):
+                    base_opts.update(active_overrides["options"])
                 base_opts["model"] = model
                 active_overrides["options"] = base_opts
 

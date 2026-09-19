@@ -354,10 +354,12 @@ def test_goose_parse_stream_whitespace_and_early_exit(runtime: GooseRuntime) -> 
 
 
 def test_goose_build_completion_command() -> None:
-    """Verify build_completion_command constructs arguments correctly."""
+    """Verify build_completion_command constructs arguments correctly without CLI prompt."""
     gen = GooseGenerator()
     cmd = gen.build_completion_command("test prompt")
-    assert cmd[:6] == ["goose", "run", "-q", "--no-session", "-t", "test prompt"]
+    assert cmd[:6] == ["goose", "run", "-q", "-i", "-", "--no-session"]
+    assert "-t" not in cmd
+    assert "test prompt" not in cmd
     assert "--no-profile" in cmd
 
 
@@ -487,7 +489,8 @@ def test_goose_generator_command_and_env(monkeypatch: pytest.MonkeyPatch) -> Non
     generator = GooseGenerator(model="gemini-3-flash-preview", options=opts)
 
     cmd = generator.build_completion_command("test prompt")
-    assert cmd[:6] == ["goose", "run", "-q", "--no-session", "-t", "test prompt"]
+    assert cmd[:6] == ["goose", "run", "-q", "-i", "-", "--no-session"]
+    assert "-t" not in cmd
     assert "--no-profile" in cmd
     assert "--model" in cmd
     assert cmd[cmd.index("--model") + 1] == "gemini-3-flash-preview"
@@ -503,6 +506,7 @@ def test_goose_generator_command_and_env(monkeypatch: pytest.MonkeyPatch) -> Non
     def mock_run(command: list[str], **kwargs: Any) -> Any:
         captured["command"] = command
         captured["env"] = kwargs.get("env")
+        captured["input"] = kwargs.get("input")
         import subprocess
 
         return subprocess.CompletedProcess(
@@ -515,6 +519,6 @@ def test_goose_generator_command_and_env(monkeypatch: pytest.MonkeyPatch) -> Non
     result = generator.complete("draft queries", schema=schema)
     assert result == '{"queries": []}'
     assert captured["env"]["OTEL_SDK_DISABLED"] == "true"
-    # Verify schema instruction was appended to the prompt in command arguments
-    prompt_arg = captured["command"][captured["command"].index("-t") + 1]
-    assert "Respond with valid JSON adhering to this JSON schema:" in prompt_arg
+    assert "Respond with valid JSON adhering to this JSON schema:" in captured["input"]
+    assert "-t" not in captured["command"]
+

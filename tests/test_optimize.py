@@ -1816,3 +1816,87 @@ def test_optimization_pydantic_models_and_transitions(
 
     tested = trained.with_test_metrics(tally)
     assert (tested.test_recall, tested.test_accuracy, tested.test_misroute_rate) == expected_metrics
+
+
+def test_run_optimization_round_test_budget_absorbs_unspent_train_budget(
+    write_skill_model: Callable[..., Skill],
+) -> None:
+    """Verify holdout test budget in _run_optimization_round absorbs unspent train budget."""
+    from unittest.mock import patch
+
+    from reach.models import Query, QueryKind
+    from reach.optimize import (
+        _BaselineEvaluation,
+        _RivalContext,
+        _run_optimization_round,
+    )
+
+    target = write_skill_model(name="my-tool", description="Tool.")
+    rival = write_skill_model(name="rival-tool", description="Rival.")
+    context = _RivalContext(
+        target_skill=target,
+        rival_skills=[rival],
+        all_skills=[target, rival],
+        ceded_terms=(),
+        unclaimed_terms=(),
+    )
+    train_queries = [
+        Query(id="tr1", text="q train 1", expected_skill="my-tool", kind=QueryKind.IMPLICIT),
+    ]
+    test_queries = [
+        Query(id=f"te{i}", text=f"q test {i}", expected_skill="my-tool", kind=QueryKind.IMPLICIT)
+        for i in range(10)
+    ]
+    baseline = _BaselineEvaluation(
+        recall=0.5,
+        accuracy=0.5,
+        misroute_rate=0.0,
+        remaining_budget=100,
+        hits_by_id={},
+    )
+
+    with (
+        patch("reach.optimize.synthesize_candidates") as mock_synth,
+        patch("reach.optimize.evaluate_candidate") as mock_eval,
+    ):
+        mock_synth.return_value = [
+            OptimizationCandidate(
+                description="Synthesized description for my tool.", lint_clean=True
+            )
+        ]
+
+        test_budgets_passed = []
+
+        def fake_eval(**kw: Any) -> Any:
+            if kw.get("is_test"):
+                test_budgets_passed.append(kw.get("budget"))
+            return kw["candidate"].model_copy(
+                update={"recall": 1.0, "accuracy": 1.0, "delta_recall": 0.5, "test_recall": 1.0}
+            )
+
+        mock_eval.side_effect = fake_eval
+
+        # remaining_budget=20, 1 iteration remaining -> round_budget=20.
+        # holdout=0.2 -> test_share = 4, train_share = 16.
+        # train_queries only has 1 query, so train_spent = 1.
+        # Available for test should absorb unspent train budget: min(19, max(4, 19)) = 19.
+        _outcome = _run_optimization_round(
+            context=context,
+            train_queries=train_queries,
+            test_queries=test_queries,
+            agent="fake",
+            driver=None,
+            lint_config=None,
+            config=None,
+            candidates_count=1,
+            failed_triggers=[],
+            false_triggers=[],
+            prev_description="Old desc",
+            iter_idx=1,
+            iterations=1,
+            remaining_budget=20,
+            holdout=0.2,
+            baseline=baseline,
+        )
+
+        assert test_budgets_passed == [10]

@@ -228,3 +228,22 @@ def test_run_doctor_checks_includes_google_adc(tmp_path: Path) -> None:
     adc_checks = [r for r in results if r.name == "Google Cloud ADC"]
     assert len(adc_checks) == 1
     assert adc_checks[0].category == "Credentials & Environment"
+
+
+def test_check_agent_registry_uses_custom_workdir_cache(tmp_path: Path) -> None:
+    """Verify _check_agent_registry checks cache scoped to the specified workdir."""
+    from reach.cli.doctor import _check_agent_registry
+
+    custom_workdir = tmp_path / "custom_workdir"
+    custom_cache = custom_workdir / ".reach" / "cache" / "registry" / "my-project" / "global"
+    custom_cache.mkdir(parents=True)
+    manifest = custom_cache / ".manifest.json"
+    manifest.write_text('{"skills": []}', encoding="utf-8")
+
+    with (
+        patch("reach.config.resolve_registry_project", return_value="my-project"),
+        patch("reach.registry.is_adc_available", return_value=True),
+    ):
+        res = _check_agent_registry(custom_workdir)
+        assert res.status == "ok"
+        assert "bytes cached" in res.detail
