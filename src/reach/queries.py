@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
@@ -32,7 +33,7 @@ from pydantic import (
 )
 
 from reach._io import write_model
-from reach.models import Query
+from reach.models import Query, QueryKind
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -104,8 +105,129 @@ class QuerySet(BaseModel):
         return tuple(q for q in self.queries if name in (q.expected_skill, q.truth_label))
 
 
-def load_query_set(path: Path | str, *, catalog_id: str = "all") -> QuerySet:
-    """Load and validate a QuerySet from JSON, JSONL, or CSV, asserting unique query IDs."""
+class _LegacyQueryEntry(BaseModel):
+    """Validate and normalize a legacy or skill-creator JSON query entry."""
+
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    id: str | None = None
+    text: str | None = None
+    query: str | None = None
+    kind: QueryKind | None = None
+    should_trigger: bool | None = None
+    expected_skill: str | None = None
+    neighbor_skill: str | None = None
+    true_skill: str | None = None
+    acceptable_skills: tuple[str, ...] = ()
+    notes: str = ""
+
+    def to_query(self, index: int) -> Query:
+        """Convert normalized legacy entry into a canonical Query model."""
+        prompt = self.text if self.text is not None else self.query
+        if prompt is None or not prompt.strip():
+            msg = f"Legacy query at index {index} must provide non-empty 'text' or 'query'"
+            raise ValueError(msg)
+
+        q_id = self.id.strip() if self.id and self.id.strip() else f"q-{index:03d}"
+
+        if self.should_trigger is False:
+            positive_rival = self.neighbor_skill or self.true_skill
+            if positive_rival:
+                expected = positive_rival
+                q_kind = self.kind or QueryKind.NEIGHBOR_NEGATIVE
+            else:
+                expected = None
+                q_kind = QueryKind.OUT_OF_SCOPE
+        else:
+            expected = self.expected_skill
+            if self.kind is not None:
+                q_kind = self.kind
+            elif expected is None:
+                q_kind = QueryKind.OUT_OF_SCOPE
+            else:
+                q_kind = QueryKind.IMPLICIT
+
+        return Query(
+            id=q_id,
+            text=prompt,
+            kind=q_kind,
+            expected_skill=expected,
+            acceptable_skills=tuple(s for s in self.acceptable_skills if s),
+            notes=self.notes,
+        )
+
+
+class _LegacyQueryEnvelope(BaseModel):
+    """Validate a dict-wrapped skill-creator query payload containing 'queries' or 'evals'."""
+
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    catalog_id: str | None = None
+    queries: tuple[_LegacyQueryEntry, ...] | None = None
+    evals: tuple[_LegacyQueryEntry, ...] | None = None
+
+    @model_validator(mode="after")
+    def _require_skill_creator_markers(self) -> Self:
+        """Require 'evals' key or entries with 'query' or 'should_trigger' fields."""
+        items = self.queries if self.queries is not None else self.evals
+        if items is None or not items:
+            msg = "Legacy query envelope requires non-empty queries or evals"
+            raise ValueError(msg)
+        if self.evals is None and not any(
+            item.query is not None or item.should_trigger is not None for item in items
+        ):
+            msg = "Canonical QuerySet dict must validate via QuerySet schema"
+            raise ValueError(msg)
+        return self
+
+
+def _parse_json_query_set(
+    content: str,
+    *,
+    catalog_id: str,
+    source: str,
+) -> QuerySet:
+    """Parse canonical QuerySet JSON or normalize top-level array / skill-creator JSON."""
+    try:
+        return QuerySet.model_validate_json(content)
+    except (ValueError, ValidationError) as primary_err:
+        try:
+            raw = json.loads(content)
+        except json.JSONDecodeError:
+            raise primary_err from None
+
+        resolved_catalog_id = catalog_id
+        try:
+            if isinstance(raw, list):
+                entries = [_LegacyQueryEntry.model_validate(item) for item in raw]
+            elif isinstance(raw, dict):
+                envelope = _LegacyQueryEnvelope.model_validate(raw)
+                if envelope.catalog_id:
+                    resolved_catalog_id = envelope.catalog_id
+                raw_items = envelope.queries if envelope.queries is not None else envelope.evals
+                entries = list(raw_items or ())
+            else:
+                raise primary_err
+
+            normalized_queries = tuple(
+                entry.to_query(idx) for idx, entry in enumerate(entries, start=1)
+            )
+        except (ValueError, ValidationError):
+            raise primary_err from None
+
+        return QuerySet(
+            catalog_id=resolved_catalog_id,
+            queries=normalized_queries,
+            provenance=QuerySetProvenance(origin=Origin.AUTHORED, source=source),
+        )
+
+
+def load_query_set(
+    path: Path | str,
+    *,
+    catalog_id: str = "all",
+) -> QuerySet:
+    """Load and validate a QuerySet from a JSON, JSONL, or CSV file."""
     resolved = Path(path).expanduser().resolve()
     content = resolved.read_text(encoding="utf-8")
     suffix = resolved.suffix.lower()
@@ -120,9 +242,9 @@ def load_query_set(path: Path | str, *, catalog_id: str = "all") -> QuerySet:
 
         return import_query_set(content, Exchange.CSV, catalog_id=catalog_id, source=str(resolved))
     if suffix == ".json":
-        return QuerySet.model_validate_json(content)
+        return _parse_json_query_set(content, catalog_id=catalog_id, source=str(resolved))
     try:
-        return QuerySet.model_validate_json(content)
+        return _parse_json_query_set(content, catalog_id=catalog_id, source=str(resolved))
     except (ValueError, ValidationError):
         from reach.exchange import Exchange, import_query_set
 

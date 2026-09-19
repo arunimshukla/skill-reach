@@ -22,7 +22,7 @@ import statistics
 import tempfile
 from collections import Counter
 from pathlib import Path
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -167,7 +167,7 @@ def _compute_effective_noise_floor(
 def find_kneedle_knee(
     scales: Sequence[int],
     pass_rates: Sequence[float],
-    noise_floor: float = 0.05,
+    noise_floor: float = 0.10,
 ) -> int | None:
     """Identify the inflection knee scale k* using normalized log-scale Kneedle curvature."""
     if (
@@ -181,21 +181,21 @@ def find_kneedle_knee(
     k_vals = [p[0] for p in points]
     y_vals = [p[1] for p in points]
 
+    if (y_vals[0] - y_vals[-1]) <= noise_floor:
+        return None
+
     log_k = [math.log(k) for k in k_vals]
     min_log = log_k[0]
     max_log = log_k[-1]
     log_range = max_log - min_log
-    if log_range <= 0.0:
-        return None
-
-    norm_x = [(lk - min_log) / log_range for lk in log_k]
-
     min_y = min(y_vals)
     max_y = max(y_vals)
     y_range = max_y - min_y
-    if y_range <= 0.0:
+
+    if log_range <= 0.0 or y_range <= 0.0:
         return None
 
+    norm_x = [(lk - min_log) / log_range for lk in log_k]
     norm_y = [(y - min_y) / y_range for y in y_vals]
 
     y0 = norm_y[0]
@@ -205,11 +205,12 @@ def find_kneedle_knee(
 
     max_below = max(diffs_below[1:-1])
     max_above = max(diffs_above[1:-1])
+    min_prominence = max(0.05, (noise_floor * 0.5) / y_range)
 
-    if max_above >= max_below and max_above > 0.0:
+    if max_above >= max_below and max_above > min_prominence:
         knee_idx = 1 + diffs_above[1:-1].index(max_above)
         return k_vals[knee_idx]
-    if max_below > 0.0:
+    if max_below > min_prominence:
         knee_idx = 1 + diffs_below[1:-1].index(max_below)
         return k_vals[knee_idx]
     return None
@@ -266,6 +267,21 @@ def bootstrap_f1_ci(
     return (round(f1_boots[low_idx], 4), round(f1_boots[high_idx], 4))
 
 
+def _log_interpolate_scale(
+    p1: ScalingPoint,
+    p2: ScalingPoint,
+    threshold: float,
+) -> float | None:
+    """Interpolate log-linear scale crossing between two adjacent scaling points."""
+    denom = p2.f1_score - p1.f1_score
+    if denom == 0.0:
+        return None
+    t = (threshold - p1.f1_score) / denom
+    log_k1 = math.log(max(1, p1.scale))
+    log_k2 = math.log(max(1, p2.scale))
+    return round(math.exp(log_k1 + t * (log_k2 - log_k1)), 1)
+
+
 def compute_sla_crossings(
     points: Sequence[ScalingPoint],
     threshold: float,
@@ -274,19 +290,24 @@ def compute_sla_crossings(
     if not points:
         return None, None
 
-    qualifying = [p.scale for p in points if p.f1_score >= threshold]
-    discrete_k = max(qualifying) if qualifying else None
-
+    ordered = sorted(points, key=lambda p: p.scale)
+    discrete_k: int | None = None
     interp_k: float | None = None
-    for i in range(len(points) - 1):
-        p1, p2 = points[i], points[i + 1]
-        if (p1.f1_score >= threshold > p2.f1_score) or (p1.f1_score <= threshold < p2.f1_score):
-            denom = p2.f1_score - p1.f1_score
-            if denom != 0.0:
-                t = (threshold - p1.f1_score) / denom
-                log_k1 = math.log(max(1, p1.scale))
-                log_k2 = math.log(max(1, p2.scale))
-                interp_k = round(math.exp(log_k1 + t * (log_k2 - log_k1)), 1)
+
+    for i in range(len(ordered) - 1):
+        p1, p2 = ordered[i], ordered[i + 1]
+        if p1.f1_score >= threshold > p2.f1_score:
+            discrete_k = p1.scale
+            interp_k = _log_interpolate_scale(p1, p2, threshold)
+            break
+
+    if discrete_k is None:
+        qualifying = [p.scale for p in ordered if p.f1_score >= threshold]
+        discrete_k = max(qualifying) if qualifying else None
+        for i in range(len(ordered) - 1):
+            p1, p2 = ordered[i], ordered[i + 1]
+            if p1.f1_score <= threshold < p2.f1_score:
+                interp_k = _log_interpolate_scale(p1, p2, threshold)
                 break
 
     if interp_k is None and discrete_k is not None:
@@ -788,8 +809,11 @@ def run_scaling_sweep(
         temp_dir_obj = tempfile.TemporaryDirectory(prefix="reach_sweep_")
         work_dir = Path(temp_dir_obj.name)
 
+    shared_outcome_cache: dict[Any, Any] = {}
     try:
         for scale, catalog in zip(actual_scales, catalogs, strict=True):
+            safe_cat_id = catalog.id.replace(":", "_").replace("/", "_")
+            scale_out = work_dir / f"sweep_{safe_cat_id}.jsonl"
             scale_config = effective_config.model_copy(
                 update={
                     "study": effective_config.study.model_copy(
@@ -798,7 +822,7 @@ def run_scaling_sweep(
                             "rescope": True,
                             "partial": True,
                             "workdir": work_dir,
-                            "out": None,
+                            "out": scale_out,
                         }
                     ),
                     "catalog": effective_config.catalog.model_copy(
@@ -830,6 +854,7 @@ def run_scaling_sweep(
                 allow_truncation=True,
                 append_across_arms=True,
                 workers=workers,
+                outcome_cache=shared_outcome_cache,
             )
 
             point, decomp = _build_scaling_point(

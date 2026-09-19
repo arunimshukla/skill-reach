@@ -149,6 +149,10 @@ def _view(
 ) -> int:
     """Read back a recorded run and render what it measured."""
     target_artifact = artifact or Path(".reach/eval.json")
+    if artifact is None and not target_artifact.is_file():
+        alt_artifact = Path(".reach/queries.json.artifact.json")
+        if alt_artifact.is_file():
+            target_artifact = alt_artifact
     if not target_artifact.is_file():
         msg = (
             f"No evaluation artifact found at {target_artifact}.\n\n"

@@ -140,7 +140,7 @@ def confirm_skill_execution(
         return 0
 
     # Fail-closed in non-interactive (non-TTY) environments
-    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+    if not (sys.stdin.isatty() and (sys.stderr.isatty() or sys.stdout.isatty())):
         sys.stderr.write(
             f"Error: Confirmation required to probe skills with runtime '{runtime_name}' "
             "in a non-interactive environment.\n"
@@ -170,7 +170,8 @@ def confirm_skill_execution(
     console.print(panel)
 
     try:
-        response = input(f"Proceed with {action}? [y/N]: ").strip().lower()
+        console.print(f"Proceed with {action}? [y/N]: ", end="")
+        response = input().strip().lower()
         if response in ("y", "yes"):
             return 0
         console.print("[dim]Aborted.[/dim]")

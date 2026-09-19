@@ -941,6 +941,93 @@ def test_antigravity_validation_error_stub_is_exception_subclass() -> None:
     assert issubclass(AntigravityValidationError, Exception)
 
 
+def test_select_async_hook_records_skill_when_early_exit_false_and_allows_view_file(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Verify _on_tool_call records trajectory when early_exit=False and allows view_file."""
+    rt = AntigravitySdkRuntime(
+        options=AntigravitySdkOptions(
+            model="test-model",
+            early_exit=False,
+            allowed_tools=("finish", "view_file"),
+        ),
+    )
+    rt._resident = ("gke-basics", "cloud-run-basics")
+    config = rt._select_config(tmp_path / "work")
+    assert config.capabilities is not None
+    assert config.capabilities.enabled_tools is not None
+    assert len(config.capabilities.enabled_tools) == 2
+
+    instances = _fake_agent(
+        monkeypatch,
+        _FakeResponse(
+            structured={"selected_skill": "gke-basics"},
+            tool_calls=[
+                ag_types.ToolCall(
+                    name="view_file",
+                    args={"path": "/workspace/.agents/skills/gke-basics/SKILL.md"},
+                )
+            ],
+        ),
+    )
+    outcome = rt.select("how to setup", tmp_path / "work", target_skill="gke-basics")
+    assert outcome.error is None
+    assert outcome.invoked_skill == "gke-basics"
+    hook_fn = instances[0].config.hooks[0]
+    res = asyncio.run(
+        hook_fn(
+            ag_types.ToolCall(
+                name="view_file",
+                args={"path": "/workspace/.agents/skills/gke-basics/SKILL.md"},
+            )
+        )
+    )
+    assert res.allow is True
+
+
+@pytest.mark.parametrize(
+    ("max_turns", "early_exit", "allowed_tools", "expect_multi_turn"),
+    [
+        pytest.param(3, True, (), False, id="default-early-exit-uses-selection-tools"),
+        pytest.param(1, False, (), False, id="single-turn-uses-selection-tools"),
+        pytest.param(
+            3, False, (), True, id="multi-turn-trajectory-uses-multi-turn-selection-tools"
+        ),
+        pytest.param(
+            3, False, ("finish",), False, id="explicit-allowed-tools-overrides-multi-turn"
+        ),
+    ],
+)
+def test_select_config_multi_turn_selection_tools(
+    tmp_path: Path,
+    max_turns: int,
+    early_exit: bool,
+    allowed_tools: tuple[str, ...],
+    expect_multi_turn: bool,
+) -> None:
+    """Verify _select_config enables MULTI_TURN_SELECTION_TOOLS when max_turns > 1."""
+    from reach.runtime.antigravity_sdk import MULTI_TURN_SELECTION_TOOLS, SELECTION_TOOLS
+
+    assert len(MULTI_TURN_SELECTION_TOOLS) > len(SELECTION_TOOLS)
+    rt = AntigravitySdkRuntime(
+        options=AntigravitySdkOptions(
+            model="test-model",
+            max_turns=max_turns,
+            early_exit=early_exit,
+            allowed_tools=allowed_tools,
+        ),
+    )
+    rt._resident = ("gke-basics",)
+    config = rt._select_config(tmp_path / "work")
+    assert config.capabilities is not None
+    assert config.capabilities.enabled_tools is not None
+    if expect_multi_turn:
+        assert tuple(config.capabilities.enabled_tools) == MULTI_TURN_SELECTION_TOOLS
+    else:
+        assert tuple(config.capabilities.enabled_tools) == SELECTION_TOOLS
+
+
 @pytest.mark.parametrize(
     ("model_name", "expected_thinking"),
     [

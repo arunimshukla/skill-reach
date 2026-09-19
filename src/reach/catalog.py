@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import contextlib
+import functools
 import hashlib
 import json
 import math
@@ -88,20 +89,32 @@ def _is_set(value: object) -> bool:
 _SKILL_TOOL_PATTERN = re.compile(r"Skill\(\s*([a-z0-9_-]+)\s*\)", re.IGNORECASE)
 
 
+@functools.lru_cache(maxsize=512)
+def _find_manifest_for_dir(directory: Path, _mtime_ns: int) -> Path | None:
+    """Recursively search upward from directory for skills.json or skills-lock.json."""
+    for candidate in ("skills.json", "skills-lock.json"):
+        manifest = directory / candidate
+        if manifest.is_file():
+            return manifest
+    if (directory / ".git").exists() or directory == directory.parent:
+        return None
+    parent = directory.parent
+    try:
+        parent_mtime = parent.stat().st_mtime_ns
+    except OSError:
+        parent_mtime = 0
+    return _find_manifest_for_dir(parent, parent_mtime)
+
+
 def find_skill_manifest(skill_path: Path) -> Path | None:
     """Traverse upward from SKILL.md or directory to locate nearest skills.json or lockfile."""
     resolved = resolve_path(skill_path)
     current = resolved if resolved.is_dir() else resolved.parent
-
-    while current != current.parent:
-        for candidate in ("skills.json", "skills-lock.json"):
-            manifest = current / candidate
-            if manifest.is_file():
-                return manifest
-        if (current / ".git").exists():
-            break
-        current = current.parent
-    return None
+    try:
+        mtime_ns = current.stat().st_mtime_ns
+    except OSError:
+        mtime_ns = 0
+    return _find_manifest_for_dir(current, mtime_ns)
 
 
 def _extract_allowed_skills(raw_allowed: object) -> tuple[str, ...]:
@@ -141,28 +154,39 @@ def _extract_declared_dependencies(
     return tuple(sorted(deps))
 
 
+@functools.lru_cache(maxsize=256)
+def _load_manifest_json(manifest_path: Path, _mtime_ns: int) -> dict[str, Any] | None:
+    """Load and cache parsed JSON dictionary from a manifest file."""
+    try:
+        data = json.loads(manifest_path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else None
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
 def _resolve_manifest_source(skill_name: str, manifest_path: Path | None) -> str | None:
     """Extract package source or identifier from a resolved manifest or lockfile."""
     if manifest_path is None or not manifest_path.is_file():
         return None
     try:
-        data = json.loads(manifest_path.read_text(encoding="utf-8"))
-        if not isinstance(data, dict):
-            return None
-        if manifest_path.name == "skills-lock.json":
-            skills = data.get("skills")
-            if isinstance(skills, dict):
-                info = skills.get(skill_name)
-                if isinstance(info, dict):
-                    src = info.get("source")
-                    if isinstance(src, str) and src:
-                        return src
-        elif manifest_path.name == "skills.json":
-            name = data.get("name")
-            if isinstance(name, str) and name:
-                return name
-    except (OSError, json.JSONDecodeError):
+        mtime_ns = manifest_path.stat().st_mtime_ns
+    except OSError:
         return None
+    data = _load_manifest_json(manifest_path, mtime_ns)
+    if not isinstance(data, dict):
+        return None
+    if manifest_path.name == "skills-lock.json":
+        skills = data.get("skills")
+        if isinstance(skills, dict):
+            info = skills.get(skill_name)
+            if isinstance(info, dict):
+                src = info.get("source")
+                if isinstance(src, str) and src:
+                    return src
+    elif manifest_path.name == "skills.json":
+        name = data.get("name")
+        if isinstance(name, str) and name:
+            return name
     return None
 
 
@@ -473,6 +497,21 @@ def resolve_sweep_scales(
     return tuple(scales)
 
 
+def _extend_unique_up_to(
+    target_list: list[str],
+    seen_set: set[str],
+    candidates: Sequence[str],
+    limit: int,
+) -> None:
+    """Append unseen candidate names to target_list until its length reaches limit."""
+    for name in candidates:
+        if len(target_list) >= limit:
+            break
+        if name not in seen_set:
+            seen_set.add(name)
+            target_list.append(name)
+
+
 def build_scaling_catalogs(
     skills: Sequence[Skill],
     target_skill: str,
@@ -492,44 +531,36 @@ def build_scaling_catalogs(
     unique_skills = list(by_name.values())
     target_obj = by_name[target_skill]
     ranker = scorer or Bm25Scorer.from_skills(unique_skills)
-    ranked: list[str] = []
-    seen: set[str] = {target_skill}
-    for name, _ in ranker.rank(target_obj, unique_skills):
-        if name not in seen:
-            seen.add(name)
-            ranked.append(name)
+    ranked = [name for name, _ in ranker.rank(target_obj, unique_skills) if name != target_skill]
 
-    catalogs = []
-    for k in scales:
+    rng = Random(f"{seed}:{target_skill}")  # noqa: S311 (deterministic benchmark sampling)
+    filler_order = list(ranked)
+    rng.shuffle(filler_order)
+
+    unique_sorted_scales = sorted({max(1, k) for k in scales})
+    chosen_by_scale: dict[int, tuple[str, ...]] = {}
+    current_chosen: list[str] = [target_skill]
+    current_set: set[str] = {target_skill}
+
+    for k in unique_sorted_scales:
         if k <= 1:
-            catalogs.append(
-                Catalog(
-                    id=f"sweep:{target_skill}:1",
-                    mode=CatalogMode.SWEEP,
-                    skills=(target_skill,),
-                    target=target_skill,
-                )
-            )
+            chosen_by_scale[k] = (target_skill,)
             continue
 
         r = max(1, round((k - 1) * rivals_share))
-        chosen = [target_skill, *ranked[:r]]
+        _extend_unique_up_to(current_chosen, current_set, ranked[:r], k)
+        _extend_unique_up_to(current_chosen, current_set, filler_order, k)
+        chosen_by_scale[k] = tuple(sorted(current_chosen[:k]))
 
-        rng = Random(f"{seed}:{target_skill}:{k}")  # noqa: S311 (deterministic benchmark sampling)
-        chosen_set = set(chosen)
-        pool = [s for s in ranked[r:] if s not in chosen_set]
-        rng.shuffle(pool)
-        chosen.extend(pool[: max(0, k - len(chosen))])
-
-        catalogs.append(
-            Catalog(
-                id=f"sweep:{target_skill}:{k}",
-                mode=CatalogMode.SWEEP,
-                skills=tuple(sorted(chosen)),
-                target=target_skill,
-            )
+    return [
+        Catalog(
+            id=f"sweep:{target_skill}:{max(1, raw_k)}",
+            mode=CatalogMode.SWEEP,
+            skills=chosen_by_scale[max(1, raw_k)],
+            target=target_skill,
         )
-    return catalogs
+        for raw_k in scales
+    ]
 
 
 def deduplicate_skills(skills: Sequence[Skill]) -> list[Skill]:

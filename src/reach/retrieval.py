@@ -370,6 +370,7 @@ class DenseScorer(BaseModel):
     mode: str = "cosine"
 
     _unit_vectors: dict[str, EmbeddingVector] = PrivateAttr(default_factory=dict)
+    _text_vectors: dict[str, list[float]] = PrivateAttr(default_factory=dict)
 
     @override
     def model_post_init(self, _context: object) -> None:
@@ -379,6 +380,7 @@ class DenseScorer(BaseModel):
             "_unit_vectors",
             {name: _unit_vector(vec) for name, vec in self.vectors.items()},
         )
+        object.__setattr__(self, "_text_vectors", {})
 
     @classmethod
     def from_skills(
@@ -498,14 +500,19 @@ class DenseScorer(BaseModel):
             return []
         if text in self.vectors:
             return self.vectors[text]
+        cached = self._text_vectors.get(text)
+        if cached is not None:
+            return cached
         try:
             model = _load_model2vec_model(self.model_name)
             query_vec = model.encode([text])[0]
-            return (
+            vec_list = (
                 query_vec.tolist()
                 if hasattr(query_vec, "tolist")
                 else [float(x) for x in query_vec]
             )
+            self._text_vectors[text] = vec_list
+            return vec_list
         except (RuntimeError, ValueError, TypeError, AttributeError):
             return []
 

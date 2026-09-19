@@ -259,11 +259,25 @@ function updateCardRival(select) {
 function exportEvalSetJson() {
   const queries = getRows();
   const targetSkill = getTargetSkill();
-  const data = queries.map((q) => ({
-    query: q.text,
-    should_trigger: q.expected_skill === targetSkill,
-    expected_skill: q.expected_skill,
-  }));
+  const catalogId = document.body.dataset.catalogId || `neighborhood:${targetSkill}`;
+  const origin = document.body.dataset.origin || 'authored';
+  const data = {
+    catalog_id: catalogId,
+    provenance: {
+      origin: origin,
+      source: `eval_set_${targetSkill}.json`,
+    },
+    queries: queries.map((q, idx) => ({
+      id: `q-${String(idx + 1).padStart(3, '0')}`,
+      text: q.text,
+      kind: !q.expected_skill
+        ? 'out_of_scope'
+        : q.expected_skill === targetSkill
+          ? 'implicit'
+          : 'neighbor_negative',
+      expected_skill: q.expected_skill,
+    })),
+  };
   const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');

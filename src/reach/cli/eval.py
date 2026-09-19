@@ -272,6 +272,15 @@ def _adjust_eval_catalog_mode(
     return settings
 
 
+def _default_reach_dir(study: StudyFlags) -> Path:
+    """Resolve the default .reach directory anchored to study.skills or CWD."""
+    if study.skills is not None:
+        skills_path = Path(study.skills)
+        base = skills_path.parent if skills_path.name == "SKILL.md" else skills_path
+        return base / ".reach"
+    return Path(".reach")
+
+
 def _apply_execution_mode_defaults(
     *,
     quick: QuickEval | None,
@@ -291,12 +300,9 @@ def _apply_execution_mode_defaults(
         if not generate.targets:
             generate = generate.model_copy(update={"targets": (quick.target,)})
     elif auto and scratch is not None:
-        default_queries = Path(".reach/queries.json")
+        default_queries = _default_reach_dir(study) / "queries.json"
         if study.queries is None:
-            if default_queries.is_file():
-                study = study.model_copy(update={"queries": default_queries})
-            else:
-                study = study.model_copy(update={"queries": scratch / "queries.json"})
+            study = study.model_copy(update={"queries": default_queries})
         if study.workdir is None:
             study = study.model_copy(update={"workdir": scratch / "workspace"})
     elif run_dir is not None:
@@ -322,9 +328,9 @@ def _validate_queries_available(
     """Ensure benchmark queries exist or raise a user-friendly instructional error."""
     if quick is not None or auto or config is not None or study.queries is not None:
         return study
-    default_queries = Path(".reach/queries.json")
-    if default_queries.is_file():
-        return study.model_copy(update={"queries": default_queries})
+    for candidate in (_default_reach_dir(study) / "queries.json", Path(".reach/queries.json")):
+        if candidate.is_file():
+            return study.model_copy(update={"queries": candidate})
 
     corpus_hint = f" --skills {study.skills}" if study.skills is not None else ""
     msg = (
@@ -825,6 +831,15 @@ def _probe_query_set(
     measured = outcome.artifact(roots=roots, contested=contested)
     destination = _artifact_destination(settings, out, bank=bank)
     written = write_artifact(measured, destination) if destination is not None else None
+    if (
+        written is not None
+        and out is None
+        and settings.study.out is None
+        and destination is not None
+        and destination.name == "queries.json.artifact.json"
+        and destination.parent.name == ".reach"
+    ):
+        write_artifact(measured, destination.parent / "eval.json")
     if format in ("json", "jsonl", "csv"):
         print(render(measured, format), end="" if format == "jsonl" else "\n")
         return 0

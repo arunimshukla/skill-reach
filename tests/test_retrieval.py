@@ -384,3 +384,25 @@ def test_hybrid_scorer_rank_text() -> None:
     assert len(ranked) == 2
     assert ranked[0][0] == "pdf-parser"
     assert ranked[1][0] == "image-editor"
+
+
+def test_dense_scorer_memoizes_query_text_vectors(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify DenseScorer caches dynamic query text embeddings across repeated rank_text calls."""
+    import reach.retrieval as retrieval_mod
+
+    encode_calls: list[list[str]] = []
+
+    class _FakeModel:
+        def encode(self, texts: list[str]) -> list[list[float]]:
+            encode_calls.append(list(texts))
+            return [[1.0, 0.5, 0.0] for _ in texts]
+
+    monkeypatch.setattr(retrieval_mod, "_load_model2vec_model", lambda _name: _FakeModel())
+    cand = _make_skill("pdf-parser", "Extract tables from PDF files.")
+    scorer = DenseScorer(vectors={"pdf-parser": [1.0, 0.5, 0.0]})
+
+    scorer.rank_text("parse my invoice pdf", [cand])
+    scorer.rank_text("parse my invoice pdf", [cand])
+    scorer.score_query("parse my invoice pdf", cand)
+
+    assert len(encode_calls) == 1

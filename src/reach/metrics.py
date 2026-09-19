@@ -77,10 +77,10 @@ def classify_invocation_pattern(
         )
     if not invoked:
         return InvocationPattern.ABANDONED
-    target = query.expected_skill
-    if set(invoked) == {target}:
+    valid_targets = query.valid_skills
+    if set(invoked) <= valid_targets:
         return InvocationPattern.ORACLE_ONLY
-    if target in invoked:
+    if set(invoked) & valid_targets:
         return InvocationPattern.MIXED_ORACLE
     return InvocationPattern.DISTRACTOR_HIJACK
 
@@ -107,9 +107,8 @@ def score_trajectory(
     query: Query,
     invoked_skills: Sequence[str],
 ) -> TrajectoryScore:
-    """Evaluate an observed skill trajectory against query target skill."""
+    """Evaluate an observed skill trajectory against query target skill and acceptable skills."""
     invoked_seq = tuple(invoked_skills)
-    target = query.truth_label
 
     if query.is_out_of_scope:
         abstained = len(invoked_seq) == 0
@@ -121,17 +120,20 @@ def score_trajectory(
             redundancy=len(invoked_seq),
         )
 
+    valid_targets = query.valid_skills
     invoked_set = set(invoked_seq)
-    entry_hit = bool(invoked_seq and invoked_seq[0] == target)
-    traj_hit = target in invoked_set
+    entry_hit = bool(invoked_seq and invoked_seq[0] in valid_targets)
+    traj_hit = bool(invoked_set & valid_targets)
 
     first_rank = next(
-        (i + 1 for i, s in enumerate(invoked_seq) if s == target),
+        (i + 1 for i, s in enumerate(invoked_seq) if s in valid_targets),
         None,
     )
     mrr = (1.0 / first_rank) if first_rank else 0.0
 
-    prec = (1.0 / len(invoked_set)) if (traj_hit and invoked_set) else 0.0
+    prec = (
+        (len(invoked_set & valid_targets) / len(invoked_set)) if (traj_hit and invoked_set) else 0.0
+    )
     rec = 1.0 if traj_hit else 0.0
     f1 = (2 * prec * rec) / (prec + rec) if (prec + rec) else 0.0
 
@@ -330,7 +332,7 @@ def labeled_pairs(
     pairs = _paired(results, queries)
     return (
         [query.truth_label for query, _ in pairs],
-        [result.predicted_label for _, result in pairs],
+        [query.effective_predicted_label(result.predicted_label) for query, result in pairs],
     )
 
 
@@ -410,7 +412,7 @@ def classification_report(
     """Generate a comprehensive classification report across all probe results."""
     pairs = _paired(results, queries)
     y_true = [q.truth_label for q, _ in pairs]
-    y_pred = [r.predicted_label for _, r in pairs]
+    y_pred = [q.effective_predicted_label(r.predicted_label) for q, r in pairs]
     universe = _label_universe(y_true, y_pred, labels)
     per_class = _build_per_class(y_true, y_pred, universe)
     precision, recall, f1 = _macro_averages(per_class)
@@ -449,9 +451,25 @@ def trajectory_scores(
     results: Sequence[ProbeResult],
     queries: Sequence[Query],
 ) -> dict[str, TrajectoryScore]:
-    """Return mapping of query_id to its TrajectoryScore."""
+    """Return mapping of query_id to its aggregated TrajectoryScore across replicates."""
     pairs = _paired(results, queries)
-    return {q.id: score_trajectory(q, r.invoked_skills) for q, r in pairs}
+    by_query: dict[str, list[TrajectoryScore]] = defaultdict(list)
+    for q, r in pairs:
+        by_query[q.id].append(score_trajectory(q, r.invoked_skills))
+
+    aggregated: dict[str, TrajectoryScore] = {}
+    for q_id, scores in by_query.items():
+        if len(scores) == 1:
+            aggregated[q_id] = scores[0]
+        else:
+            aggregated[q_id] = TrajectoryScore(
+                entrypoint_hit=sum(1 for s in scores if s.entrypoint_hit) * 2 >= len(scores),
+                trajectory_hit=sum(1 for s in scores if s.trajectory_hit) * 2 >= len(scores),
+                step_efficiency=round(_mean([s.step_efficiency for s in scores]), 4),
+                skill_f1=round(_mean([s.skill_f1 for s in scores]), 4),
+                redundancy=round(_mean([float(s.redundancy) for s in scores])),
+            )
+    return aggregated
 
 
 def consistency_counts(
@@ -486,7 +504,14 @@ def confusion(
         query = truth.get(result.query_id)
         if query is None:
             continue
-        pairs[(query.truth_label, result.invoked_skill)] += 1
+        effective_invoked = (
+            query.expected_skill
+            if (
+                result.invoked_skill is not None and result.invoked_skill in query.acceptable_skills
+            )
+            else result.invoked_skill
+        )
+        pairs[(query.truth_label, effective_invoked)] += 1
     return pairs
 
 
@@ -504,7 +529,7 @@ def collisions(
         if (
             query is None
             or result.invoked_skill is None
-            or result.invoked_skill == query.truth_label
+            or query.matches_skill(result.invoked_skill)
         ):
             continue
         pairs[(query.truth_label, result.invoked_skill)] += 1

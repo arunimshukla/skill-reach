@@ -448,8 +448,22 @@ class RunOutcome(BaseModel):
         )
 
 
+class _ProbeOutcomeCacheKey(BaseModel):
+    """Identify a content-addressed probe outcome by resident skills and query."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    runtime_name: str
+    runtime_model: str
+    resident_skills: tuple[str, ...]
+    query_id: str
+    query_text: str
+    expected_skill: str | None = None
+    attempt: int = 1
+
+
 class ProbeHarness:
-    """Coordinate workspace preparation, probe execution, retries, and persistence."""
+    """Coordinate concurrent probe attempts, retries, and result streaming."""
 
     def __init__(
         self,
@@ -460,6 +474,8 @@ class ProbeHarness:
         backoff_s: float = 5.0,
         pause_s: float = 0.0,
         sleep: Callable[[float], None] = time.sleep,
+        cache_outcomes: bool = True,
+        outcome_cache: dict[_ProbeOutcomeCacheKey, Any] | None = None,
     ) -> None:
         """Initialize probe harness with runtime driver and execution options."""
         self.runtime = runtime
@@ -468,6 +484,11 @@ class ProbeHarness:
         self.backoff_s = backoff_s
         self.pause_s = pause_s
         self.sleep = sleep
+        self.cache_outcomes = cache_outcomes and runtime.name != "fake"
+        self._cache_lock = threading.Lock()
+        self._outcome_cache: dict[_ProbeOutcomeCacheKey, Any] = (
+            outcome_cache if outcome_cache is not None else {}
+        )
 
     def probe(
         self,
@@ -480,19 +501,40 @@ class ProbeHarness:
         fit: CatalogFit | None = None,
     ) -> ProbeResult:
         """Execute a single query probe attempt with catalog residency validation."""
-        try:
+        elided = frozenset(fit.elided_skills) if fit is not None else frozenset()
+        resident = tuple(s for s in catalog.skills if s not in elided)
+        cache_key = _ProbeOutcomeCacheKey(
+            runtime_name=self.runtime.name,
+            runtime_model=self.runtime.model,
+            resident_skills=resident,
+            query_id=query.id,
+            query_text=query.text,
+            expected_skill=query.expected_skill,
+            attempt=attempt,
+        )
+        outcome = None
+        if self.cache_outcomes:
+            with self._cache_lock:
+                outcome = self._outcome_cache.get(cache_key)
+
+        if outcome is None:
             try:
-                outcome = self.runtime.select(
-                    query.text, workdir, target_skill=query.expected_skill
+                try:
+                    outcome = self.runtime.select(
+                        query.text, workdir, target_skill=query.expected_skill
+                    )
+                except TypeError:
+                    outcome = self.runtime.select(query.text, workdir)
+            except Exception as err:
+                err.add_note(
+                    f"Reach probe execution context: query_id={query.id!r}, "
+                    f"attempt={attempt}, catalog_id={catalog.id!r}, runtime={self.runtime.name!r}"
                 )
-            except TypeError:
-                outcome = self.runtime.select(query.text, workdir)
-        except Exception as err:
-            err.add_note(
-                f"Reach probe execution context: query_id={query.id!r}, "
-                f"attempt={attempt}, catalog_id={catalog.id!r}, runtime={self.runtime.name!r}"
-            )
-            raise
+                raise
+            if self.cache_outcomes and not getattr(outcome, "error", None):
+                with self._cache_lock:
+                    self._outcome_cache[cache_key] = outcome
+
         is_dyn = getattr(self.runtime, "is_dynamic", False)
         error = outcome.error or validate_residency(
             catalog, outcome.observed_catalog, dynamic=is_dyn
@@ -674,6 +716,7 @@ def conduct(
     allow_truncation: bool = False,
     composed: Composition | None = None,
     workers: int = 1,
+    outcome_cache: dict[_ProbeOutcomeCacheKey, Any] | None = None,
 ) -> RunOutcome:
     """Execute an evaluation run end-to-end and return the full RunOutcome."""
     resolved_runtime = runtime or build_runtime(config.runtime)
@@ -684,6 +727,7 @@ def conduct(
         retries=config.plan.retries,
         backoff_s=config.plan.backoff_s,
         pause_s=config.plan.pause_s,
+        outcome_cache=outcome_cache,
     )
     return harness.run(
         composition,

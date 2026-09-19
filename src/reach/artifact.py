@@ -785,7 +785,7 @@ def _query_records(
                 kind=query.kind,
                 expected=query.truth_label,
                 probes=len(usable),
-                hits=sum(1 for row in usable if row.predicted_label == query.truth_label),
+                hits=sum(1 for row in usable if query.matches_skill(row.invoked_skill)),
                 selections=tuple(sorted({row.predicted_label for row in usable})),
                 difficulty_rank=(rank.position if (rank := ranks.get(query.id)) else None),
                 leak=flags.get(query.id),

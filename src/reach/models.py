@@ -181,6 +181,25 @@ class Query(BaseModel):
         """Return expected skill name or NO_SKILL sentinel for out-of-scope queries."""
         return self.expected_skill if self.expected_skill is not None else NO_SKILL
 
+    @property
+    def valid_skills(self) -> frozenset[str]:
+        """Return all valid target skill names (expected_skill plus acceptable_skills)."""
+        if self.expected_skill is None:
+            return frozenset()
+        return frozenset((self.expected_skill, *self.acceptable_skills))
+
+    def matches_skill(self, invoked: str | None) -> bool:
+        """Check whether an invoked skill satisfies expected_skill or acceptable_skills."""
+        if self.expected_skill is None:
+            return invoked is None
+        return invoked is not None and invoked in self.valid_skills
+
+    def effective_predicted_label(self, predicted_label: str) -> str:
+        """Normalize an acceptable secondary skill selection to truth_label for scoring."""
+        if self.expected_skill is not None and predicted_label in self.acceptable_skills:
+            return self.truth_label
+        return predicted_label
+
 
 class Catalog(BaseModel):
     """Represent a collection of resident skills presented during a probe execution."""

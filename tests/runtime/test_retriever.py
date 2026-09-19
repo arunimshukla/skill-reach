@@ -145,3 +145,96 @@ def test_retriever_runtime_with_dense_scorer(tmp_path: Path) -> None:
     outcome = runtime.select("query", workdir)
     assert len(outcome.observed_catalog) == 2
     assert outcome.observed_catalog[0] == "cloud-tool-00"
+
+
+def test_retriever_runtime_concurrent_stateful_inner_isolation(tmp_path: Path) -> None:
+    """Verify concurrent threads do not clobber inner._resident or KeywordRuntime regex state."""
+    from reach.runtime.keyword import KeywordRuntime
+
+    skills = _make_skills(tmp_path / "skills", 12)
+    catalog = Catalog(id="all-12", mode=CatalogMode.ALL, skills=tuple(s.name for s in skills))
+
+    inner = KeywordRuntime()
+    runtime = TwoStageRetrieverRuntime(inner, top_k=2)
+
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+    runtime.install(catalog, skills, workdir)
+
+    def _worker(idx: int) -> tuple[str | None, tuple[str, ...]]:
+        target_name = f"cloud-tool-{idx % 12:02d}"
+        outcome = runtime.select(f"please use {target_name}", workdir)
+        return outcome.invoked_skill, outcome.observed_catalog
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
+        futures = {executor.submit(_worker, i): f"cloud-tool-{i % 12:02d}" for i in range(24)}
+        for fut, expected_skill in futures.items():
+            invoked, observed = fut.result()
+            assert expected_skill in observed
+            assert invoked == expected_skill
+
+    runtime.cleanup()
+
+
+def test_two_stage_retriever_caches_identical_subcatalog_across_scales(tmp_path: Path) -> None:
+    """Verify Stage-2 outcomes are cached across scales via Pydantic _RetrieverStage2CacheKey."""
+    from pydantic import BaseModel
+
+    from reach.runtime import SelectionOutcome
+    from reach.runtime.keyword import KeywordRuntime
+    from reach.runtime.retriever import _RetrieverStage2CacheKey
+
+    assert issubclass(_RetrieverStage2CacheKey, BaseModel)
+
+    skills = _make_skills(tmp_path / "skills", 10)
+    call_count = 0
+
+    class CountingKeywordRuntime(KeywordRuntime):
+        def clone_isolated(self) -> CountingKeywordRuntime:
+            clone = CountingKeywordRuntime()
+            clone._resident = self._resident
+            return clone
+
+        def select(
+            self,
+            query_text: str,
+            workdir: Path,
+            target_skill: str | None = None,
+        ) -> SelectionOutcome:
+            nonlocal call_count
+            call_count += 1
+            return super().select(query_text, workdir, target_skill=target_skill)
+
+    runtime = TwoStageRetrieverRuntime(inner=CountingKeywordRuntime(), top_k=3)
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+
+    # Scale 1: first 5 skills
+    cat_5 = Catalog(
+        id="scale-5",
+        mode=CatalogMode.ALL,
+        skills=tuple(s.name for s in skills[:5]),
+    )
+    runtime.install(cat_5, skills[:5], workdir)
+    out1 = runtime.select("please use cloud-tool-00", workdir)
+    assert out1.invoked_skill == "cloud-tool-00"
+    assert call_count == 1
+
+    # Replicate attempt within same scale (attempt 2) MUST invoke inner runtime independently
+    out1_rep2 = runtime.select("please use cloud-tool-00", workdir)
+    assert out1_rep2.invoked_skill == "cloud-tool-00"
+    assert call_count == 2
+
+    # Scale 2: all 10 skills; top-3 BM25 for "cloud-tool-00" is identical, so attempts hit cache!
+    cat_10 = Catalog(
+        id="scale-10",
+        mode=CatalogMode.ALL,
+        skills=tuple(s.name for s in skills),
+    )
+    runtime.install(cat_10, skills, workdir)
+    out2 = runtime.select("please use cloud-tool-00", workdir)
+    out2_rep2 = runtime.select("please use cloud-tool-00", workdir)
+    assert out2.invoked_skill == "cloud-tool-00"
+    assert out2_rep2.invoked_skill == "cloud-tool-00"
+    assert call_count == 2
+    runtime.cleanup()

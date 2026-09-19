@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterable, Mapping, Sequence
-from typing import TYPE_CHECKING, Any, override
+from typing import TYPE_CHECKING, Any, Self, override
 
 from pydantic import Field
 
@@ -77,6 +77,14 @@ class KeywordRuntime(AgentRuntime[KeywordOptions]):
         """Precompute normalized term mapping and compiled regex for fast matching."""
         self._resident = tuple(resident)
         self._pattern, self._term_to_skill = _compile_term_matcher(self._resident)
+
+    @override
+    def clone_isolated(self) -> Self:
+        """Create a thread-local isolated clone with fresh regex and term map state."""
+        clone = super().clone_isolated()
+        clone._pattern = None  # noqa: SLF001
+        clone._term_to_skill = {}  # noqa: SLF001
+        return clone
 
     def match_skill(self, text: str, resident: Sequence[str] = ()) -> str | None:
         """Find the first matching resident skill mentioned in the given text."""

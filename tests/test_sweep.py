@@ -24,6 +24,7 @@ from reach.catalog import resolve_sweep_scales
 from reach.config import CatalogSettings, PlanSettings, RunConfig, StudySettings
 from reach.models import CatalogMode, Query, QueryKind, Skill
 from reach.queries import Origin, QuerySet, QuerySetProvenance, save_query_set
+from reach.runtime import SelectionOutcome
 from reach.runtime.fake import FakeRuntime
 from reach.sweep import (
     ScalingPoint,
@@ -723,3 +724,136 @@ def test_scaling_sweep_does_not_skip_probes_when_out_path_configured(tmp_path: P
     assert len(study.points) == 2
     assert study.points[0].probes_executed == 2
     assert study.points[1].probes_executed == 2
+
+
+@pytest.mark.parametrize(
+    ("scales", "rates", "expected_knee"),
+    [
+        pytest.param((1, 10, 100), (0.50, 0.80, 0.95), None, id="rising-curve"),
+        pytest.param((1, 10, 100), (1.0, 0.749, 0.50), None, id="straight-log-linear-wiggle"),
+        pytest.param((1, 10, 100), (0.95, 0.92, 0.88), None, id="drop-below-0.10-noise-floor"),
+        pytest.param((1, 10, 100), (1.0, 0.96, 0.60), 10, id="genuine-knee-above-0.10-drop"),
+    ],
+)
+def test_find_kneedle_knee_behavior(
+    scales: tuple[int, ...],
+    rates: tuple[float, ...],
+    expected_knee: int | None,
+) -> None:
+    """Verify find_kneedle_knee enforces MIN_KNEE_DROP=0.10 and rejects non-falling curves."""
+    assert find_kneedle_knee(scales, rates) == expected_knee
+
+
+@pytest.mark.parametrize(
+    ("f1_values", "expected_discrete", "expected_interp_bounds"),
+    [
+        pytest.param(
+            [(10, 0.95), (25, 0.82), (50, 0.91)],
+            10,
+            (10.0, 25.0),
+            id="downward-crossing-with-late-noise",
+        ),
+        pytest.param(
+            [(10, 0.75), (25, 0.92), (50, 0.95)],
+            50,
+            (10.0, 25.0),
+            id="upward-recovery-crossing",
+        ),
+    ],
+)
+def test_compute_sla_crossings_interpolation(
+    f1_values: list[tuple[int, float]],
+    expected_discrete: int | None,
+    expected_interp_bounds: tuple[float, float],
+) -> None:
+    """Verify compute_sla_crossings interpolates crossings via _log_interpolate_scale."""
+    from reach.sweep import _log_interpolate_scale, compute_sla_crossings
+
+    def _pt(scale: int, f1: float) -> ScalingPoint:
+        return ScalingPoint(
+            scale=scale,
+            catalog_id=f"sweep:corpus:{scale}",
+            pass_rate=f1,
+            pass_rate_interval=(0.0, 1.0),
+            f1_score=f1,
+            delta_vs_baseline=0.0,
+            delta_context=0.0,
+            delta_shadowing=0.0,
+            probes_executed=10,
+        )
+
+    points = [_pt(s, f1) for s, f1 in f1_values]
+    discrete_k, interp_k = compute_sla_crossings(points, threshold=0.90)
+    assert discrete_k == expected_discrete
+    assert interp_k is not None
+    assert expected_interp_bounds[0] <= interp_k < expected_interp_bounds[1]
+    assert _log_interpolate_scale(points[0], points[1], 0.90) == interp_k
+
+
+def test_run_scaling_sweep_shares_probe_harness_cache_across_identical_scales(
+    tmp_path: Path,
+) -> None:
+    """Verify ProbeHarness uses Pydantic _ProbeOutcomeCacheKey and shares cache across scales."""
+    from pydantic import BaseModel
+
+    from reach.run import _ProbeOutcomeCacheKey
+    from reach.runtime.keyword import KeywordRuntime
+
+    assert issubclass(_ProbeOutcomeCacheKey, BaseModel)
+
+    from reach.catalog import load_skills
+
+    skills_dir = tmp_path / "skills"
+    _create_mock_skills(skills_dir, 3)
+    skills = list(load_skills(skills_dir))
+    qs = QuerySet(
+        catalog_id="in-memory",
+        queries=(
+            Query(
+                id="q0",
+                text="please run skill-00",
+                kind=QueryKind.IMPLICIT,
+                expected_skill="skill-00",
+            ),
+        ),
+        provenance=QuerySetProvenance(origin=Origin.AUTHORED),
+    )
+
+    select_calls = 0
+
+    class CountingKeywordRuntime(KeywordRuntime):
+        def select(
+            self, query_text: str, workdir: Path, target_skill: str | None = None
+        ) -> SelectionOutcome:
+            nonlocal select_calls
+            select_calls += 1
+            return super().select(query_text, workdir, target_skill=target_skill)
+
+    runtime = CountingKeywordRuntime()
+    from reach.models import Catalog
+    from reach.run import ProbeHarness
+
+    shared_cache: dict = {}
+    cat_a = Catalog(
+        id="scale-3a",
+        mode=CatalogMode.SWEEP,
+        target="skill-00",
+        skills=tuple(s.name for s in skills),
+    )
+    cat_b = Catalog(
+        id="scale-3b",
+        mode=CatalogMode.SWEEP,
+        target="skill-00",
+        skills=tuple(s.name for s in skills),
+    )
+    workdir = tmp_path / "ws"
+    workdir.mkdir()
+    runtime.install(cat_a, skills, workdir)
+    h1 = ProbeHarness(runtime, outcome_cache=shared_cache)
+    res1 = list(h1.run_probes(qs.queries, cat_a, workdir, attempts=1))
+    h2 = ProbeHarness(runtime, outcome_cache=shared_cache)
+    res2 = list(h2.run_probes(qs.queries, cat_b, workdir, attempts=1))
+    assert select_calls == 1
+    assert res1[0].invoked_skills == ("skill-00",)
+    assert res2[0].invoked_skills == ("skill-00",)
+    assert res2[0].catalog_id == "scale-3b"

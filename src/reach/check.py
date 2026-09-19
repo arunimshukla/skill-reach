@@ -40,7 +40,7 @@ from reach.runtime import FAKE_AGENT, AgentRuntime, build_runtime
 from reach.runtime.keyword import KeywordRuntime
 
 if TYPE_CHECKING:
-    from collections.abc import Collection, Mapping, Sequence
+    from collections.abc import Callable, Collection, Mapping, Sequence
 
 #: Pattern matching skill directories or files in git diff output.
 _SKILL_PATH_PATTERN = re.compile(
@@ -260,6 +260,49 @@ def _filter_check_queries(
     return all_queries[:budget], budget_exhausted
 
 
+class _CheckCacheKey(BaseModel):
+    """Represent a deterministic, hashable in-memory cache key for a check probe."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    paths_key: tuple[str, ...]
+    runtime_name: str
+    runtime_model: str | None
+    opts_key: str
+    corpus_digest: str
+    query_id: str
+    query_text: str
+    expected_skill: str | None
+    acceptable_skills: tuple[str, ...]
+
+    @classmethod
+    def for_query(
+        cls,
+        *,
+        paths_key: tuple[str, ...],
+        runtime_name: str,
+        runtime_model: str | None,
+        opts_key: str,
+        corpus_digest: str,
+        query: Query,
+    ) -> _CheckCacheKey:
+        """Construct a frozen cache key for a single Query."""
+        return cls(
+            paths_key=paths_key,
+            runtime_name=runtime_name,
+            runtime_model=runtime_model,
+            opts_key=opts_key,
+            corpus_digest=corpus_digest,
+            query_id=query.id,
+            query_text=query.text,
+            expected_skill=query.expected_skill,
+            acceptable_skills=tuple(sorted(query.acceptable_skills)),
+        )
+
+
+_CHECK_PROBE_CACHE: dict[_CheckCacheKey, ProbeResult] = {}
+
+
 def _execute_empirical_probes(
     queries_to_run: Sequence[Query],
     resolved_paths: Sequence[Path],
@@ -268,33 +311,67 @@ def _execute_empirical_probes(
     config: RunConfig | None,
 ) -> tuple[ClassificationReport, EmpiricalMetrics, int]:
     """Execute probes in an isolated workspace and compute classification metrics."""
+    import json
+
+    from reach.catalog import corpus_digest
+    from reach.run import ProbeHarness
+
     loaded_skills = _load_catalog_skills(resolved_paths)
+    c_digest = corpus_digest(loaded_skills)
+    paths_key = tuple(str(p.resolve()) for p in resolved_paths)
+    opts_key = json.dumps(runtime_options or {}, sort_keys=True)
     catalog = Catalog(
         id="check-catalog",
         skills=tuple(s.name for s in loaded_skills),
         mode=CatalogMode.ALL,
     )
     runtime = _setup_runtime(agent, loaded_skills, runtime_options, config=config)
+    use_cache = runtime.name != FAKE_AGENT
 
-    results: list[ProbeResult] = []
-    with tempfile.TemporaryDirectory() as temp_dir:
-        workdir = Path(temp_dir)
-        runtime.install(catalog, loaded_skills, workdir)
+    def _key_for(query: Query) -> _CheckCacheKey:
+        return _CheckCacheKey.for_query(
+            paths_key=paths_key,
+            runtime_name=runtime.name,
+            runtime_model=runtime.model,
+            opts_key=opts_key,
+            corpus_digest=c_digest,
+            query=query,
+        )
 
-        for query in queries_to_run:
-            try:
-                outcome = runtime.select(query.text, workdir, target_skill=query.expected_skill)
-            except TypeError:
-                outcome = runtime.select(query.text, workdir)
-            results.append(
-                ProbeResult.from_outcome(
-                    outcome=outcome,
-                    query=query,
-                    catalog=catalog,
-                    runtime_name=runtime.name,
-                    model=runtime.model,
+    try:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workdir = Path(temp_dir)
+            fit = runtime.fit(catalog, loaded_skills)
+            cached_by_id: dict[str, ProbeResult] = {}
+            missing_queries: list[Query] = []
+            for q in queries_to_run:
+                key = _key_for(q)
+                if use_cache and key in _CHECK_PROBE_CACHE:
+                    cached_by_id[q.id] = _CHECK_PROBE_CACHE[key]
+                else:
+                    missing_queries.append(q)
+
+            if missing_queries:
+                runtime.install(catalog, loaded_skills, workdir)
+                harness = ProbeHarness(runtime)
+                fresh_results = list(
+                    harness.run_probes(
+                        missing_queries,
+                        catalog,
+                        workdir,
+                        attempts=1,
+                        out_path=None,
+                        fit=fit,
+                    )
                 )
-            )
+                for q, res in zip(missing_queries, fresh_results, strict=True):
+                    cached_by_id[q.id] = res
+                    if use_cache and not res.error:
+                        _CHECK_PROBE_CACHE[_key_for(q)] = res
+
+            results = [cached_by_id[q.id] for q in queries_to_run]
+    finally:
+        runtime.cleanup()
 
     report = classification_report(results, queries_to_run)
     total_triggers = sum(c.true_positives for c in report.per_class if c.label != NO_SKILL)
@@ -303,7 +380,7 @@ def _execute_empirical_probes(
     misroutes = sum(
         1
         for q, r in zip(queries_to_run, results, strict=True)
-        if r.invoked_skill is not None and r.invoked_skill != q.truth_label
+        if r.invoked_skill is not None and not q.matches_skill(r.invoked_skill)
     )
     obs_misroute = misroutes / report.scored if report.scored else 0.0
 
@@ -506,7 +583,7 @@ def run_check(  # noqa: PLR0913
     rule_overrides: Mapping[str, Severity] | None = None,
     runtime_options: dict[str, Any] | None = None,
     global_scope: bool = False,
-    yes: bool = False,
+    confirm_callback: Callable[[str, list[Skill], Sequence[Path]], int] | None = None,
 ) -> CheckOutcome:
     """Execute two-stage quality gate: static lint pre-flight then empirical assertions."""
     if settings is not None:
@@ -578,22 +655,9 @@ def run_check(  # noqa: PLR0913
     from reach.config import default_agent
 
     resolved_agent = agent or (config.runtime.agent if config is not None else default_agent())
-    if resolved_agent not in ("keyword", FAKE_AGENT):
-        from reach.cli.safety import confirm_skill_execution
-        from reach.views import build_console
-
-        console = build_console()
+    if confirm_callback is not None and resolved_agent not in ("keyword", FAKE_AGENT):
         loaded = _load_catalog_skills(resolved_paths)
-        trusted = config.study.trusted if config is not None else False
-        if code := confirm_skill_execution(
-            console,
-            runtime_name=resolved_agent,
-            skills=loaded,
-            roots=resolved_paths,
-            action="check empirical probes",
-            yes=yes,
-            trusted=trusted,
-        ):
+        if code := confirm_callback(resolved_agent, loaded, resolved_paths):
             return CheckOutcome(
                 lint_report=lint_report,
                 stage_failed=CheckStage.EMPIRICAL,

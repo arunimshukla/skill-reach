@@ -75,7 +75,13 @@ function reachClearActiveFilter() {
 }
 
 function getExpectedSkill(q) {
-  return q.querySelector('.expected')?.textContent.trim() || '';
+  return q.getAttribute('data-expected') || q.querySelector('.expected')?.textContent.trim() || '';
+}
+
+function getSelectedSkills(q) {
+  const raw = q.getAttribute('data-selections');
+  if (raw === null) return [];
+  return raw ? raw.split(',').map((s) => s.trim()) : [];
 }
 
 // Cross-filter bindings via event delegation
@@ -94,7 +100,11 @@ document.addEventListener('DOMContentLoaded', () => {
         const filterMsg = `Confusion cell: Expected [${expected}] → Invoked [${invoked}]`;
         reachApplyFilter(filterMsg, (q) => {
           const qExpected = getExpectedSkill(q);
-          const matched = invoked === '(no skill)' || q.textContent.includes(invoked);
+          const selections = getSelectedSkills(q);
+          const matched =
+            invoked === '(no skill)'
+              ? selections.length === 0 || selections.includes('(no skill)')
+              : selections.includes(invoked);
           return qExpected === expected && matched;
         });
       }
@@ -112,7 +122,7 @@ document.addEventListener('DOMContentLoaded', () => {
         const inv = cells[1].textContent.trim();
         const colMsg = `Collision: Expected [${exp}] → Invoked [${inv}]`;
         reachApplyFilter(colMsg, (q) => {
-          return getExpectedSkill(q) === exp && q.textContent.includes(inv);
+          return getExpectedSkill(q) === exp && getSelectedSkills(q).includes(inv);
         });
       }
     });
@@ -127,7 +137,7 @@ document.addEventListener('DOMContentLoaded', () => {
       if (skillCell) {
         const skillName = skillCell.textContent.trim();
         reachApplyFilter(`Skill focus: [${skillName}]`, (q) => {
-          return getExpectedSkill(q) === skillName || q.textContent.includes(skillName);
+          return getExpectedSkill(q) === skillName || getSelectedSkills(q).includes(skillName);
         });
       }
     });

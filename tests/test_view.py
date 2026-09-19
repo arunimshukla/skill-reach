@@ -444,3 +444,18 @@ def test_queries_support_expand_and_collapse_all(artifact: Artifact) -> None:
     script = tree.css_first("script")
     assert script is not None
     assert "function reachToggleAllQueries" in script.text()
+
+
+def test_queries_render_exact_data_attributes_and_exact_js_matching(artifact: Artifact) -> None:
+    """Verify details.query elements expose data attributes and JS uses exact array matching."""
+    tree = HTMLParser(render_view_html(artifact))
+    details = tree.css("details.query")
+    assert len(details) > 0
+    for item in details:
+        assert "data-expected" in item.attributes
+        assert "data-selections" in item.attributes
+    script = tree.css_first("script")
+    assert script is not None
+    js_text = script.text()
+    assert "getSelectedSkills(q).includes(" in js_text
+    assert "q.textContent.includes(" not in js_text

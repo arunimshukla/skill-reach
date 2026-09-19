@@ -69,7 +69,6 @@ def test_check_fails_fast_on_static_lint_before_prompting(tmp_path: Path) -> Non
             queries_path=queries_file,
             agent="pi",
             strict=True,
-            yes=False,
         )
 
     assert outcome.exit_code == 1
