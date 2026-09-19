@@ -216,38 +216,53 @@ def find_kneedle_knee(
     return None
 
 
+def _classify_probe_outcome(
+    result: ProbeResult,
+    expected: str | None,
+    installed_skills: set[str],
+    target_skill: str | None = None,
+) -> tuple[bool, bool, bool]:
+    """Classify a single probe result into (is_tp, is_fp, is_fn) confusion indicators."""
+    if target_skill is not None:
+        is_tp = (
+            not result.error and expected == target_skill and result.predicted_label == target_skill
+        )
+        is_fn = expected == target_skill and not is_tp
+        is_fp = (
+            not result.error and result.predicted_label == target_skill and expected != target_skill
+        )
+        return is_tp, is_fp, is_fn
+
+    is_tp = not result.error and expected is not None and result.predicted_label == expected
+    is_fn = expected is not None and not is_tp
+    is_fp = (
+        not result.error
+        and result.predicted_label in installed_skills
+        and result.predicted_label != expected
+    )
+    return is_tp, is_fp, is_fn
+
+
 def bootstrap_f1_ci(
     results: Sequence[ProbeResult],
     truth: Mapping[str, str | None],
     installed_skills: set[str],
     iterations: int = 1000,
     seed: int = 42,
+    target_skill: str | None = None,
 ) -> tuple[float, float]:
     """Compute empirical bootstrap confidence interval for micro F1 score."""
     m = len(results)
     if m <= 0 or iterations <= 0:
         return (0.0, 1.0)
 
-    tp_arr = [
-        1
-        if not r.error
-        and r.predicted_label == truth.get(r.query_id)
-        and truth.get(r.query_id) is not None
-        else 0
+    outcomes = [
+        _classify_probe_outcome(r, truth.get(r.query_id), installed_skills, target_skill)
         for r in results
     ]
-    fn_arr = [
-        1 if truth.get(r.query_id) is not None and not tp_arr[i] else 0
-        for i, r in enumerate(results)
-    ]
-    fp_arr = [
-        1
-        if not r.error
-        and r.predicted_label in installed_skills
-        and r.predicted_label != truth.get(r.query_id)
-        else 0
-        for r in results
-    ]
+    tp_arr = [int(tp) for tp, _, _ in outcomes]
+    fp_arr = [int(fp) for _, fp, _ in outcomes]
+    fn_arr = [int(fn) for _, _, fn in outcomes]
 
     rng = random.Random(seed)  # noqa: S311
     f1_boots: list[float] = []
@@ -416,29 +431,36 @@ def _compute_scope_counts(
     in_scope: Sequence[ProbeResult],
     truth_expected: Mapping[str, str | None],
     installed: set[str],
+    target_skill: str | None = None,
 ) -> tuple[int, int, float, tuple[float, float]]:
-    """Compute true positives, routing false negatives, recall, and Wilson interval."""
-    tp = sum(1 for r in in_scope if not r.error and r.predicted_label == truth_expected[r.query_id])
-    fn_misroute = sum(
-        1
+    """Compute true positives, routing false positives, recall, and Wilson interval."""
+    relevant = [
+        r
         for r in in_scope
-        if not r.error
-        and r.predicted_label != truth_expected[r.query_id]
-        and r.predicted_label in installed
-    )
-    recall = tp / len(in_scope) if in_scope else 0.0
-    rec_int = wilson_interval(tp, len(in_scope))
+        if target_skill is None or truth_expected.get(r.query_id) == target_skill
+    ]
+    outcomes = [
+        _classify_probe_outcome(r, truth_expected.get(r.query_id), installed, target_skill)
+        for r in in_scope
+    ]
+    tp = sum(1 for is_tp, _, _ in outcomes if is_tp)
+    internal_fp = sum(1 for _, is_fp, _ in outcomes if is_fp)
+    recall = tp / len(relevant) if relevant else 0.0
+    rec_int = wilson_interval(tp, len(relevant))
     recall_interval = (rec_int.low, rec_int.high) if rec_int else (0.0, 1.0)
-    return tp, fn_misroute, recall, recall_interval
+    return tp, internal_fp, recall, recall_interval
 
 
 def _compute_negative_counts(
     negative: Sequence[ProbeResult],
     installed: set[str],
+    target_skill: str | None = None,
 ) -> tuple[int, int, float | None, tuple[float, float] | None]:
     """Compute true negatives, distractor false positives, and abstention intervals."""
     tn = sum(1 for r in negative if not r.error and r.predicted_label == NO_SKILL)
-    fp_distractor = sum(1 for r in negative if not r.error and r.predicted_label in installed)
+    fp_distractor = sum(
+        1 for r in negative if _classify_probe_outcome(r, None, installed, target_skill)[1]
+    )
     if not negative:
         return tn, fp_distractor, None, None
     abstention_rate = round(tn / len(negative), 4)
@@ -479,6 +501,7 @@ def _calculate_scale_classification(
     truth_expected: Mapping[str, str | None],
     installed_skills: set[str] | None,
     seed: int,
+    target_skill: str | None = None,
 ) -> _ScaleClassificationMetrics:
     """Calculate precision, recall, abstention rate, and F1 confidence intervals."""
     installed = installed_skills if installed_skills is not None else set()
@@ -486,17 +509,24 @@ def _calculate_scale_classification(
     negative = [r for r in results if truth_expected.get(r.query_id) is None]
 
     tp, fn_misroute, recall, recall_interval = _compute_scope_counts(
-        in_scope, truth_expected, installed
+        in_scope, truth_expected, installed, target_skill=target_skill
     )
     _tn, fp_distractor, abstention_rate, abstention_interval = _compute_negative_counts(
-        negative, installed
+        negative, installed, target_skill=target_skill
     )
     internal_prec, ext_prec, precision, precision_interval = _compute_precision_metrics(
         tp, fn_misroute, fp_distractor, bool(negative)
     )
 
     f1 = _compute_f1_score(precision, recall)
-    f1_ci = bootstrap_f1_ci(results, truth_expected, installed, iterations=1000, seed=seed)
+    f1_ci = bootstrap_f1_ci(
+        results,
+        truth_expected,
+        installed,
+        iterations=1000,
+        seed=seed,
+        target_skill=target_skill,
+    )
 
     return _ScaleClassificationMetrics(
         in_scope_probes=len(in_scope),
@@ -523,9 +553,7 @@ def _aggregate_scale_telemetry(results: Sequence[ProbeResult]) -> _ScaleTelemetr
             if getattr(r, "disclosure_state", None) is not None
         )
     )
-    tokens: list[float] = [
-        float(tok) for r in results if (tok := getattr(r, "prompt_tokens", None)) is not None
-    ]
+    tokens: list[float] = [float(r.prompt_tokens) for r in results if r.prompt_tokens is not None]
     avg_tokens = statistics.fmean(tokens) if tokens else None
     prompt_tokens_mean = round(avg_tokens, 2) if avg_tokens is not None else None
 
@@ -574,6 +602,7 @@ def _build_scaling_point(
     resolved_query_set: QuerySet,
     baseline_results: tuple[ProbeResult, ...],
     installed_skills: set[str] | None = None,
+    target_skill: str | None = None,
     seed: int = 42,
 ) -> tuple[ScalingPoint, DecompositionResult | None]:
     """Calculate point metrics, Wilson confidence intervals, and pass-rate decomposition."""
@@ -582,7 +611,9 @@ def _build_scaling_point(
     truth_expected = {q.id: q.expected_skill for q in queries}
 
     pass_stats = _calculate_scale_pass_rate(results, truth_labels)
-    class_stats = _calculate_scale_classification(results, truth_expected, installed_skills, seed)
+    class_stats = _calculate_scale_classification(
+        results, truth_expected, installed_skills, seed, target_skill=target_skill
+    )
     telemetry = _aggregate_scale_telemetry(results)
     decomp_stats = _evaluate_baseline_decomposition(results, baseline_results, queries, seed)
 
@@ -864,6 +895,7 @@ def run_scaling_sweep(
                 resolved_query_set=scale_query_set,
                 baseline_results=baseline_results,
                 installed_skills=set(catalog.skills),
+                target_skill=target if not is_corpus else None,
                 seed=effective_config.catalog.seed,
             )
             points.append(point)

@@ -1687,9 +1687,15 @@ def test_run_config_resolve_registry_and_runtime_specializations() -> None:
     """Verify RunConfig.resolve handles RegistrySettings env and RuntimeSettings model."""
     from reach.config import RegistrySettings
 
-    # RuntimeSettings model override updates options
-    rt = RunConfig.resolve(RuntimeSettings, model="custom-gemini")
-    assert rt.options.get("model") == "custom-gemini"
+    # RuntimeSettings model override updates options and preserves other options
+    rt = RunConfig.resolve(
+        RuntimeSettings,
+        agent="claude-code",
+        options={"executable": "/bin/claude"},
+        model="claude-3-5-sonnet",
+    )
+    assert rt.options.get("model") == "claude-3-5-sonnet"
+    assert rt.options.get("executable") == "/bin/claude"
 
     # RegistrySettings env resolution
     reg = RunConfig.resolve(RegistrySettings, project="my-project")

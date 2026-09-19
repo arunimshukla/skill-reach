@@ -2275,6 +2275,27 @@ def test_query_draft_destination_collision_and_force(
     assert outcome == 0
 
 
+def test_bare_query_command_auto_discovers_skills(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Verify bare reach query without target auto-discovers skills from workspace."""
+    workspace = tmp_path / "my_project"
+    skill_dir = workspace / ".agents" / "skills" / "test-skill"
+    skill_dir.mkdir(parents=True)
+    manifest = skill_dir / "SKILL.md"
+    manifest.write_text(
+        "---\nname: test-skill\ndescription: A test skill for discovery.\n---\n# Test\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(workspace)
+    out = workspace / "discovered_queries.json"
+    outcome = main(["query", "--out", str(out), "--generator-agent", "fake"])
+    assert outcome == 0
+    assert out.is_file()
+
+
 def test_build_drafter_runtime_resolution() -> None:
     """Verify _build_drafter_runtime respects generator_agent override and defaults."""
     from reach.cli.drafting import _build_drafter_runtime

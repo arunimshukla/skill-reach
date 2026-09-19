@@ -33,6 +33,7 @@ from .flags import SWITCH, ProjectFlag, Quiet
 _BYTES_PER_KB = 1024
 _BYTES_PER_MB = 1024 * 1024
 _BYTES_PER_GB = 1024 * 1024 * 1024
+CONFIG_SIDECAR_GLOB = "*.config.json"
 
 
 def _format_size(num_bytes: int) -> str:
@@ -109,6 +110,7 @@ def clean(
             # Sidecars carry a reach-owned suffix, so sweep them up wherever they landed.
             targets = {reach_dir / fname for fname in target_files}
             targets.update(reach_dir.glob(f"*{ARTIFACT_SUFFIX}"))
+            targets.update(reach_dir.glob(CONFIG_SIDECAR_GLOB))
             for extra in sorted(targets):
                 if extra.is_file():
                     with contextlib.suppress(OSError):

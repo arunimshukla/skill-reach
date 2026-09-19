@@ -1575,7 +1575,39 @@ def test_cli_generator_receives_prompt(agent: str) -> None:
     cmd = cmd_fn(prompt)
     assert isinstance(cmd, list)
     in_command = any(prompt in token for token in cmd)
-    assert in_command or gen.name in ("claude-code", "antigravity-cli")
+    assert in_command or gen.name in ("claude-code", "antigravity-cli", "goose", "pi")
+
+
+@pytest.mark.parametrize(
+    ("agent", "expected_prefix"),
+    [
+        pytest.param("goose", ["goose", "run", "-q", "-i", "-", "--no-session"], id="goose-stdin"),
+        pytest.param("pi", ["pi", "-p", "--no-session"], id="pi-stdin"),
+    ],
+)
+def test_stdin_cli_generators_pipe_large_prompts_with_non_interactive_flags(
+    agent: str,
+    expected_prefix: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify stdin CLI generators pass non-interactive flags and pipe >128KB prompts via stdin."""
+    gen = build_text_generator(agent=agent)
+    large_prompt = "x" * 150_000
+    captured: dict[str, Any] = {}
+
+    def fake_run(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        captured["command"] = command
+        captured["input"] = kwargs.get("input")
+        return subprocess.CompletedProcess(
+            args=command, returncode=0, stdout='{"queries": []}', stderr=""
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    res = gen.complete(large_prompt)
+    assert res == '{"queries": []}'
+    assert captured["input"] == large_prompt
+    assert captured["command"][: len(expected_prefix)] == expected_prefix
+    assert large_prompt not in captured["command"]
 
 
 @pytest.mark.parametrize("agent", [a for a in known_agents() if agent_default_model(a)])

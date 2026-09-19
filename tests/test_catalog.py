@@ -67,11 +67,25 @@ def test_missing_root_raises(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize(
     "text",
-    ["no frontmatter here", "---\nunterminated", "---\njust a string\n---\n"],
-    ids=["absent", "unterminated", "not-a-mapping"],
+    [
+        "no frontmatter here",
+        "---\nunterminated",
+        "---\njust a string\n---\n",
+        "---\nname: my-skill\ndescription: ''\n---\nbody",
+        "---\nname: my-skill\ndescription: '   '\n---\nbody",
+        "---\nname: my-skill\ndescription: null\n---\nbody",
+    ],
+    ids=[
+        "absent",
+        "unterminated",
+        "not-a-mapping",
+        "empty-description",
+        "whitespace-description",
+        "null-description",
+    ],
 )
 def test_unparseable_frontmatter_is_skipped(text: str, tmp_path: Path) -> None:
-    """Verify parse_frontmatter returns None for missing or unparseable frontmatter."""
+    """Verify parse_frontmatter returns None for missing, unparseable, or invalid frontmatter."""
     assert parse_frontmatter(text, tmp_path / "x" / "SKILL.md") is None
 
 
@@ -232,9 +246,8 @@ def test_a_symlinked_skill_takes_the_name_it_was_installed_under(
 
 
 def test_empty_description_is_rejected(tmp_path: Path) -> None:
-    """Verify parse_frontmatter raises ValueError when description is empty."""
-    with pytest.raises(ValueError, match="non-empty"):
-        parse_frontmatter("---\nname: x\ndescription: ''\n---\n", tmp_path / "SKILL.md")
+    """Verify parse_frontmatter returns None when description is empty."""
+    assert parse_frontmatter("---\nname: x\ndescription: ''\n---\n", tmp_path / "SKILL.md") is None
 
 
 def test_singleton_mode_isolates_each_skill(skill_repo: Path) -> None:

@@ -165,7 +165,9 @@ def changed_skills(
         if match := _SKILL_PATH_PATTERN.search(trimmed):
             discovered.add(match.group(1))
         elif trimmed.endswith("SKILL.md"):
-            discovered.add(Path(trimmed).parent.name)
+            skill_name = Path(trimmed).parent.name or Path(work_dir).resolve().name
+            if skill_name:
+                discovered.add(skill_name)
 
     return tuple(sorted(discovered))
 

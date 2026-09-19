@@ -20,6 +20,7 @@ import contextlib
 import functools
 import hashlib
 import json
+import logging
 import math
 import re
 from pathlib import Path
@@ -27,7 +28,14 @@ from random import Random
 from typing import TYPE_CHECKING, Any, Final
 
 import yaml
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+)
 
 from reach.config import resolve_path
 from reach.models import Catalog, CatalogMode, Skill
@@ -196,7 +204,7 @@ class _SkillFrontmatter(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     name: str | None = None
-    description: str = ""
+    description: str
     metadata: dict[str, Any] = Field(default_factory=dict)
     allowed_tools: Any = Field(
         default=None,
@@ -206,6 +214,15 @@ class _SkillFrontmatter(BaseModel):
         default=None,
         validation_alias=AliasChoices(HIDE_FROM_MODEL_KEY, "disable_model_invocation"),
     )
+
+    @field_validator("description")
+    @classmethod
+    def _reject_blank_description(cls, value: str) -> str:
+        """Validate that frontmatter description is a non-empty, non-whitespace string."""
+        if not value or not value.strip():
+            msg = "skill description must not be empty or whitespace"
+            raise ValueError(msg)
+        return value
 
     def is_model_invocable(self) -> bool:
         """Check whether the skill allows model invocation based on frontmatter flags."""
@@ -253,24 +270,28 @@ def parse_frontmatter(text: str, path: Path) -> Skill | None:
         return None
     if not isinstance(loaded, dict):
         return None
-    parsed = _SkillFrontmatter.model_validate(loaded)
-    name = parsed.name or path.parent.name
-    raw_allowed = parsed.allowed_tools
-    allowed = _extract_allowed_skills(raw_allowed)
-    deps = _extract_declared_dependencies(loaded, allowed)
-    manifest = find_skill_manifest(path)
-    manifest_src = _resolve_manifest_source(name, manifest)
+    try:
+        parsed = _SkillFrontmatter.model_validate(loaded)
+        name = parsed.name or path.parent.name
+        raw_allowed = parsed.allowed_tools
+        allowed = _extract_allowed_skills(raw_allowed)
+        deps = _extract_declared_dependencies(loaded, allowed)
+        manifest = find_skill_manifest(path)
+        manifest_src = _resolve_manifest_source(name, manifest)
 
-    return Skill(
-        name=name,
-        description=parsed.description,
-        metadata=parsed.stringified_metadata(),
-        path=path.parent,
-        allowed_tools=allowed,
-        declared_dependencies=deps,
-        manifest_source=manifest_src,
-        model_invocable=parsed.is_model_invocable(),
-    )
+        return Skill(
+            name=name,
+            description=parsed.description,
+            metadata=parsed.stringified_metadata(),
+            path=path.parent,
+            allowed_tools=allowed,
+            declared_dependencies=deps,
+            manifest_source=manifest_src,
+            model_invocable=parsed.is_model_invocable(),
+        )
+    except (ValueError, ValidationError) as exc:
+        logging.getLogger(__name__).warning("Skipping invalid SKILL.md at %s: %s", path, exc)
+        return None
 
 
 def _skill_files(root: Path) -> list[Path]:

@@ -579,3 +579,27 @@ def test_lint_settings_from_settings() -> None:
     assert cfg.similarity_threshold == 0.85
     assert cfg.rules["no-description"] == "error"
     assert cfg.rules["kebab-case-name"] == Severity.WARN
+
+
+@pytest.mark.parametrize(
+    "empty_val",
+    ['""', "''", "   ", "null"],
+    ids=["double-quoted-empty", "single-quoted-empty", "whitespace", "null"],
+)
+def test_missing_description_in_lint_tree_does_not_crash(
+    tmp_path: Path,
+    empty_val: str,
+) -> None:
+    """Verify lint_tree handles empty/null descriptions and records missing-description."""
+    skill_dir = tmp_path / "broken-skill"
+    skill_dir.mkdir(parents=True)
+    manifest = skill_dir / "SKILL.md"
+    manifest.write_text(
+        f"---\nname: broken-skill\ndescription: {empty_val}\n---\n# Body\n",
+        encoding="utf-8",
+    )
+    report = lint_tree(tmp_path)
+    assert report.skills_checked == 1
+    assert any(
+        i.rule == "missing-description" and i.severity == Severity.ERROR for i in report.issues
+    )

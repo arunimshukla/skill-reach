@@ -1365,7 +1365,7 @@ def _run_optimization_round(
     tested_any = False
 
     if test_queries and evaluated_candidates and test_share > 0 and avail_for_test > 0:
-        test_round_budget = min(avail_for_test, test_share)
+        test_round_budget = min(avail_for_test, max(test_share, round_budget - train_spent))
         tested_candidates: list[OptimizationCandidate] = []
         test_cands_to_run = [
             c

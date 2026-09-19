@@ -598,6 +598,16 @@ class HybridScorer(BaseModel):
         semantic = DenseScorer(vectors=vectors)
         return cls(lexical=lexical, semantic=semantic, rrf_k=rrf_k)
 
+    def _fuse_rankings(
+        self,
+        bm25_ranked: Sequence[tuple[str, float]],
+        dense_ranked: Sequence[tuple[str, float]],
+    ) -> list[tuple[str, float]]:
+        """Fuse positive-score lexical rankings with dense rankings via Reciprocal Rank Fusion."""
+        lex_ranks = [name for name, score in bm25_ranked if score > 0.0]
+        sem_ranks = [name for name, _ in dense_ranked]
+        return compute_rrf([lex_ranks, sem_ranks], k=self.rrf_k)
+
     def rank_text(
         self,
         text: str,
@@ -606,11 +616,10 @@ class HybridScorer(BaseModel):
         """Rank candidate skills against query text using Reciprocal Rank Fusion."""
         if not candidates:
             return []
-
-        lex_ranks = [name for name, _ in self.lexical.rank_text(text, candidates)]
-        sem_ranks = [name for name, _ in self.semantic.rank_text(text, candidates)]
-
-        return compute_rrf([lex_ranks, sem_ranks], k=self.rrf_k)
+        return self._fuse_rankings(
+            self.lexical.rank_text(text, candidates),
+            self.semantic.rank_text(text, candidates),
+        )
 
     def rank(
         self,
@@ -621,11 +630,10 @@ class HybridScorer(BaseModel):
         pool = [c for c in candidates if c.name != target.name]
         if not pool:
             return []
-
-        lex_ranks = [name for name, _ in self.lexical.rank(target, pool)]
-        sem_ranks = [name for name, _ in self.semantic.rank(target, pool)]
-
-        return compute_rrf([lex_ranks, sem_ranks], k=self.rrf_k)
+        return self._fuse_rankings(
+            self.lexical.rank(target, pool),
+            self.semantic.rank(target, pool),
+        )
 
 
 def build_scorer(

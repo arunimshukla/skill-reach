@@ -1246,3 +1246,84 @@ def test_artifact_assemble_accepts_optional_metadata(
     assert artifact.reused == 3
     assert artifact.provenance.catalog_fit == fit
     assert [(r.path, r.skills) for r in artifact.resolved_roots] == [(root, 3)]
+
+
+@pytest.mark.parametrize(
+    (
+        "invoked_skills",
+        "expected_top1_reached",
+        "expected_top1_recall",
+        "expected_traj_reached",
+        "expected_traj_recall",
+        "expected_in_unreached",
+    ),
+    [
+        pytest.param(
+            (LIFECYCLE,),
+            1,
+            1.0,
+            1,
+            1.0,
+            False,
+            id="turn-1-direct-hit",
+        ),
+        pytest.param(
+            (BASICS, LIFECYCLE),
+            0,
+            0.0,
+            1,
+            1.0,
+            False,
+            id="turn-2-trajectory-hit-not-unreached",
+        ),
+        pytest.param(
+            (BASICS,),
+            0,
+            0.0,
+            0,
+            0.0,
+            True,
+            id="never-reached-in-any-turn",
+        ),
+    ],
+)
+def test_skill_score_and_unreached_respect_multi_turn_trajectory(
+    whole_catalog: Catalog,
+    corpus: list[Skill],
+    make_config: Any,
+    invoked_skills: tuple[str, ...],
+    expected_top1_reached: int,
+    expected_top1_recall: float,
+    expected_traj_reached: int,
+    expected_traj_recall: float,
+    expected_in_unreached: bool,
+) -> None:
+    """Verify SkillScore tracks trajectory_reached/recall and unreached excludes turn 2+ hits."""
+    cfg = make_config(catalog={"mode": CatalogMode.ALL}, plan={"attempts": 1})
+    qs = QuerySet(
+        catalog_id=whole_catalog.id,
+        queries=(Query(id="q-life", text="configure lifecycle", expected_skill=LIFECYCLE),),
+        provenance=QuerySetProvenance(origin=Origin.AUTHORED),
+    )
+    res = [
+        ProbeResult(
+            query_id="q-life",
+            catalog_id=whole_catalog.id,
+            catalog_mode=CatalogMode.ALL,
+            catalog_size=len(whole_catalog.skills),
+            invoked_skills=invoked_skills,
+            runtime=cfg.runtime.agent,
+            model="sonnet",
+            config_fingerprint=cfg.fingerprint,
+            corpus_digest=corpus_digest(corpus),
+            queries_digest=query_set_digest(qs),
+        )
+    ]
+    built = assemble(res, qs, whole_catalog, corpus, cfg)
+    score = next(s for s in built.skills if s.skill == LIFECYCLE)
+
+    assert score.reached == expected_top1_reached
+    assert score.recall == expected_top1_recall
+    assert score.trajectory_reached == expected_traj_reached
+    assert score.trajectory_recall == expected_traj_recall
+    assert (score in built.unreached) is expected_in_unreached
