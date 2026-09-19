@@ -143,7 +143,12 @@ def _query_lines(comparison: Comparison) -> list[str]:
             f"{delta.delta * 100:>+8.1f}  {'yes' if delta.real else 'no'}",
         )
     if hidden := len(ordered) - len(shown):
-        lines.append(f"  ({hidden} more, none of them separated)")
+        hidden_separated = max(0, len(comparison.separated) - len(shown))
+        hidden_held = hidden - hidden_separated
+        if hidden_separated > 0:
+            lines.append(f"  ({hidden} more: {hidden_separated} separated, {hidden_held} held)")
+        else:
+            lines.append(f"  ({hidden} more, none of them separated)")
     return lines
 
 

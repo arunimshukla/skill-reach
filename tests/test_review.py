@@ -185,6 +185,10 @@ def test_render_query_review_html_empty_queries(
     )
     html = render_query_review_html(qs, target, [])
     tree = HTMLParser(html)
+    body = tree.css_first("body")
+    assert body is not None
+    assert body.attributes.get("data-catalog-id") == "test-cat"
+    assert body.attributes.get("data-origin") == "authored"
 
     # Both territory columns are empty
     assert len(tree.css(".query-card")) == 0

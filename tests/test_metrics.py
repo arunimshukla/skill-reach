@@ -679,3 +679,65 @@ def test_compute_precursor_graph_edge_cases() -> None:
     assert edge.handoffs == 0
     assert edge.handoff_rate == 0.0
     assert edge.avg_step_latency == 0.0
+
+
+def test_acceptable_skills_credited_in_classification_trajectory_and_collisions() -> None:
+    """Verify acceptable_skills are credited as hits and not false-positive collisions."""
+    query = Query(
+        id="q-accept",
+        text="deploy container to cloud",
+        expected_skill="cloud-run-basics",
+        acceptable_skills=("gke-basics",),
+    )
+    result = ProbeResult(
+        query_id="q-accept",
+        catalog_id="c",
+        catalog_mode=CatalogMode.ALL,
+        catalog_size=2,
+        model="m",
+        runtime="fake",
+        invoked_skills=("gke-basics",),
+    )
+
+    traj = score_trajectory(query, result.invoked_skills)
+    assert traj.entrypoint_hit is True
+    assert traj.trajectory_hit is True
+    assert traj.skill_f1 == 1.0
+
+    report = classification_report([result], [query])
+    assert report.top1_hits == 1
+    assert report.entrypoint_hits == 1
+    assert report.by_label("cloud-run-basics").recall == 1.0
+    assert collisions([result], [query]) == {}
+    assert confusion([result], [query])[("cloud-run-basics", "cloud-run-basics")] == 1
+
+
+def test_trajectory_scores_aggregates_multi_attempt_replicates() -> None:
+    """Verify trajectory_scores averages across multiple attempts instead of overwriting (5.F)."""
+    query = Query(id="q-rep", text="setup cluster", expected_skill="gke-basics")
+    results = [
+        ProbeResult(
+            query_id="q-rep",
+            attempt=1,
+            catalog_id="c",
+            catalog_mode=CatalogMode.ALL,
+            catalog_size=2,
+            model="m",
+            runtime="fake",
+            invoked_skills=("gke-basics",),
+        ),
+        ProbeResult(
+            query_id="q-rep",
+            attempt=2,
+            catalog_id="c",
+            catalog_mode=CatalogMode.ALL,
+            catalog_size=2,
+            model="m",
+            runtime="fake",
+            invoked_skills=("other-skill",),
+        ),
+    ]
+    scores = trajectory_scores(results, [query])
+    assert scores["q-rep"].step_efficiency == pytest.approx(0.5)
+    assert scores["q-rep"].skill_f1 == pytest.approx(0.5)
+    assert scores["q-rep"].entrypoint_hit is True

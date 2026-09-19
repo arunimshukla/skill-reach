@@ -179,6 +179,8 @@ def render_query_review_html(
         skill_name=_esc(skill.name),
         style=_REVIEW_STYLE,
         target_skill=_esc(target_name),
+        catalog_id=_esc(query_set.catalog_id),
+        origin=_esc(query_set.provenance.origin.value),
         rivals_json=rivals_json,
         out_of_scope=ReviewSentinel.OUT_OF_SCOPE.value,
         skill_desc=_esc(skill.description),

@@ -1475,3 +1475,25 @@ def test_antigravity_cli_enforces_schema_in_both_single_and_multi_turn(
     branches = schema["properties"]["selected_skill"]["anyOf"]
     enum = next(b["enum"] for b in branches if "enum" in b)
     assert sorted(enum) == ["skill-a", "skill-b"]
+
+
+def test_antigravity_cli_generator_normalized_model_delegates_to_normalize_agy_model() -> None:
+    """Verify AntigravityCliGenerator.normalized_model does not hardcode gemini-3.8-flash (5.D)."""
+    gen = AntigravityCliGenerator(model="gemini-2.5-flash")
+    try:
+        assert gen.normalized_model == "gemini-2.5-flash"
+    finally:
+        gen.cleanup()
+
+
+def test_antigravity_cli_runtime_clone_isolated_creates_distinct_home_dir(home_dir: Path) -> None:
+    """Verify clone_isolated allocates a separate temporary home directory for worker isolation."""
+    rt = AntigravityCliRuntime(options=AntigravityCliOptions(home_dir=home_dir))
+    clone = rt.clone_isolated()
+    try:
+        assert clone.home_dir != rt.home_dir
+        assert clone.home_dir.is_dir()
+    finally:
+        clone.cleanup()
+        assert not clone.home_dir.exists()
+        assert rt.home_dir.is_dir()

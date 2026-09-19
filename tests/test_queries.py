@@ -253,8 +253,9 @@ def test_saving_a_set_writes_what_the_loader_reads(tmp_path: Path) -> None:
     assert load_query_set(save_query_set(written, tmp_path / "set.json")) == written
 
 
-def test_save_and_load_query_set_jsonl(tmp_path: Path) -> None:
-    """Verify QuerySet saved to JSONL round-trips correctly through load_query_set."""
+@pytest.mark.parametrize("filename", ["queries.jsonl", "queries.csv"])
+def test_save_and_load_query_set_tabular(tmp_path: Path, filename: str) -> None:
+    """Verify QuerySet saved to JSONL or CSV round-trips correctly through load_query_set."""
     initial = QuerySet(
         catalog_id="c",
         queries=(
@@ -266,7 +267,7 @@ def test_save_and_load_query_set_jsonl(tmp_path: Path) -> None:
         ),
         provenance=provenance(),
     )
-    saved = save_query_set(initial, tmp_path / "queries.jsonl")
+    saved = save_query_set(initial, tmp_path / filename)
     loaded = load_query_set(saved)
     assert len(loaded.queries) == 1
     assert loaded.queries[0].id == "q1"
@@ -274,41 +275,114 @@ def test_save_and_load_query_set_jsonl(tmp_path: Path) -> None:
     assert loaded.queries[0].expected_skill == "gcs-lifecycle-rules"
 
 
-def test_save_and_load_query_set_csv(tmp_path: Path) -> None:
-    """Verify QuerySet saved to CSV round-trips correctly through load_query_set."""
-    initial = QuerySet(
-        catalog_id="c",
-        queries=(
-            Query(
-                id="q1",
-                text="tier cold objects",
-                expected_skill="gcs-lifecycle-rules",
-            ),
-        ),
-        provenance=provenance(),
-    )
-    saved = save_query_set(initial, tmp_path / "queries.csv")
-    loaded = load_query_set(saved)
-    assert len(loaded.queries) == 1
-    assert loaded.queries[0].id == "q1"
-    assert loaded.queries[0].text == "tier cold objects"
-    assert loaded.queries[0].expected_skill == "gcs-lifecycle-rules"
-
-
-def test_query_set_for_skill_matches_expected_skill() -> None:
-    """Verify QuerySet.for_skill filters queries by expected skill name."""
+@pytest.mark.parametrize(
+    ("target", "expected_ids"),
+    [
+        ("s1", ("q1",)),
+        ("s2", ("q2",)),
+        ("s3", ()),
+        (NO_SKILL, ("q3",)),
+        ("(no skill)", ("q3",)),
+    ],
+)
+def test_query_set_for_skill_lookup(target: str, expected_ids: tuple[str, ...]) -> None:
+    """Verify QuerySet.for_skill matches expected skill names and out-of-scope sentinels."""
     q1 = Query(id="q1", text="text 1", expected_skill="s1")
     q2 = Query(id="q2", text="text 2", expected_skill="s2")
-    qs = QuerySet(catalog_id="c", queries=(q1, q2), provenance=provenance())
-    assert qs.for_skill("s1") == (q1,)
-    assert qs.for_skill("s2") == (q2,)
-    assert qs.for_skill("s3") == ()
+    q3 = Query(id="q3", text="out of scope", kind=QueryKind.OUT_OF_SCOPE)
+    qs = QuerySet(catalog_id="c", queries=(q1, q2, q3), provenance=provenance())
+    assert tuple(q.id for q in qs.for_skill(target)) == expected_ids
 
 
-def test_query_set_for_skill_matches_out_of_scope_truth_label() -> None:
-    """Verify QuerySet.for_skill matches out-of-scope queries via NO_SKILL sentinel."""
-    q1 = Query(id="q1", text="text 1", expected_skill="s1")
-    q2 = Query(id="q2", text="out of scope", kind=QueryKind.OUT_OF_SCOPE)
-    qs = QuerySet(catalog_id="c", queries=(q1, q2), provenance=provenance())
-    assert qs.for_skill(NO_SKILL) == (q2,)
-    assert qs.for_skill("(no skill)") == (q2,)
+@pytest.mark.parametrize(
+    ("payload", "expected_first", "expected_second"),
+    [
+        pytest.param(
+            [
+                {
+                    "query": "deploy service to cloud run",
+                    "should_trigger": True,
+                    "expected_skill": "cloud-run-basics",
+                },
+                {
+                    "query": "book a flight to tokyo",
+                    "should_trigger": False,
+                    "expected_skill": "cloud-run-basics",
+                },
+            ],
+            ("q-001", "deploy service to cloud run", "cloud-run-basics", QueryKind.IMPLICIT),
+            ("q-002", "book a flight to tokyo", None, QueryKind.OUT_OF_SCOPE),
+            id="top-level-array-clears-negative-expected-skill",
+        ),
+        pytest.param(
+            [
+                {
+                    "query": "deploy service to cloud run",
+                    "should_trigger": True,
+                    "expected_skill": "cloud-run-basics",
+                },
+                {
+                    "query": "configure gke node pool",
+                    "should_trigger": False,
+                    "expected_skill": "cloud-run-basics",
+                    "neighbor_skill": "gke-basics",
+                },
+            ],
+            ("q-001", "deploy service to cloud run", "cloud-run-basics", QueryKind.IMPLICIT),
+            ("q-002", "configure gke node pool", "gke-basics", QueryKind.NEIGHBOR_NEGATIVE),
+            id="top-level-array-preserves-neighbor-skill-on-negative",
+        ),
+        pytest.param(
+            {
+                "catalog_id": "custom:cloud-run-basics",
+                "queries": [
+                    {
+                        "query": "deploy service to cloud run",
+                        "should_trigger": True,
+                        "expected_skill": "cloud-run-basics",
+                    },
+                    {
+                        "query": "book a flight to tokyo",
+                        "should_trigger": False,
+                        "expected_skill": None,
+                    },
+                ],
+            },
+            ("q-001", "deploy service to cloud run", "cloud-run-basics", QueryKind.IMPLICIT),
+            ("q-002", "book a flight to tokyo", None, QueryKind.OUT_OF_SCOPE),
+            id="dict-wrapper-queries-key",
+        ),
+        pytest.param(
+            {
+                "evals": [
+                    {
+                        "query": "deploy service to cloud run",
+                        "should_trigger": True,
+                        "expected_skill": "cloud-run-basics",
+                    },
+                    {
+                        "query": "book a flight to tokyo",
+                        "should_trigger": False,
+                    },
+                ],
+            },
+            ("q-001", "deploy service to cloud run", "cloud-run-basics", QueryKind.IMPLICIT),
+            ("q-002", "book a flight to tokyo", None, QueryKind.OUT_OF_SCOPE),
+            id="dict-wrapper-evals-key",
+        ),
+    ],
+)
+def test_load_query_set_normalizes_legacy_json_formats(
+    tmp_path: Path,
+    payload: object,
+    expected_first: tuple[str, str, str | None, QueryKind],
+    expected_second: tuple[str, str, str | None, QueryKind],
+) -> None:
+    """Verify load_query_set normalizes array and dict-wrapped skill-creator JSON via Pydantic."""
+    p = tmp_path / "eval_set.json"
+    p.write_text(json.dumps(payload), encoding="utf-8")
+    loaded = load_query_set(p, catalog_id="neighborhood:cloud-run-basics")
+    assert len(loaded.queries) == 2
+    q0, q1 = loaded.queries
+    assert (q0.id, q0.text, q0.expected_skill, q0.kind) == expected_first
+    assert (q1.id, q1.text, q1.expected_skill, q1.kind) == expected_second

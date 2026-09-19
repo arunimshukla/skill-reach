@@ -1049,3 +1049,41 @@ def test_diff_runs_accepts_artifact_files_directly(arm, tmp_path: Path) -> None:
     assert comparison.control.label == "control"
     assert comparison.treatment.label == "treatment"
     assert comparison.corroboration.corroborated
+
+
+@pytest.mark.parametrize(
+    ("num_separated", "num_held", "expected_line"),
+    [
+        pytest.param(10, 0, "(2 more: 2 separated, 0 held)", id="all-hidden-separated"),
+        pytest.param(9, 2, "(3 more: 1 separated, 2 held)", id="mixed-hidden-separated-and-held"),
+        pytest.param(0, 10, "(2 more, none of them separated)", id="no-hidden-separated"),
+    ],
+)
+def test_query_lines_reports_hidden_separated_when_exceeding_queries_shown(
+    arm,
+    num_separated: int,
+    num_held: int,
+    expected_line: str,
+) -> None:
+    """Verify _query_lines reports both hidden separated and hidden held counts."""
+    comparison = diff_runs(
+        arm("shipped", DILUTED_CONTROL),
+        arm("patched", DILUTED_TREATMENT),
+        "description",
+    )
+    sep_template = comparison.queries[0].model_copy(update={"real": True})
+    held_template = comparison.queries[0].model_copy(update={"real": False})
+    separated = tuple(
+        sep_template.model_copy(update={"query_id": f"q-sep-{i}"}) for i in range(num_separated)
+    )
+    held = tuple(
+        held_template.model_copy(update={"query_id": f"q-held-{i}"}) for i in range(num_held)
+    )
+    over_comparison = comparison.model_copy(
+        update={
+            "queries": (*separated, *held),
+            "separated": separated,
+        },
+    )
+    rendered = render_diff(over_comparison, "text")
+    assert expected_line in rendered

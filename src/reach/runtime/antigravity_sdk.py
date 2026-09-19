@@ -78,6 +78,24 @@ SELECTION_TOOLS: tuple[Any, ...] = (
     (ag_types.BuiltinTools.FINISH,) if ag_types is not None else ("finish",)
 )
 
+
+def _build_multi_turn_selection_tools() -> tuple[Any, ...]:
+    """Assemble finish tool plus available read-only workspace inspection tools."""
+    if ag_types is None or not hasattr(ag_types, "BuiltinTools"):
+        return ("finish", "view_file", "list_dir", "grep_search", "find_by_name")
+    tools: list[Any] = [ag_types.BuiltinTools.FINISH]
+    for attr in ("VIEW_FILE", "LIST_DIR", "GREP_SEARCH", "FIND_BY_NAME"):
+        member = getattr(ag_types.BuiltinTools, attr, None)
+        if member is not None:
+            tools.append(member)
+    if len(tools) == 1:
+        tools.append("view_file")
+    return tuple(tools)
+
+
+#: Selection tool set configured for multi-turn trajectory probe evaluations.
+MULTI_TURN_SELECTION_TOOLS: tuple[Any, ...] = _build_multi_turn_selection_tools()
+
 #: Terminal stop reasons considered normal for single-turn evaluations.
 EXPECTED_STOP_REASONS: frozenset[Any] = (
     frozenset({ag_types.StopReason.UNSPECIFIED, ag_types.StopReason.MAX_MODEL_CALLS_EXCEEDED})
@@ -291,11 +309,24 @@ class AntigravitySdkRuntime(_AntigravitySdkConfigMixin, AntigravityRuntime):
             )
             app_data_dir = str(sdk_dir)
 
+        enabled_tools = (
+            list(MULTI_TURN_SELECTION_TOOLS)
+            if not self.options.early_exit and self.options.max_turns > 1
+            else list(SELECTION_TOOLS)
+        )
+        if self.allowed_tools:
+            builtin_by_name = (
+                {_tool_name(member): member for member in ag_types.BuiltinTools}
+                if ag_types is not None and hasattr(ag_types, "BuiltinTools")
+                else {}
+            )
+            enabled_tools = [builtin_by_name.get(t, t) for t in self.allowed_tools]
+
         return LocalAgentConfig(
             model=self._model_spec(),
             skills_paths=[str(self.skills_dir(workdir))],
             capabilities=ag_types.CapabilitiesConfig(
-                enabled_tools=list(SELECTION_TOOLS),
+                enabled_tools=enabled_tools,
                 enable_subagents=False,
             ),
             budget_config=ag_types.BudgetConfig(max_model_calls=self.options.max_turns),
@@ -327,14 +358,14 @@ class AntigravitySdkRuntime(_AntigravitySdkConfigMixin, AntigravityRuntime):
 
             @ag_hooks.pre_tool_call_decide
             async def _on_tool_call(call: ag_types.ToolCall) -> ag_types.HookResult:
-                if not self.options.early_exit:
-                    return ag_types.HookResult(allow=True)
                 args = getattr(call, "args", None) or getattr(call, "arguments", {}) or {}
                 path = args.get("path") or args.get("AbsolutePath")
                 if path:
                     skill = resolve_skill_from_path(path, self._resident)
-                    if skill and tracker.observe(skill):
-                        return ag_types.HookResult(allow=False)
+                    if skill:
+                        should_stop = tracker.observe(skill)
+                        if self.options.early_exit and should_stop:
+                            return ag_types.HookResult(allow=False)
                 return ag_types.HookResult(allow=True)
 
             hooks_list.append(_on_tool_call)
@@ -355,11 +386,16 @@ class AntigravitySdkRuntime(_AntigravitySdkConfigMixin, AntigravityRuntime):
             msg = f"Antigravity SDK execution error: {err}"
             raise RuntimeError(msg) from err
 
+        allowed_tool_names = (
+            set(self.allowed_tools)
+            if self.allowed_tools
+            else (set(self.ANTIGRAVITY_SELECTION_TOOLS) | {_tool_name(t) for t in SELECTION_TOOLS})
+        )
         error = None
         if stop_reason not in EXPECTED_STOP_REASONS:
             reason_str = getattr(stop_reason, "value", str(stop_reason))
             error = f"runtime error: {reason_str}"
-        elif tool_leak := check_tool_leak(observed_tools, {_tool_name(t) for t in SELECTION_TOOLS}):
+        elif tool_leak := check_tool_leak(observed_tools, allowed_tool_names):
             error = tool_leak
 
         invoked, reasoning = _extract_selection_and_reasoning(data)

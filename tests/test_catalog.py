@@ -1286,3 +1286,22 @@ def test_infer_parent_catalog_relative_path(
     # Pass 1-level relative path
     inferred = _infer_parent_catalog(Path("s1"))
     assert inferred == catalog.resolve()
+
+
+def test_build_scaling_catalogs_strict_nested_subset(tmp_path: Path) -> None:
+    """Verify single-skill scaling catalogs satisfy strict subset nestedness C_k1 subset C_k2."""
+    skills = [
+        Skill(
+            name=f"skill-{i:02d}",
+            description=f"Skill {i} specialized tool for domain {i % 4}",
+            path=tmp_path / f"s{i}",
+        )
+        for i in range(25)
+    ]
+    import itertools
+
+    catalogs = build_scaling_catalogs(skills, target_skill="skill-00", scales=(1, 5, 10, 15, 25))
+    for earlier, later in itertools.pairwise(catalogs):
+        assert set(earlier.skills).issubset(set(later.skills)), (
+            f"Catalog {earlier.id} is not a subset of {later.id}"
+        )

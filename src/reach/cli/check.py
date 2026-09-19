@@ -319,6 +319,10 @@ def _check(
         run_config = run_config.model_copy(update={"check": eff_settings})
     rule_overrides = rules.to_overrides() if rules is not None else None
 
+    from .safety import confirm_skill_execution
+
+    trusted = run_config.study.trusted if run_config is not None else False
+
     outcome = run_check(
         skills_paths=[skills] if skills is not None else None,
         queries_path=queries,
@@ -339,7 +343,15 @@ def _check(
         config=run_config,
         rule_overrides=rule_overrides or None,
         global_scope=global_,
-        yes=yes,
+        confirm_callback=lambda rt_name, loaded, roots: confirm_skill_execution(
+            console,
+            runtime_name=rt_name,
+            skills=loaded,
+            roots=roots,
+            action="check empirical probes",
+            yes=yes,
+            trusted=trusted,
+        ),
     )
 
     _render_check_output(console, outcome, format, step_summary)

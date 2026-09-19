@@ -392,6 +392,12 @@ class AntigravityCliRuntime(CliAgentRuntime[AntigravityCliOptions], AntigravityR
             model_provider=self.effective_model_provider,
         )
 
+    @override
+    def clone_isolated(self) -> Self:
+        """Create a thread-local isolated clone with a dedicated temporary home directory."""
+        cloned_options = self.options.model_copy(update={"home_dir": None})
+        return type(self)(settings=self.settings, options=cloned_options)
+
     def cleanup(self) -> None:
         """Remove isolated temporary home directory if automatically created."""
         if getattr(self, "_temp_home", False) and self.options.home_dir is not None:
@@ -625,8 +631,7 @@ class AntigravityCliGenerator(BaseTextGenerator[AntigravityCliOptions]):
     @property
     def normalized_model(self) -> str:
         """Map canonical models to Antigravity CLI naming conventions."""
-        m = self.model
-        return "gemini-3.8-flash" if "flash" in m else m
+        return normalize_agy_model(self.model)
 
     @property
     def effective_effort(self) -> str | None:

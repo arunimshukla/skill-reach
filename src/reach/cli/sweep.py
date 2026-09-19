@@ -445,11 +445,7 @@ def _finalize_sweep_study_config(
     early_stop: bool,
 ) -> tuple[RunConfig, Path]:
     """Determine working directory and resolved benchmark queries path."""
-    import tempfile
-
-    work_dir = (
-        workdir or effective_config.study.workdir or Path(tempfile.mkdtemp(prefix="reach_sweep_"))
-    )
+    work_dir = workdir or effective_config.study.workdir
     resolved_skills = (
         found[0].path.parent
         if effective_config.study.skills is None and found

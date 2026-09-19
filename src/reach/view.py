@@ -282,8 +282,11 @@ def _queries_html(artifact: Artifact) -> str:
             if record.probes == 0
             else ("hit" if record.hits == record.probes else "miss" if record.hits else "error")
         )
+        expected_attr = _esc(record.expected)
+        selections_attr = _esc(",".join(record.selections))
         entries.append(
-            f'<details class="query {css}">'
+            f'<details class="query {css}" data-expected="{expected_attr}" '
+            f'data-selections="{selections_attr}">'
             "<summary>"
             f'<span class="query-id">{_esc(record.query_id)}</span>'
             f'<span class="expected">{_esc(record.expected)}</span>'

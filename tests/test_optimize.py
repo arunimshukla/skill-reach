@@ -595,25 +595,21 @@ def test_run_candidate_probes_scores_rival_and_out_of_scope_queries(tmp_path: Pa
         "unrelated query 2": "target-tool",
     }
     runtime = FakeRuntime(selections)
-    (
-        triggers,
-        positive_queries,
-        correct_count,
-        misroutes,
-        failed_queries,
-        misrouted_queries,
-    ) = _run_candidate_probes(
+    tally = _run_candidate_probes(
         runtime,
         queries,
         "target-tool",
         tmp_path,
     )
-    assert positive_queries == 2
-    assert triggers == 1
-    assert correct_count == 3
-    assert misroutes == 3
-    assert failed_queries == ("target query 2",)
-    assert misrouted_queries == ("rival query 2", "unrelated query 2")
+    assert tally.positive_queries == 2
+    assert tally.triggers == 1
+    assert tally.correct_count == 3
+    assert tally.misroutes == 3
+    assert tally.failed_queries == ("target query 2",)
+    assert tally.misrouted_queries == ("rival query 2", "unrelated query 2")
+    assert tally.recall == 0.5
+    assert tally.accuracy == 0.5
+    assert tally.misroute_rate == 0.5
 
 
 def test_evaluate_candidate_with_rival_queries_computes_accuracy(
@@ -647,11 +643,14 @@ def test_evaluate_candidate_with_rival_queries_computes_accuracy(
         rivals=[rival],
         queries=queries,
         agent="keyword",
+        baseline_recall=0.5,
+        baseline_accuracy=0.5,
         budget=10,
     )
-    assert evaluated.accuracy == 1.0
     assert evaluated.recall == 1.0
+    assert evaluated.accuracy == 1.0
     assert evaluated.misroute_rate == 0.0
+    assert evaluated.delta_recall == 0.5
 
 
 def test_evaluate_all_candidates_breaks_ties_by_origin() -> None:
@@ -689,68 +688,56 @@ def test_evaluate_all_candidates_breaks_ties_by_origin() -> None:
     assert spent == 0
 
 
-def test_evaluate_all_candidates_returns_exact_probe_spend_and_avoids_budget_drift(
+@pytest.mark.parametrize(
+    ("budget", "candidates", "expected_spent"),
+    [
+        pytest.param(
+            12,
+            [
+                OptimizationCandidate(description="Valid clean candidate 1.", lint_clean=True),
+                OptimizationCandidate(description="Valid clean candidate 2.", lint_clean=True),
+                OptimizationCandidate(description="Short", lint_clean=False),
+            ],
+            4,
+            id="exact-probe-spend-avoids-budget-drift",
+        ),
+        pytest.param(
+            1,
+            [
+                OptimizationCandidate(description="Valid clean candidate 1.", lint_clean=True),
+                OptimizationCandidate(description="Valid clean candidate 2.", lint_clean=True),
+                OptimizationCandidate(description="Valid clean candidate 3.", lint_clean=True),
+            ],
+            1,
+            id="clamps-spend-when-budget-less-than-candidate-count",
+        ),
+    ],
+)
+def test_evaluate_all_candidates_budget_clamping_and_exact_spend(
     write_skill_model: Callable[..., Skill],
+    budget: int,
+    candidates: list[OptimizationCandidate],
+    expected_spent: int,
 ) -> None:
-    """Verify _evaluate_all_candidates returns exact probes spent and does not over-deduct."""
+    """Verify _evaluate_all_candidates returns exact probes spent and clamps to remaining budget."""
     target = write_skill_model(name="probe-tool", description="Tool for testing probe spend.")
     queries = [
         Query(id="q1", text="query 1", expected_skill="probe-tool", kind=QueryKind.IMPLICIT),
         Query(id="q2", text="query 2", expected_skill="probe-tool", kind=QueryKind.IMPLICIT),
     ]
 
-    cands = [
-        OptimizationCandidate(description="Valid clean candidate 1.", lint_clean=True),
-        OptimizationCandidate(description="Valid clean candidate 2.", lint_clean=True),
-        OptimizationCandidate(description="Short", lint_clean=False),  # Dirty: skipped
-    ]
-
-    # Budget is 12, 2 clean candidates -> eval_budget_per_candidate = 6
-    # But only 2 queries exist, so each clean candidate only runs 2 probes
-    # Total probes spent must be exactly 2 * 2 = 4, NOT 12!
     _ranked, spent = _evaluate_all_candidates(
-        candidates=cands,
+        candidates=candidates,
         target_skill=target,
         rivals=[],
         queries=queries,
         agent="keyword",
         baseline_recall=0.0,
         baseline_accuracy=0.0,
-        budget=12,
+        budget=budget,
         config=None,
     )
-    assert spent == 4
-
-
-def test_evaluate_all_candidates_clamps_spend_when_budget_less_than_candidate_count(
-    write_skill_model: Callable[..., Skill],
-) -> None:
-    """Verify _evaluate_all_candidates clamps probe spend when budget < candidate count."""
-    target = write_skill_model(name="probe-tool-clamp", description="Tool for testing clamp.")
-    queries = [
-        Query(id="q1", text="query 1", expected_skill="probe-tool-clamp", kind=QueryKind.IMPLICIT),
-        Query(id="q2", text="query 2", expected_skill="probe-tool-clamp", kind=QueryKind.IMPLICIT),
-    ]
-
-    cands = [
-        OptimizationCandidate(description="Valid clean candidate 1.", lint_clean=True),
-        OptimizationCandidate(description="Valid clean candidate 2.", lint_clean=True),
-        OptimizationCandidate(description="Valid clean candidate 3.", lint_clean=True),
-    ]
-
-    # Budget is 1 with 3 candidates. Running clamp must ensure total probes spent <= 1
-    _ranked, spent = _evaluate_all_candidates(
-        candidates=cands,
-        target_skill=target,
-        rivals=[],
-        queries=queries,
-        agent="keyword",
-        baseline_recall=0.0,
-        baseline_accuracy=0.0,
-        budget=1,
-        config=None,
-    )
-    assert spent == 1
+    assert spent == expected_spent
 
 
 @pytest.mark.parametrize(
@@ -1595,3 +1582,230 @@ def test_optimization_response_requires_candidates() -> None:
     )
     assert len(resp.candidates) == 1
     assert resp.candidates[0].description == "Valid candidate"
+
+
+@pytest.mark.parametrize(
+    "origin",
+    [CandidateOrigin.LLM, CandidateOrigin.DISCLAIMER],
+)
+def test_evaluate_candidate_preserves_origin_and_installs_full_corpus(
+    origin: CandidateOrigin,
+    tmp_path: Path,
+) -> None:
+    """Verify evaluate_candidate preserves origin, installs full corpus, and pairs recall."""
+    from reach.models import Skill
+
+    for s_name in ("target-skill", "rival-skill", "third-corpus-skill"):
+        s_dir = tmp_path / s_name
+        s_dir.mkdir(parents=True, exist_ok=True)
+        (s_dir / "SKILL.md").write_text(
+            f"---\nname: {s_name}\ndescription: Use when working with {s_name}.\n---\n",
+            encoding="utf-8",
+        )
+    target = Skill(
+        name="target-skill",
+        description="Use when deploying target-skill services.",
+        path=tmp_path / "target-skill",
+    )
+    rival = Skill(
+        name="rival-skill",
+        description="Use when deploying rival-skill services.",
+        path=tmp_path / "rival-skill",
+    )
+    third_corpus_skill = Skill(
+        name="third-corpus-skill",
+        description="Use when managing third-corpus-skill workflows.",
+        path=tmp_path / "third-corpus-skill",
+    )
+    cand = OptimizationCandidate(
+        description="Use when deploying target-skill services reliably.",
+        origin=origin,
+    )
+    queries = [
+        Query(id="q-pos-1", text="deploy target-skill service", expected_skill="target-skill"),
+        Query(
+            id="q-neg-third",
+            text="manage third-corpus-skill workflow",
+            expected_skill="third-corpus-skill",
+        ),
+    ]
+    evaluated = evaluate_candidate(
+        candidate=cand,
+        target=target,
+        rivals=[rival],
+        queries=queries,
+        agent="keyword",
+        baseline_recall=0.0,
+        budget=2,
+        skills_corpus=[target, rival, third_corpus_skill],
+        baseline_hits_by_id={"q-pos-1": True},
+    )
+    assert evaluated.origin == origin
+    assert evaluated.recall == 1.0
+    assert evaluated.accuracy == 1.0
+    # Because q-pos-1 already hit in baseline_hits_by_id, paired delta_recall is 0.0 (not 1.0 - 0.0)
+    assert evaluated.delta_recall == 0.0
+
+
+def test_evaluate_all_candidates_deduplicates_and_memoizes_across_rounds(
+    tmp_path: Path,
+) -> None:
+    """Verify duplicate candidates, baseline matches, and cache hits avoid extra probes."""
+    from reach.optimize import _evaluate_all_candidates
+
+    target = Skill(
+        name="target-tool",
+        description="Baseline description for target-tool.",
+        path=tmp_path / "target-tool",
+    )
+    rival = Skill(
+        name="rival-tool",
+        description="Competitor description.",
+        path=tmp_path / "rival-tool",
+    )
+    queries = [
+        Query(
+            id="q1",
+            text="run target-tool",
+            expected_skill="target-tool",
+            kind=QueryKind.IMPLICIT,
+        )
+    ]
+
+    candidates = [
+        # 1. Exact match to baseline description -> short-circuits to baseline scores (0 probes)
+        OptimizationCandidate(
+            description="Baseline description for target-tool.",
+            origin=CandidateOrigin.HEURISTIC,
+            lint_clean=True,
+        ),
+        # 2. Duplicate description across two origins -> only probes once and keeps LLM origin
+        OptimizationCandidate(
+            description="Improved description for target-tool.",
+            origin=CandidateOrigin.HEURISTIC,
+            lint_clean=True,
+        ),
+        OptimizationCandidate(
+            description="Improved description for target-tool.  ",
+            origin=CandidateOrigin.LLM,
+            lint_clean=True,
+        ),
+    ]
+
+    from reach.optimize import _BaselineEvaluation, _CandidateEvalCache
+
+    eval_cache = _CandidateEvalCache()
+    baseline = _BaselineEvaluation(
+        recall=0.75,
+        accuracy=0.75,
+        misroute_rate=0.1,
+        remaining_budget=10,
+        hits_by_id={"q1": True},
+    )
+    with patch("reach.optimize.evaluate_candidate") as mock_eval:
+        mock_eval.side_effect = lambda **kw: kw["candidate"].model_copy(
+            update={"recall": 1.0, "accuracy": 1.0, "delta_recall": 0.25}
+        )
+
+        # Round 1: only 1 actual evaluate_candidate call should be made
+        evaluated_r1, spent_r1 = _evaluate_all_candidates(
+            candidates=candidates,
+            target_skill=target,
+            rivals=[rival],
+            queries=queries,
+            agent="keyword",
+            baseline=baseline,
+            budget=10,
+            config=None,
+            eval_cache=eval_cache,
+        )
+        assert mock_eval.call_count == 1
+        assert spent_r1 == 1
+        assert len(evaluated_r1) == 2
+
+        # Round 2 with the same candidate -> served from eval_cache with 0 probes!
+        evaluated_r2, spent_r2 = _evaluate_all_candidates(
+            candidates=candidates,
+            target_skill=target,
+            rivals=[rival],
+            queries=queries,
+            agent="keyword",
+            baseline=baseline,
+            budget=10,
+            config=None,
+            eval_cache=eval_cache,
+        )
+        assert mock_eval.call_count == 1
+        assert spent_r2 == 0
+        assert len(evaluated_r2) == 2
+
+
+@pytest.mark.parametrize(
+    (
+        "triggers",
+        "positive_queries",
+        "correct_count",
+        "misroutes",
+        "total_queries",
+        "expected_metrics",
+    ),
+    [
+        pytest.param(3, 4, 5, 1, 6, (0.75, 0.8333, 0.1667), id="partial-hits-and-misroutes"),
+        pytest.param(
+            0, 0, 2, 0, 2, (1.0, 1.0, 0.0), id="zero-positive-queries-all-negatives-correct"
+        ),
+    ],
+)
+def test_optimization_pydantic_models_and_transitions(
+    triggers: int,
+    positive_queries: int,
+    correct_count: int,
+    misroutes: int,
+    total_queries: int,
+    expected_metrics: tuple[float, float, float],
+) -> None:
+    """Verify Pydantic _CandidateProbeTally, rounding validators, and candidate transitions."""
+    from pydantic import BaseModel
+
+    from reach.optimize import (
+        _BaselineEvaluation,
+        _CandidateEvalCache,
+        _CandidateProbeTally,
+        _RivalContext,
+        _RoundOutcome,
+        _SkillFrontmatterPatch,
+    )
+
+    for model_cls in (
+        _CandidateProbeTally,
+        _BaselineEvaluation,
+        _RivalContext,
+        _RoundOutcome,
+        _CandidateEvalCache,
+        _SkillFrontmatterPatch,
+    ):
+        assert issubclass(model_cls, BaseModel)
+
+    tally = _CandidateProbeTally(
+        triggers=triggers,
+        positive_queries=positive_queries,
+        correct_count=correct_count,
+        misroutes=misroutes,
+        total_queries=total_queries,
+        failed_queries=("q-miss",),
+        misrouted_queries=("q-misroute -> rival",),
+    )
+    cand = OptimizationCandidate(description="Candidate with unrounded float.", recall=0.123456)
+    assert cand.recall == 0.1235
+
+    trained = cand.with_train_metrics(tally, delta_recall=tally.recall - 0.5)
+    assert (trained.recall, trained.accuracy, trained.misroute_rate) == expected_metrics
+    assert trained.failed_queries == ("q-miss",)
+
+    filtered = trained.mark_filtered("Too short")
+    assert filtered.filtered_out is True
+    assert filtered.filter_reason == "Too short"
+    assert filtered.unfiltered().filtered_out is False
+
+    tested = trained.with_test_metrics(tally)
+    assert (tested.test_recall, tested.test_accuracy, tested.test_misroute_rate) == expected_metrics

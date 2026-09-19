@@ -85,7 +85,7 @@ _KEY_SYNC_AGENTS = ("antigravity-cli", "antigravity-sdk", "goose", "pi")
 def test_agent_runtime_cannot_be_instantiated_directly() -> None:
     """Verify AgentRuntime ABC raises TypeError when instantiated directly."""
     with pytest.raises(TypeError, match="Can't instantiate abstract class AgentRuntime"):
-        AgentRuntime()  # type: ignore[abstract]
+        AgentRuntime()  # type: ignore[abstract]  # ty: ignore[call-non-callable]
 
 
 def test_incomplete_runtime_subclass_cannot_be_instantiated() -> None:
@@ -95,7 +95,7 @@ def test_incomplete_runtime_subclass_cannot_be_instantiated() -> None:
         name = "incomplete"
 
     with pytest.raises(TypeError, match="Can't instantiate abstract class IncompleteRuntime"):
-        IncompleteRuntime()  # type: ignore[abstract]
+        IncompleteRuntime()  # type: ignore[abstract]  # ty: ignore[call-non-callable]
 
 
 def _assert_runtime_attributes(runtime: AgentRuntime, agent: str) -> None:

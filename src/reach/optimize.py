@@ -25,7 +25,14 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any, Final
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints, computed_field
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    computed_field,
+    field_validator,
+)
 
 from reach._io import atomic_write_text
 from reach.catalog import load_skills, split_frontmatter
@@ -93,6 +100,87 @@ ORIGIN_PRIORITY: Final[dict[CandidateOrigin | str, int]] = {
 }
 
 
+def _round_optional_metric(value: object) -> object:
+    """Round float metric values to 4 decimal places when numeric."""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return round(float(value), 4)
+    return value
+
+
+class _CandidateProbeTally(BaseModel):
+    """Encapsulate empirical probe counts and derived routing metrics for a candidate."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    triggers: int = Field(default=0, ge=0)
+    positive_queries: int = Field(default=0, ge=0)
+    correct_count: int = Field(default=0, ge=0)
+    misroutes: int = Field(default=0, ge=0)
+    total_queries: int = Field(default=0, ge=0)
+    failed_queries: tuple[str, ...] = ()
+    misrouted_queries: tuple[str, ...] = ()
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def recall(self) -> float:
+        """Compute empirical recall across positive queries."""
+        return round(
+            (self.triggers / self.positive_queries) if self.positive_queries > 0 else 1.0,
+            4,
+        )
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def accuracy(self) -> float:
+        """Compute empirical overall accuracy across executed probes."""
+        return round(
+            (self.correct_count / self.total_queries) if self.total_queries > 0 else 1.0,
+            4,
+        )
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def misroute_rate(self) -> float:
+        """Compute empirical misroute rate across executed probes."""
+        return round(
+            (self.misroutes / self.total_queries) if self.total_queries > 0 else 0.0,
+            4,
+        )
+
+    def paired_delta_recall(
+        self,
+        *,
+        baseline_recall: float,
+        baseline_hits_by_id: dict[str, bool] | None,
+        queries_to_run: Sequence[Query],
+        target_name: str,
+    ) -> float:
+        """Compute paired delta recall against baseline hits on the same positive query subset."""
+        effective_baseline_recall = baseline_recall
+        if baseline_hits_by_id:
+            paired_pos_ids = [
+                q.id
+                for q in queries_to_run
+                if q.expected_skill == target_name and q.id in baseline_hits_by_id
+            ]
+            if paired_pos_ids:
+                effective_baseline_recall = sum(
+                    1 for q_id in paired_pos_ids if baseline_hits_by_id[q_id]
+                ) / len(paired_pos_ids)
+        return round(self.recall - effective_baseline_recall, 4)
+
+    def as_legacy_tuple(self) -> tuple[int, int, int, int, tuple[str, ...], tuple[str, ...]]:
+        """Return the 6-element tuple shape for callers unpacking _run_candidate_probes."""
+        return (
+            self.triggers,
+            self.positive_queries,
+            self.correct_count,
+            self.misroutes,
+            self.failed_queries,
+            self.misrouted_queries,
+        )
+
+
 class OptimizationCandidate(BaseModel):
     """Represent a generated description rewrite and its empirical performance."""
 
@@ -102,6 +190,8 @@ class OptimizationCandidate(BaseModel):
     delta_recall: float = Field(default=0.0, ge=-1.0, le=1.0)
     description: str
     lint_clean: bool = True
+    filtered_out: bool = False
+    filter_reason: str = ""
     misroute_rate: float = Field(default=0.0, ge=0.0, le=1.0)
     rationale: str = ""
     origin: CandidateOrigin = CandidateOrigin.HEURISTIC
@@ -111,6 +201,195 @@ class OptimizationCandidate(BaseModel):
     test_misroute_rate: Annotated[float, Field(ge=0.0, le=1.0)] | None = None
     failed_queries: tuple[str, ...] = ()
     misrouted_queries: tuple[str, ...] = ()
+
+    @field_validator(
+        "accuracy",
+        "delta_recall",
+        "misroute_rate",
+        "recall",
+        "test_recall",
+        "test_accuracy",
+        "test_misroute_rate",
+        mode="before",
+    )
+    @classmethod
+    def _round_metrics(cls, value: object) -> object:
+        """Round candidate metric fields to 4 decimal places."""
+        return _round_optional_metric(value)
+
+    def mark_filtered(self, reason: str = "") -> OptimizationCandidate:
+        """Return a copy marked as filtered out by static lint rules."""
+        return self.model_copy(
+            update={"lint_clean": False, "filtered_out": True, "filter_reason": reason}
+        )
+
+    def unfiltered(self) -> OptimizationCandidate:
+        """Return a copy marked as passing static lint rules."""
+        return self.model_copy(
+            update={"lint_clean": True, "filtered_out": False, "filter_reason": ""}
+        )
+
+    def with_train_metrics(
+        self,
+        tally: _CandidateProbeTally,
+        *,
+        delta_recall: float,
+    ) -> OptimizationCandidate:
+        """Return a copy populated with training probe metrics from a _CandidateProbeTally."""
+        return self.model_copy(
+            update={
+                "recall": tally.recall,
+                "accuracy": tally.accuracy,
+                "misroute_rate": tally.misroute_rate,
+                "delta_recall": round(delta_recall, 4),
+                "failed_queries": tally.failed_queries,
+                "misrouted_queries": tally.misrouted_queries,
+            }
+        )
+
+    def with_test_metrics(self, tally: _CandidateProbeTally) -> OptimizationCandidate:
+        """Return a copy populated with holdout test probe metrics from a _CandidateProbeTally."""
+        return self.model_copy(
+            update={
+                "test_recall": tally.recall,
+                "test_accuracy": tally.accuracy,
+                "test_misroute_rate": tally.misroute_rate,
+            }
+        )
+
+    def with_baseline_metrics(
+        self,
+        *,
+        recall: float,
+        accuracy: float,
+        misroute_rate: float,
+    ) -> OptimizationCandidate:
+        """Return a copy populated with baseline scores when description matches baseline."""
+        return self.model_copy(
+            update={
+                "recall": round(recall, 4),
+                "accuracy": round(accuracy, 4),
+                "misroute_rate": round(misroute_rate, 4),
+                "delta_recall": 0.0,
+            }
+        )
+
+    def from_cached_train(self, cached: OptimizationCandidate) -> OptimizationCandidate:
+        """Return a copy adopting cached training metrics from a prior evaluation."""
+        return self.model_copy(
+            update={
+                "recall": cached.recall,
+                "accuracy": cached.accuracy,
+                "misroute_rate": cached.misroute_rate,
+                "delta_recall": cached.delta_recall,
+                "failed_queries": cached.failed_queries,
+                "misrouted_queries": cached.misrouted_queries,
+            }
+        )
+
+    def from_cached_test(self, cached: OptimizationCandidate) -> OptimizationCandidate:
+        """Return a copy adopting cached holdout test metrics from a prior evaluation."""
+        return self.model_copy(
+            update={
+                "test_recall": cached.test_recall,
+                "test_accuracy": cached.test_accuracy,
+                "test_misroute_rate": cached.test_misroute_rate,
+            }
+        )
+
+
+class _BaselineEvaluation(BaseModel):
+    """Bundle baseline empirical scores, remaining probe budget, and per-query hit map."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    recall: float = Field(default=0.0, ge=0.0, le=1.0)
+    accuracy: float = Field(default=0.0, ge=0.0, le=1.0)
+    misroute_rate: float = Field(default=0.0, ge=0.0, le=1.0)
+    remaining_budget: int = Field(default=0, ge=0)
+    hits_by_id: dict[str, bool] = Field(default_factory=dict)
+
+    @field_validator("recall", "accuracy", "misroute_rate", mode="before")
+    @classmethod
+    def _round_metrics(cls, value: object) -> object:
+        """Round baseline metric fields to 4 decimal places."""
+        return _round_optional_metric(value)
+
+
+class _RivalContext(BaseModel):
+    """Encapsulate resolved target skill, full catalog, and lexical rival analysis."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    target_skill: Skill
+    all_skills: tuple[Skill, ...]
+    rival_name: str = ""
+    ceded_terms: tuple[str, ...] = ()
+    unclaimed_terms: tuple[str, ...] = ()
+    rival_skills: tuple[Skill, ...] = ()
+
+
+class _RoundOutcome(BaseModel):
+    """Record evaluated candidates, best candidate, and probe spend for a single round."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    evaluated_candidates: tuple[OptimizationCandidate, ...] = ()
+    round_best: OptimizationCandidate | None = None
+    probes_spent: int = Field(default=0, ge=0)
+    test_evaluated: bool = False
+
+
+class _CandidateEvalCache(BaseModel):
+    """Memoize evaluated OptimizationCandidates across rounds for train and holdout sets."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    entries: dict[tuple[str, bool], OptimizationCandidate] = Field(default_factory=dict)
+
+    def has_train(self, description: str) -> bool:
+        """Check if a normalized candidate description has cached training metrics."""
+        return (description.strip(), False) in self.entries
+
+    def get_train(self, description: str) -> OptimizationCandidate | None:
+        """Retrieve cached training evaluation for a normalized candidate description."""
+        return self.entries.get((description.strip(), False))
+
+    def put_train(self, candidate: OptimizationCandidate) -> None:
+        """Store training evaluation for a candidate description."""
+        self.entries[(candidate.description.strip(), False)] = candidate
+
+    def has_test(self, description: str) -> bool:
+        """Check if a normalized candidate description has cached holdout test metrics."""
+        return (description.strip(), True) in self.entries
+
+    def get_test(self, description: str) -> OptimizationCandidate | None:
+        """Retrieve cached holdout test evaluation for a normalized candidate description."""
+        return self.entries.get((description.strip(), True))
+
+    def put_test(self, candidate: OptimizationCandidate) -> None:
+        """Store holdout test evaluation for a candidate description."""
+        self.entries[(candidate.description.strip(), True)] = candidate
+
+    def __contains__(self, key: tuple[str, bool]) -> bool:
+        """Support legacy `(norm, is_test) in cache` membership checks."""
+        return (key[0].strip(), key[1]) in self.entries
+
+    def __getitem__(self, key: tuple[str, bool]) -> OptimizationCandidate:
+        """Support legacy `cache[(norm, is_test)]` indexing."""
+        return self.entries[(key[0].strip(), key[1])]
+
+    def __setitem__(self, key: tuple[str, bool], value: OptimizationCandidate) -> None:
+        """Support legacy `cache[(norm, is_test)] = value` assignment."""
+        self.entries[(key[0].strip(), key[1])] = value
+
+
+class _SkillFrontmatterPatch(BaseModel):
+    """Validate SKILL.md frontmatter updates while preserving all additional keys."""
+
+    model_config = ConfigDict(extra="allow")
+
+    description: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 
 
 class IterationRecord(BaseModel):
@@ -144,6 +423,12 @@ class OptimizationReport(BaseModel):
     rounds: tuple[IterationRecord, ...] = ()
     skill_name: str
     unclaimed_terms: tuple[str, ...] = ()
+
+    @field_validator("baseline_accuracy", "baseline_misroute", "baseline_recall", mode="before")
+    @classmethod
+    def _round_baseline_metrics(cls, value: object) -> object:
+        """Round baseline metric fields to 4 decimal places."""
+        return _round_optional_metric(value)
 
     @property
     def best_candidate(self) -> OptimizationCandidate | None:
@@ -184,10 +469,10 @@ def update_skill_description(manifest_path: Path, new_description: str) -> bool:
         data = yaml.safe_load(raw_frontmatter)
         if not isinstance(data, dict):
             return False
-        data["description"] = new_description
-        new_yaml = yaml.safe_dump(data, sort_keys=False, allow_unicode=True).strip()
+        patched = _SkillFrontmatterPatch.model_validate({**data, "description": new_description})
+        new_yaml = yaml.safe_dump(patched.model_dump(), sort_keys=False, allow_unicode=True).strip()
         atomic_write_text(manifest_path, f"---\n{new_yaml}\n---{body}", encoding="utf-8")
-    except (OSError, yaml.YAMLError):
+    except (OSError, yaml.YAMLError, ValueError):
         return False
     return True
 
@@ -309,12 +594,20 @@ def filter_candidates(
 
     for candidate in candidates:
         desc_len = len(candidate.description)
-        clean = not (
-            desc_len < lint_config.min_description_length
-            or desc_len > lint_config.max_description_length
-        )
-
-        results.append(candidate.model_copy(update={"lint_clean": clean}))
+        if desc_len < lint_config.min_description_length:
+            results.append(
+                candidate.mark_filtered(
+                    f"Description length {desc_len} < {lint_config.min_description_length}"
+                )
+            )
+        elif desc_len > lint_config.max_description_length:
+            results.append(
+                candidate.mark_filtered(
+                    f"Description length {desc_len} > {lint_config.max_description_length}"
+                )
+            )
+        else:
+            results.append(candidate.unfiltered())
     return results
 
 
@@ -539,8 +832,11 @@ def _run_candidate_probes(
     queries_to_run: Sequence[Query],
     target_name: str,
     workdir: Path,
-) -> tuple[int, int, int, int, tuple[str, ...], tuple[str, ...]]:
-    """Execute empirical queries in isolated workspace and tally routing counts and failures."""
+    catalog: Catalog | None = None,
+) -> _CandidateProbeTally:
+    """Execute empirical queries via ProbeHarness in isolated workspace and tally outcomes."""
+    from reach.run import ProbeHarness
+
     triggers = 0
     positive_queries = 0
     correct_count = 0
@@ -548,41 +844,46 @@ def _run_candidate_probes(
     failed_queries: list[str] = []
     misrouted_queries: list[str] = []
 
+    active_catalog = catalog or Catalog(
+        id="opt-catalog",
+        skills=(target_name,),
+        mode=CatalogMode.ALL,
+    )
+    harness = ProbeHarness(runtime=runtime, workers=1)
+
     for query in queries_to_run:
         is_positive = query.expected_skill == target_name
         if is_positive:
             positive_queries += 1
 
         try:
-            try:
-                outcome = runtime.select(query.text, workdir, target_skill=query.expected_skill)
-            except TypeError:
-                outcome = runtime.select(query.text, workdir)
-            invoked = outcome.invoked_skill
-        except (OSError, RuntimeError, ValueError):
+            probe_res = next(harness.run_probes([query], active_catalog, workdir, attempts=1))
+            invoked = probe_res.invoked_skill
+        except (OSError, RuntimeError, ValueError, StopIteration):
             invoked = None
 
         if is_positive:
-            if invoked == target_name:
+            if invoked == target_name or query.matches_skill(invoked):
                 triggers += 1
                 correct_count += 1
             else:
                 if invoked is not None:
                     misroutes += 1
                 failed_queries.append(query.text)
-        elif invoked == query.expected_skill:
+        elif query.matches_skill(invoked):
             correct_count += 1
         elif invoked == target_name:
             misroutes += 1
             misrouted_queries.append(query.text)
 
-    return (
-        triggers,
-        positive_queries,
-        correct_count,
-        misroutes,
-        tuple(failed_queries),
-        tuple(misrouted_queries),
+    return _CandidateProbeTally(
+        triggers=triggers,
+        positive_queries=positive_queries,
+        correct_count=correct_count,
+        misroutes=misroutes,
+        total_queries=len(queries_to_run),
+        failed_queries=tuple(failed_queries),
+        misrouted_queries=tuple(misrouted_queries),
     )
 
 
@@ -627,6 +928,8 @@ def evaluate_candidate(
     budget: int = 20,
     config: Path | None = None,
     is_test: bool = False,
+    skills_corpus: Sequence[Skill] | None = None,
+    baseline_hits_by_id: dict[str, bool] | None = None,
 ) -> OptimizationCandidate:
     """Empirically evaluate a candidate description against queries within a probe budget."""
     if not queries or budget < 1:
@@ -635,72 +938,50 @@ def evaluate_candidate(
     queries_to_run = list(queries)[:budget]
     runtime = _setup_runtime(agent, config=config)
 
-    with tempfile.TemporaryDirectory() as temp_dir:
-        temp_path = Path(temp_dir)
-        workdir = temp_path / "workdir"
-        workdir.mkdir(parents=True, exist_ok=True)
-        candidate_stage = temp_path / "candidate_skill" / target.name
-        candidate_skill = _materialize_candidate_skill(
-            target, candidate.description, candidate_stage
-        )
-        all_skills = [candidate_skill, *rivals]
-        catalog = Catalog(
-            id="opt-catalog",
-            skills=tuple(s.name for s in all_skills),
-            mode=CatalogMode.ALL,
-        )
+    try:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            workdir = temp_path / "workdir"
+            workdir.mkdir(parents=True, exist_ok=True)
+            candidate_stage = temp_path / "candidate_skill" / target.name
+            candidate_skill = _materialize_candidate_skill(
+                target, candidate.description, candidate_stage
+            )
+            corpus_source = skills_corpus if skills_corpus is not None else [target, *rivals]
+            seen_names = {target.name}
+            all_skills = [candidate_skill]
+            for s in [*corpus_source, *rivals]:
+                if s.name not in seen_names:
+                    seen_names.add(s.name)
+                    all_skills.append(s)
 
-        runtime.install(catalog, all_skills, workdir)
-        (
-            triggers,
-            positive_queries,
-            correct_count,
-            misroutes,
-            failed_q,
-            misrouted_q,
-        ) = _run_candidate_probes(
-            runtime,
-            queries_to_run,
-            target.name,
-            workdir,
-        )
+            catalog = Catalog(
+                id="opt-catalog",
+                skills=tuple(s.name for s in all_skills),
+                mode=CatalogMode.ALL,
+            )
 
-    probes_executed = len(queries_to_run)
-    measured_recall = (triggers / positive_queries) if positive_queries > 0 else 1.0
-    measured_accuracy = (correct_count / probes_executed) if probes_executed > 0 else 1.0
-    measured_misroute = (misroutes / probes_executed) if probes_executed > 0 else 0.0
+            runtime.install(catalog, all_skills, workdir)
+            tally = _run_candidate_probes(
+                runtime,
+                queries_to_run,
+                target.name,
+                workdir,
+                catalog=catalog,
+            )
+    finally:
+        runtime.cleanup()
 
     if is_test:
-        return OptimizationCandidate(
-            description=candidate.description,
-            rationale=candidate.rationale,
-            lint_clean=candidate.lint_clean,
-            recall=candidate.recall,
-            accuracy=candidate.accuracy,
-            misroute_rate=candidate.misroute_rate,
-            delta_recall=candidate.delta_recall,
-            failed_queries=candidate.failed_queries,
-            misrouted_queries=candidate.misrouted_queries,
-            test_recall=round(measured_recall, 4),
-            test_accuracy=round(measured_accuracy, 4),
-            test_misroute_rate=round(measured_misroute, 4),
-        )
+        return candidate.with_test_metrics(tally)
 
-    delta_recall = round(measured_recall - baseline_recall, 4)
-    return OptimizationCandidate(
-        description=candidate.description,
-        rationale=candidate.rationale,
-        lint_clean=candidate.lint_clean,
-        recall=round(measured_recall, 4),
-        accuracy=round(measured_accuracy, 4),
-        misroute_rate=round(measured_misroute, 4),
-        delta_recall=delta_recall,
-        failed_queries=failed_q,
-        misrouted_queries=misrouted_q,
-        test_recall=candidate.test_recall,
-        test_accuracy=candidate.test_accuracy,
-        test_misroute_rate=candidate.test_misroute_rate,
+    delta_recall = tally.paired_delta_recall(
+        baseline_recall=baseline_recall,
+        baseline_hits_by_id=baseline_hits_by_id,
+        queries_to_run=queries_to_run,
+        target_name=target.name,
     )
+    return candidate.with_train_metrics(tally, delta_recall=delta_recall)
 
 
 def _find_target_skill(all_skills: Sequence[Skill], skill_name: str, resolved_root: Path) -> Skill:
@@ -896,27 +1177,91 @@ def _candidate_rank_key(
     return (c.delta_recall, -c.misroute_rate, c.accuracy, origin_prio)
 
 
+def _deduplicate_candidates_pre_eval(
+    candidates: Sequence[OptimizationCandidate],
+) -> list[OptimizationCandidate]:
+    """Deduplicate candidates by normalized description before probe evaluation."""
+    by_desc: dict[str, OptimizationCandidate] = {}
+    for cand in candidates:
+        norm = cand.description.strip()
+        existing = by_desc.get(norm)
+        if existing is None or (
+            cand.lint_clean,
+            ORIGIN_PRIORITY.get(cand.origin, 0),
+        ) > (
+            existing.lint_clean,
+            ORIGIN_PRIORITY.get(existing.origin, 0),
+        ):
+            by_desc[norm] = cand
+    return list(by_desc.values())
+
+
 def _evaluate_all_candidates(
     candidates: Sequence[OptimizationCandidate],
     target_skill: Skill,
     rivals: Sequence[Skill],
     queries: Sequence[Query],
     agent: str | None,
-    baseline_recall: float,
-    baseline_accuracy: float,
-    budget: int,
-    config: Path | None,
+    baseline_recall: float = 0.0,
+    baseline_accuracy: float = 0.0,
+    budget: int = 0,
+    config: Path | None = None,
+    skills_corpus: Sequence[Skill] | None = None,
+    baseline_hits_by_id: dict[str, bool] | None = None,
+    baseline_misroute: float = 0.0,
+    eval_cache: _CandidateEvalCache | dict[tuple[str, bool], OptimizationCandidate] | None = None,
+    *,
+    baseline: _BaselineEvaluation | None = None,
 ) -> tuple[list[OptimizationCandidate], int]:
     """Empirically evaluate all lint-clean candidates and rank them."""
-    clean_candidates = [c for c in candidates if c.lint_clean]
-    num_clean = len(clean_candidates)
+    if baseline is not None:
+        baseline_recall = baseline.recall
+        baseline_accuracy = baseline.accuracy
+        baseline_misroute = baseline.misroute_rate
+        baseline_hits_by_id = baseline.hits_by_id
+
+    cache = (
+        eval_cache
+        if isinstance(eval_cache, _CandidateEvalCache)
+        else (_CandidateEvalCache(entries=eval_cache) if eval_cache is not None else None)
+    )
+    unique_candidates = _deduplicate_candidates_pre_eval(candidates)
+    target_norm = target_skill.description.strip()
+
+    needs_probe = [
+        c
+        for c in unique_candidates
+        if c.lint_clean
+        and c.description.strip() != target_norm
+        and (cache is None or not cache.has_train(c.description))
+    ]
+    num_clean = len(needs_probe)
     eval_budget_per_candidate = max(1, budget // (num_clean or 1)) if budget > 0 else 0
     evaluated_candidates: list[OptimizationCandidate] = []
     total_probes_spent = 0
     remaining_budget = budget
 
-    for cand in candidates:
-        if cand.lint_clean and queries and eval_budget_per_candidate > 0 and remaining_budget > 0:
+    for cand in unique_candidates:
+        norm = cand.description.strip()
+        if not cand.lint_clean:
+            evaluated_candidates.append(cand)
+            continue
+
+        if norm == target_norm:
+            evaluated_candidates.append(
+                cand.with_baseline_metrics(
+                    recall=baseline_recall,
+                    accuracy=baseline_accuracy,
+                    misroute_rate=baseline_misroute,
+                )
+            )
+            continue
+
+        if cache is not None and (cached := cache.get_train(norm)) is not None:
+            evaluated_candidates.append(cand.from_cached_train(cached))
+            continue
+
+        if queries and eval_budget_per_candidate > 0 and remaining_budget > 0:
             actual_budget = min(len(queries), eval_budget_per_candidate, remaining_budget)
             evaluated = evaluate_candidate(
                 candidate=cand,
@@ -928,7 +1273,13 @@ def _evaluate_all_candidates(
                 baseline_accuracy=baseline_accuracy,
                 budget=actual_budget,
                 config=config,
+                skills_corpus=skills_corpus,
+                baseline_hits_by_id=baseline_hits_by_id,
             )
+            if cache is not None:
+                cache.put_train(evaluated)
+                if isinstance(eval_cache, dict):
+                    eval_cache[(norm, False)] = evaluated
             total_probes_spent += actual_budget
             remaining_budget = max(0, remaining_budget - actual_budget)
             evaluated_candidates.append(evaluated)
@@ -940,8 +1291,7 @@ def _evaluate_all_candidates(
 
 
 def _run_optimization_round(
-    target_skill: Skill,
-    rival_skills: Sequence[Skill],
+    context: _RivalContext,
     train_queries: Sequence[Query],
     test_queries: Sequence[Query],
     *,
@@ -949,8 +1299,6 @@ def _run_optimization_round(
     driver: TextGenerator | None,
     lint_config: LintSettings | None,
     config: Path | None,
-    ceded_terms: tuple[str, ...],
-    unclaimed_terms: tuple[str, ...],
     candidates_count: int,
     failed_triggers: Sequence[str],
     false_triggers: Sequence[str],
@@ -959,15 +1307,18 @@ def _run_optimization_round(
     iterations: int,
     remaining_budget: int,
     holdout: float,
-    baseline_recall: float,
-    baseline_accuracy: float,
-) -> tuple[list[OptimizationCandidate], OptimizationCandidate | None, int, bool]:
+    baseline: _BaselineEvaluation,
+    eval_cache: _CandidateEvalCache | None = None,
+) -> _RoundOutcome:
     """Execute candidate synthesis and dual-phase evaluation for a single iteration round."""
+    target_skill = context.target_skill
+    rival_skills = context.rival_skills
+    skills_corpus = context.all_skills
     raw_candidates = synthesize_candidates(
         target=target_skill,
         rivals=rival_skills,
-        ceded_terms=ceded_terms,
-        unclaimed_terms=unclaimed_terms,
+        ceded_terms=context.ceded_terms,
+        unclaimed_terms=context.unclaimed_terms,
         count=candidates_count,
         driver=driver,
         config=lint_config,
@@ -998,10 +1349,11 @@ def _run_optimization_round(
         rivals=rival_skills,
         queries=train_queries,
         agent=agent,
-        baseline_recall=baseline_recall,
-        baseline_accuracy=baseline_accuracy,
+        baseline=baseline,
         budget=train_share,
         config=config,
+        skills_corpus=skills_corpus,
+        eval_cache=eval_cache,
     )
 
     total_spent = train_spent
@@ -1011,12 +1363,24 @@ def _run_optimization_round(
     if test_queries and evaluated_candidates and test_share > 0 and avail_for_test > 0:
         test_round_budget = min(avail_for_test, test_share)
         tested_candidates: list[OptimizationCandidate] = []
-        test_cands_to_run = [c for c in evaluated_candidates if c.lint_clean]
+        test_cands_to_run = [
+            c
+            for c in evaluated_candidates
+            if c.lint_clean and (eval_cache is None or not eval_cache.has_test(c.description))
+        ]
         n_test = len(test_cands_to_run) or 1
         test_budget_per_cand = max(1, test_round_budget // n_test) if test_round_budget > 0 else 0
 
         for cand in evaluated_candidates:
-            if cand.lint_clean and test_budget_per_cand > 0 and avail_for_test > 0:
+            norm = cand.description.strip()
+            if (
+                cand.lint_clean
+                and eval_cache is not None
+                and (cached_test := eval_cache.get_test(norm)) is not None
+            ):
+                tested_candidates.append(cand.from_cached_test(cached_test))
+                tested_any = True
+            elif cand.lint_clean and test_budget_per_cand > 0 and avail_for_test > 0:
                 cand_budget = min(len(test_queries), test_budget_per_cand, avail_for_test)
                 tested = evaluate_candidate(
                     candidate=cand,
@@ -1027,7 +1391,10 @@ def _run_optimization_round(
                     budget=cand_budget,
                     config=config,
                     is_test=True,
+                    skills_corpus=skills_corpus,
                 )
+                if eval_cache is not None:
+                    eval_cache.put_test(tested)
                 actual_spent = min(len(test_queries), cand_budget)
                 avail_for_test = max(0, avail_for_test - actual_spent)
                 total_spent += actual_spent
@@ -1040,7 +1407,12 @@ def _run_optimization_round(
         evaluated_candidates = tested_candidates
 
     round_best = evaluated_candidates[0] if evaluated_candidates else None
-    return evaluated_candidates, round_best, total_spent, tested_any
+    return _RoundOutcome(
+        evaluated_candidates=tuple(evaluated_candidates),
+        round_best=round_best,
+        probes_spent=total_spent,
+        test_evaluated=tested_any,
+    )
 
 
 def _resolve_target_and_rivals(
@@ -1049,7 +1421,7 @@ def _resolve_target_and_rivals(
     config: Path | None,
     agent: str | None,
     global_scope: bool,
-) -> tuple[Skill, Sequence[Skill], str, tuple[str, ...], tuple[str, ...], Sequence[Skill]]:
+) -> _RivalContext:
     """Locate target skill and calculate rival relationships within resolved skill catalog."""
     from reach.catalog import resolve_skill_target
 
@@ -1075,7 +1447,14 @@ def _resolve_target_and_rivals(
     all_skills = load_skills(resolved_root)
     target_skill = _find_target_skill(all_skills, skill_name, resolved_root)
     rival_name, ceded_terms, unclaimed, rival_skills = _identify_rivals(all_skills, target_skill)
-    return target_skill, all_skills, rival_name, ceded_terms, unclaimed, rival_skills
+    return _RivalContext(
+        target_skill=target_skill,
+        all_skills=tuple(all_skills),
+        rival_name=rival_name,
+        ceded_terms=ceded_terms,
+        unclaimed_terms=unclaimed,
+        rival_skills=tuple(rival_skills),
+    )
 
 
 def _prepare_optimization_queries(
@@ -1142,10 +1521,11 @@ def _evaluate_baseline_performance(
     candidates_count: int,
     agent: str | None,
     config: Path | None,
-) -> tuple[float, float, float, int]:
+    skills_corpus: Sequence[Skill] | None = None,
+) -> _BaselineEvaluation:
     """Empirically evaluate baseline skill description against training queries."""
     if not train_queries or remaining_budget <= 0:
-        return 0.0, 0.0, 0.0, remaining_budget
+        return _BaselineEvaluation(remaining_budget=remaining_budget)
 
     base_budget = min(
         len(train_queries),
@@ -1161,9 +1541,22 @@ def _evaluate_baseline_performance(
         agent=agent,
         budget=base_budget,
         config=config,
+        skills_corpus=skills_corpus,
     )
+    failed_texts = set(eval_base.failed_queries)
+    baseline_hits_by_id = {
+        q.id: (q.text not in failed_texts)
+        for q in train_queries[:base_budget]
+        if q.expected_skill == target_skill.name
+    }
     new_budget = max(0, remaining_budget - min(len(train_queries), base_budget))
-    return eval_base.recall, eval_base.accuracy, eval_base.misroute_rate, new_budget
+    return _BaselineEvaluation(
+        recall=eval_base.recall,
+        accuracy=eval_base.accuracy,
+        misroute_rate=eval_base.misroute_rate,
+        remaining_budget=new_budget,
+        hits_by_id=baseline_hits_by_id,
+    )
 
 
 def _build_optimization_report(
@@ -1273,41 +1666,31 @@ def optimize_skill(
     if budget is not None:
         settings = settings.model_copy(update={"budget": budget})
 
-    (
-        target_skill,
-        all_skills,
-        rival_name,
-        ceded_terms,
-        unclaimed,
-        rival_skills,
-    ) = _resolve_target_and_rivals(skill_name, skills_path, config, agent, global_scope)
+    context = _resolve_target_and_rivals(skill_name, skills_path, config, agent, global_scope)
 
     queries, train_queries, test_queries = _prepare_optimization_queries(
-        target_skill=target_skill,
-        all_skills=all_skills,
-        rival_skills=rival_skills,
+        target_skill=context.target_skill,
+        all_skills=context.all_skills,
+        rival_skills=context.rival_skills,
         queries_path=queries_path,
         settings=settings,
         agent=agent,
         config=config,
-        ceded_terms=ceded_terms,
-        unclaimed=unclaimed,
+        ceded_terms=context.ceded_terms,
+        unclaimed=context.unclaimed_terms,
     )
 
-    (
-        baseline_recall,
-        baseline_accuracy,
-        baseline_misroute,
-        remaining_budget,
-    ) = _evaluate_baseline_performance(
-        target_skill=target_skill,
-        rival_skills=rival_skills,
+    baseline = _evaluate_baseline_performance(
+        target_skill=context.target_skill,
+        rival_skills=context.rival_skills,
         train_queries=train_queries,
         remaining_budget=settings.budget,
         candidates_count=candidates_count,
         agent=agent,
         config=config,
+        skills_corpus=context.all_skills,
     )
+    remaining_budget = baseline.remaining_budget
 
     lint_config = _resolve_lint_settings(config)
     driver = _setup_driver(agent, runtime_options, config=config)
@@ -1315,28 +1698,23 @@ def optimize_skill(
     rounds_history: list[IterationRecord] = []
     all_candidates: list[OptimizationCandidate] = []
     global_best: OptimizationCandidate | None = None
+    eval_cache = _CandidateEvalCache()
 
     for iter_idx in range(1, settings.iterations + 1):
-        prev_desc = global_best.description if global_best is not None else target_skill.description
+        prev_desc = (
+            global_best.description if global_best is not None else context.target_skill.description
+        )
         failed_triggers = global_best.failed_queries if global_best is not None else ()
         false_triggers = global_best.misrouted_queries if global_best is not None else ()
 
-        (
-            evaluated_candidates,
-            round_best,
-            round_probes_spent,
-            test_evaluated,
-        ) = _run_optimization_round(
-            target_skill=target_skill,
-            rival_skills=rival_skills,
+        outcome = _run_optimization_round(
+            context=context,
             train_queries=train_queries,
             test_queries=test_queries,
             agent=agent,
             driver=driver,
             lint_config=lint_config,
             config=config,
-            ceded_terms=ceded_terms,
-            unclaimed_terms=unclaimed,
             candidates_count=candidates_count,
             failed_triggers=failed_triggers,
             false_triggers=false_triggers,
@@ -1345,29 +1723,29 @@ def optimize_skill(
             iterations=settings.iterations,
             remaining_budget=remaining_budget,
             holdout=settings.holdout,
-            baseline_recall=baseline_recall,
-            baseline_accuracy=baseline_accuracy,
+            baseline=baseline,
+            eval_cache=eval_cache,
         )
-        remaining_budget = max(0, remaining_budget - round_probes_spent)
+        remaining_budget = max(0, remaining_budget - outcome.probes_spent)
 
-        if round_best is not None:
+        if outcome.round_best is not None:
             has_test = bool(test_queries)
             if global_best is None or _candidate_rank_key(
-                round_best, has_test=has_test
+                outcome.round_best, has_test=has_test
             ) >= _candidate_rank_key(global_best, has_test=has_test):
-                global_best = round_best
+                global_best = outcome.round_best
 
             rounds_history.append(
                 IterationRecord(
                     iteration=iter_idx,
-                    candidates=tuple(evaluated_candidates),
-                    best_candidate=round_best,
-                    failed_queries=round_best.failed_queries,
-                    misrouted_queries=round_best.misrouted_queries,
-                    test_evaluated=test_evaluated,
+                    candidates=outcome.evaluated_candidates,
+                    best_candidate=outcome.round_best,
+                    failed_queries=outcome.round_best.failed_queries,
+                    misrouted_queries=outcome.round_best.misrouted_queries,
+                    test_evaluated=outcome.test_evaluated,
                 ),
             )
-            all_candidates.extend(evaluated_candidates)
+            all_candidates.extend(outcome.evaluated_candidates)
 
             if (
                 global_best.recall >= 1.0
@@ -1378,13 +1756,13 @@ def optimize_skill(
 
     return _build_optimization_report(
         skill_name=skill_name,
-        target_skill=target_skill,
-        rival_name=rival_name,
-        ceded_terms=ceded_terms,
-        unclaimed_terms=unclaimed,
-        baseline_recall=baseline_recall,
-        baseline_accuracy=baseline_accuracy,
-        baseline_misroute=baseline_misroute,
+        target_skill=context.target_skill,
+        rival_name=context.rival_name,
+        ceded_terms=context.ceded_terms,
+        unclaimed_terms=context.unclaimed_terms,
+        baseline_recall=baseline.recall,
+        baseline_accuracy=baseline.accuracy,
+        baseline_misroute=baseline.misroute_rate,
         all_candidates=all_candidates,
         global_best=global_best,
         rounds_history=rounds_history,

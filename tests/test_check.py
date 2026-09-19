@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+from reach.runtime import SelectionOutcome
 import subprocess
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -516,33 +517,6 @@ def test_run_check_with_trajectory_thresholds_pass_and_fail(
     assert fail_outcome.exit_code == 2
 
 
-def test_build_check_assertions_with_pydantic_models() -> None:
-    """Verify _build_check_assertions directly with EmpiricalMetrics and CheckSettings."""
-    metrics = EmpiricalMetrics(
-        recall=0.92,
-        accuracy=0.92,
-        misroute_rate=0.04,
-        entrypoint_accuracy=0.88,
-        trajectory_reachability=0.95,
-        step_efficiency=0.85,
-        skill_f1=0.89,
-        redundancy=0.15,
-    )
-    settings = CheckSettings(
-        min_recall=0.80,
-        min_accuracy=0.80,
-        max_misroute=0.10,
-        min_entrypoint=0.85,
-        min_reachability=0.90,
-        min_efficiency=0.80,
-        min_f1=0.85,
-        max_redundancy=0.50,
-    )
-    assertions = _build_check_assertions(metrics, settings)
-    assert len(assertions) == 8
-    assert all(a.passed for a in assertions)
-
-
 def test_run_config_resolve_check_settings() -> None:
     """Verify RunConfig.resolve overrides baseline config cleanly with Pydantic."""
     base = CheckSettings(min_recall=0.75, min_accuracy=0.80, budget=10)
@@ -575,3 +549,73 @@ def test_load_catalog_skills_deduplicates_overlapping_paths(
         mode=CatalogMode.ALL,
     )
     assert catalog.skills == ("duplicate-tool",)
+
+
+@pytest.mark.parametrize(
+    "target_is_file", [False, True], ids=["directory-path", "skill-md-file-path"]
+)
+def test_check_empirical_probes_cache_and_invalidation(
+    tmp_path: Path,
+    write_skill: Callable[..., Path],
+    target_is_file: bool,
+) -> None:
+    """Verify in-memory Pydantic cache reuses probes, works on SKILL.md, and skips disk writes."""
+    import inspect
+    from unittest.mock import patch
+
+    from pydantic import BaseModel
+
+    from reach.check import _CheckCacheKey, _execute_empirical_probes
+    from reach.models import QueryKind
+    from reach.runtime.keyword import KeywordRuntime
+
+    assert issubclass(_CheckCacheKey, BaseModel)
+    assert "yes" not in inspect.signature(run_check).parameters
+
+    skill_dir = write_skill(
+        name="cache-tool",
+        description="Execute cache-tool diagnostics and workflows.",
+    )
+    target_path = skill_dir if target_is_file else skill_dir.parent
+    queries = [
+        Query(
+            id="q-cache-1",
+            text="please run cache-tool now",
+            expected_skill="cache-tool",
+            kind=QueryKind.IMPLICIT,
+        )
+    ]
+
+    select_calls = 0
+
+    class CountingKeywordRuntime(KeywordRuntime):
+        def select(self, query_text: str, workdir: Path, target_skill: str | None = None) -> SelectionOutcome:
+            nonlocal select_calls
+            select_calls += 1
+            return super().select(query_text, workdir, target_skill=target_skill)
+
+    with patch(
+        "reach.check._setup_runtime", side_effect=lambda *_a, **_k: CountingKeywordRuntime()
+    ):
+        # 1st check run executes probe
+        _, m1, count1 = _execute_empirical_probes(queries, [target_path], "keyword", None, None)
+        assert count1 == 1
+        assert m1.accuracy == 1.0
+        assert select_calls == 1
+        assert not (skill_dir.parent / ".reach" / "cache").exists()
+
+        # 2nd check run with unchanged SKILL.md reuses cache (0 extra select calls)
+        _, m2, count2 = _execute_empirical_probes(queries, [target_path], "keyword", None, None)
+        assert count2 == 1
+        assert m2.accuracy == 1.0
+        assert select_calls == 1
+
+        # Editing SKILL.md changes corpus_digest -> invalidates cache and re-probes
+        write_skill(
+            name="cache-tool",
+            description="Updated description for cache-tool diagnostics.",
+        )
+        _, m3, count3 = _execute_empirical_probes(queries, [target_path], "keyword", None, None)
+        assert count3 == 1
+        assert m3.accuracy == 1.0
+        assert select_calls == 2

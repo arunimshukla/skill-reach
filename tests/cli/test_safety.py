@@ -229,3 +229,24 @@ def test_confirm_interactive_eof_aborts(test_console: Console) -> None:
             skills=5,
         )
     assert code == 1
+
+
+def test_confirm_interactive_when_stdout_redirected(
+    test_console: Console,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Verify confirmation works when stdout is redirected if stdin and stderr are TTYs."""
+    with (
+        patch("sys.stdin.isatty", return_value=True),
+        patch("sys.stdout.isatty", return_value=False),
+        patch("sys.stderr.isatty", return_value=True),
+        patch("builtins.input", return_value="y"),
+    ):
+        code = confirm_skill_execution(
+            test_console,
+            runtime_name="pi",
+            skills=5,
+        )
+    assert code == 0
+    captured = capsys.readouterr()
+    assert captured.out == ""

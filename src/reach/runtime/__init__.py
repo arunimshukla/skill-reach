@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import copy
 import importlib
 import json
 import os
@@ -693,6 +694,15 @@ class AgentRuntime[OptionsT: AgentOptions](ABC):
     def post_probe(self, workdir: Path) -> None:
         """Execute post-probe cleanup actions."""
         del workdir
+
+    def clone_isolated(self) -> Self:
+        """Create a thread-local isolated clone of this runtime."""
+        clone = copy.copy(self)
+        clone._resident = ()  # noqa: SLF001
+        return clone
+
+    def cleanup(self) -> None:  # noqa: B027
+        """Release any isolated temporary resources owned by this runtime."""
 
     def build_env(self, workdir: Path | None = None) -> dict[str, str]:
         """Assemble process environment for agent execution."""
