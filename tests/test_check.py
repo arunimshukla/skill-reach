@@ -16,7 +16,6 @@
 
 from __future__ import annotations
 
-from reach.runtime import SelectionOutcome
 import subprocess
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -34,6 +33,7 @@ from reach.check import (
 )
 from reach.config import CheckSettings, RunConfig
 from reach.models import Query
+from reach.runtime import SelectionOutcome
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -589,7 +589,9 @@ def test_check_empirical_probes_cache_and_invalidation(
     select_calls = 0
 
     class CountingKeywordRuntime(KeywordRuntime):
-        def select(self, query_text: str, workdir: Path, target_skill: str | None = None) -> SelectionOutcome:
+        def select(
+            self, query_text: str, workdir: Path, target_skill: str | None = None
+        ) -> SelectionOutcome:
             nonlocal select_calls
             select_calls += 1
             return super().select(query_text, workdir, target_skill=target_skill)

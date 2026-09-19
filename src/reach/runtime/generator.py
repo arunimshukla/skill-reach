@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 import os
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
@@ -69,7 +70,7 @@ class TextGenerator(Protocol):
         """Return total cost accumulated across completions in USD."""
         ...
 
-    def complete(self, prompt: str) -> str:
+    def complete(self, prompt: str, *, schema: str | Mapping[str, Any] | None = None) -> str:
         """Generate a raw text completion for an arbitrary prompt."""
         ...
 
@@ -129,8 +130,29 @@ class BaseTextGenerator[OptionsT](ABC):
         """Assemble sanitized process environment for generator execution."""
         return sanitize_subprocess_env(dict(os.environ), blocked_env_vars=self.blocked_env_vars)
 
+    def resolve_schema(
+        self,
+        schema: str | Mapping[str, Any] | None = None,
+    ) -> str | None:
+        """Resolve explicit schema argument or configured options schema to a JSON string."""
+        effective = schema if schema is not None else getattr(self.options, "json_schema", None)
+        if isinstance(effective, Mapping):
+            return json.dumps(effective)
+        return effective
+
+    def format_prompt_with_schema(
+        self,
+        prompt: str,
+        schema: str | Mapping[str, Any] | None = None,
+    ) -> str:
+        """Append schema instruction to prompt when schema is provided and not already present."""
+        schema_str = self.resolve_schema(schema)
+        if not schema_str or schema_str in prompt:
+            return prompt
+        return f"{prompt}\n\nRespond with valid JSON adhering to this JSON schema:\n{schema_str}"
+
     @abstractmethod
-    def complete(self, prompt: str) -> str:
+    def complete(self, prompt: str, *, schema: str | Mapping[str, Any] | None = None) -> str:
         """Generate a raw text completion for an arbitrary prompt."""
         ...
 

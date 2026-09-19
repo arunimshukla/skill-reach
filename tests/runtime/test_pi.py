@@ -578,3 +578,37 @@ def test_auto_clean_spares_transcripts_of_other_workers(
     assert outcome.invoked_skill == "alpha"
     assert not captured[0].exists()
     assert foreign_session.exists()
+
+
+def test_pi_generator_command_and_env() -> None:
+    """Verify PiGenerator includes provider and api-key args in command and syncs env."""
+    from reach.runtime.pi import PiGenerator, PiOptions
+
+    opts = PiOptions(model="gemini-3.8-flash", provider="google", api_key="secret-key")
+    gen = PiGenerator(options=opts)
+    cmd = gen.build_completion_command("test prompt")
+    assert "--provider" in cmd
+    assert cmd[cmd.index("--provider") + 1] == "google"
+    assert "--api-key" in cmd
+    assert cmd[cmd.index("--api-key") + 1] == "secret-key"
+
+    env = gen.build_env()
+    assert env["GEMINI_API_KEY"] == "secret-key"
+    assert env["PI_TELEMETRY"] == "0"
+    assert env["PI_SKIP_VERSION_CHECK"] == "1"
+
+
+@pytest.mark.parametrize("effort", ["none", "off", "None", "OFF"])
+def test_pi_generator_suppresses_disabled_thinking(effort: str) -> None:
+    """Verify PiGenerator omits --thinking when reasoning effort is disabled."""
+    gen = PiGenerator(options=PiOptions(effort=effort))
+    cmd = gen.build_completion_command("test")
+    assert "--thinking" not in cmd
+
+
+def test_pi_generator_includes_valid_thinking() -> None:
+    """Verify PiGenerator includes --thinking when valid effort or thinking is set."""
+    gen = PiGenerator(options=PiOptions(effort="low"))
+    cmd = gen.build_completion_command("test")
+    assert "--thinking" in cmd
+    assert cmd[cmd.index("--thinking") + 1] == "low"

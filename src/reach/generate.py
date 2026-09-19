@@ -18,15 +18,17 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Annotated
 
-from pydantic import BaseModel, ConfigDict, RootModel, ValidationError, field_validator
+from pydantic import BaseModel, ConfigDict, RootModel, StringConstraints, ValidationError
 
 from reach._io import write_model
+from reach._json import parse_model_json
 from reach.catalog import resident_skills, split_frontmatter
 from reach.config import (
     DEFAULT_GEMINI_MODEL,
@@ -56,6 +58,8 @@ REDACTION = "[REDACTED]"
 DEFAULT_COUNT = _DEFAULT_QUERY.count
 DEFAULT_ADVERSARIAL_COUNT = _DEFAULT_QUERY.adversarial_count
 DEFAULT_TOP_RIVALS = _DEFAULT_QUERY.top_rivals
+DEFAULT_MAX_ATTEMPTS: int = 3
+logger = logging.getLogger(__name__)
 
 
 def redactable_names(names: Iterable[str]) -> tuple[str, ...]:
@@ -81,25 +85,22 @@ class GeneratedQuery(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
-    text: str
-    citation: str
+    text: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+    citation: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
     reason: str = ""
     rival_index: int | None = None
-
-    @field_validator("text", "citation")
-    @classmethod
-    def _require_content(cls, value: str) -> str:
-        """Validate that query text and citation strings are non-empty."""
-        if not value.strip():
-            msg = "must be non-empty"
-            raise ValueError(msg)
-        return value
 
 
 class _Response(BaseModel):
     """Validate structured response envelope from generation prompt."""
 
+    model_config = ConfigDict(frozen=True)
+
     queries: tuple[GeneratedQuery, ...]
+
+
+#: Precomputed JSON schema string for structured generation completions.
+_RESPONSE_JSON_SCHEMA: str = json.dumps(_Response.model_json_schema())
 
 
 class GeneratorArm(StrEnum):
@@ -329,27 +330,7 @@ _INLINE_MARKDOWN = re.compile(r"[*`~]")
 
 def parse_response(raw: str) -> tuple[GeneratedQuery, ...]:
     """Parse JSON query draft payload from model completion output."""
-    candidate = raw.strip()
-    json_fence_pos = candidate.find("```json")
-    if json_fence_pos != -1:
-        start = candidate.find("{", json_fence_pos)
-        closing_fence = candidate.rfind("```")
-        if start != -1 and closing_fence > start:
-            end = candidate.rfind("}", start, closing_fence)
-        else:
-            end = candidate.rfind("}")
-    else:
-        start, end = candidate.find("{"), candidate.rfind("}")
-
-    if start != -1 and end > start:
-        candidate = candidate[start : end + 1]
-    elif fenced := _FENCE.search(candidate):
-        candidate = fenced.group(1)
-    try:
-        payload = json.loads(candidate, strict=False)
-    except json.JSONDecodeError as exc:
-        msg = f"generator reply was not JSON: {exc}"
-        raise ValueError(msg) from exc
+    payload = parse_model_json(raw)
     return _Response.model_validate(payload).queries
 
 
@@ -422,7 +403,7 @@ def generate_for_skill(
     runtime = runtime or text_generator()
     target_body, rivals = prompt_material(target, catalog, skills, top_rivals, scorer)
     prompt = assert_prompt_fits(runtime, target, target_body, rivals, count, arm)
-    drafts = parse_response(runtime.complete(prompt))
+    drafts = parse_response(runtime.complete(prompt, schema=_RESPONSE_JSON_SCHEMA))
     return tuple(d for d in drafts if verify_citation(d, target_body))
 
 
@@ -494,7 +475,7 @@ def generate_adversarial_for_skill(
         scorer,
     )
     prompt = build_adversarial_prompt(target_body, rival_bodies, count=count)
-    drafts = parse_response(driver.complete(prompt))
+    drafts = parse_response(driver.complete(prompt, schema=_RESPONSE_JSON_SCHEMA))
 
     queries: list[Query] = []
     for i, draft in enumerate(drafts, start=1):
@@ -590,29 +571,41 @@ def _dispatch_generation(
     """Execute skill query generation sequentially or across a thread pool."""
 
     def generate_target(target: str) -> tuple[GeneratedQuery, ...]:
-        drafts = generate_for_skill(
-            target,
-            catalog,
-            skills,
-            count,
-            runtime,
-            arm,
-            top_rivals,
-            scorer,
-        )
-        if not drafts:
-            # Retry once if the initial attempt returned no verified grounded citations
-            drafts = generate_for_skill(
+        last_err: Exception | None = None
+        for _ in range(DEFAULT_MAX_ATTEMPTS):
+            try:
+                drafts = generate_for_skill(
+                    target,
+                    catalog,
+                    skills,
+                    count,
+                    runtime,
+                    arm,
+                    top_rivals,
+                    scorer,
+                )
+                if drafts:
+                    return drafts
+                last_err = None
+            except (ValueError, ValidationError) as err:
+                last_err = err
+            except RuntimeError:
+                raise
+
+        if last_err is not None:
+            logger.warning(
+                "Failed drafting queries for %r after %d attempts: %s",
                 target,
-                catalog,
-                skills,
-                count,
-                runtime,
-                arm,
-                top_rivals,
-                scorer,
+                DEFAULT_MAX_ATTEMPTS,
+                last_err,
             )
-        return drafts
+        else:
+            logger.warning(
+                "Drafting queries for %r yielded no verified citations after %d attempts",
+                target,
+                DEFAULT_MAX_ATTEMPTS,
+            )
+        return ()
 
     if concurrency <= 1:
         for target in targets:
@@ -680,15 +673,42 @@ def generate_query_set(
             progress(target, drafts)
         queries.extend(to_queries(drafts, target, target))
         if adversarial:
-            adv_queries = generate_adversarial_for_skill(
-                target,
-                catalog,
-                skills,
-                count=adversarial_count,
-                runtime=driver,
-                top_rivals=top_rivals,
-                scorer=scorer,
-            )
+            adv_queries: tuple[Query, ...] = ()
+            last_adv_err: Exception | None = None
+            for _ in range(DEFAULT_MAX_ATTEMPTS):
+                try:
+                    adv_queries = generate_adversarial_for_skill(
+                        target,
+                        catalog,
+                        skills,
+                        count=adversarial_count,
+                        runtime=driver,
+                        top_rivals=top_rivals,
+                        scorer=scorer,
+                    )
+                    if adv_queries:
+                        break
+                    last_adv_err = None
+                except (ValueError, ValidationError) as err:
+                    last_adv_err = err
+                except RuntimeError:
+                    raise
+
+            if not adv_queries:
+                if last_adv_err is not None:
+                    logger.warning(
+                        "Failed drafting adversarial queries for %r after %d attempts: %s",
+                        target,
+                        DEFAULT_MAX_ATTEMPTS,
+                        last_adv_err,
+                    )
+                else:
+                    logger.warning(
+                        "Drafting adversarial queries for %r yielded no verified citations "
+                        "after %d attempts",
+                        target,
+                        DEFAULT_MAX_ATTEMPTS,
+                    )
             queries.extend(adv_queries)
         if checkpoint is not None:
             checkpoint(so_far())

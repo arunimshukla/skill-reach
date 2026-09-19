@@ -20,6 +20,7 @@ from importlib import metadata
 from typing import TYPE_CHECKING
 
 from reach.catalog import build_catalogs, resident_skills, resolve_catalog
+from reach.config import DEFAULT_GEMINI_MODEL, agent_default_model
 from reach.difficulty import lexical_ranks
 from reach.generate import (
     Citation,
@@ -39,7 +40,6 @@ from reach.generate import (
 )
 from reach.leak import leaks
 from reach.queries import Origin, QuerySet, QuerySetProvenance, save_query_set
-from reach.runtime import FAKE_AGENT
 from reach.views import (
     Console,
     print_draft_preview,
@@ -137,16 +137,34 @@ def _init_or_recover_checkpoint(
     return recovered, recovered.owed
 
 
+def _effective_generator_model(settings: RunConfig, generate: GenerateFlags) -> str:
+    """Resolve the effective model for query drafting."""
+    generator_agent = generate.generator_agent or settings.runtime.agent
+    model = generate.generator_model
+    if (
+        generator_agent
+        and model == DEFAULT_GEMINI_MODEL
+        and (agent_default := agent_default_model(generator_agent))
+    ):
+        return agent_default
+    return model
+
+
 def _build_drafter_runtime(
     settings: RunConfig,
     generate: GenerateFlags,
+    model: str | None = None,
 ) -> TextGenerator:
     """Instantiate the drafter TextGenerator for query generation."""
-    generator_agent = FAKE_AGENT if settings.runtime.agent == FAKE_AGENT else None
+    generator_agent = generate.generator_agent or settings.runtime.agent
+    generator_options = (
+        settings.runtime.options if generator_agent == settings.runtime.agent else None
+    )
+    resolved_model = model or _effective_generator_model(settings, generate)
     return text_generator(
-        model=generate.generator_model,
+        model=resolved_model,
         agent=generator_agent,
-        options=settings.runtime.options if generator_agent is not None else None,
+        options=generator_options,
     )
 
 
@@ -218,6 +236,7 @@ def _execute_draft_generation(
                 catalog,
                 generate,
                 terms.bodies,
+                generator_model=terms.generator_model,
                 reviewed=False if same_invocation_probe else None,
             ),
         },
@@ -272,26 +291,33 @@ def _draft_query_set(
     requested = _resolve_draft_targets(catalog, generate)
     destination = settings.require_queries()
     in_progress = checkpoint_path(destination)
+    generator_model = _effective_generator_model(settings, generate)
+    drafter = _build_drafter_runtime(settings, generate, generator_model)
     terms = DraftCheckpoint(
         fingerprint=settings.fingerprint,
         bodies=bodies_digest(skills),
         catalog_id=catalog.id,
         arm=generate.generator_arm,
         count=generate.count,
-        generator_model=generate.generator_model,
+        generator_model=generator_model,
         top_rivals=generate.top_rivals,
         targets=requested,
         covered=(),
         drafted=QuerySet(
             catalog_id=catalog.id,
             queries=(),
-            provenance=_drafted_by(settings, catalog, generate, bodies_digest(skills)),
+            provenance=_drafted_by(
+                settings,
+                catalog,
+                generate,
+                bodies_digest(skills),
+                generator_model=generator_model,
+            ),
         ),
         adversarial=generate.adversarial,
         adversarial_count=generate.adversarial_count,
     )
     recovered, drafting = _init_or_recover_checkpoint(in_progress, terms, requested, console)
-    drafter = _build_drafter_runtime(settings, generate)
 
     print_generation(
         console,
@@ -300,7 +326,7 @@ def _draft_query_set(
         targets=len(drafting),
         count=generate.count,
         agent=drafter.name,
-        model=generate.generator_model,
+        model=generator_model,
         rivals=_rivals_in_view(catalog, generate),
         adversarial=generate.adversarial,
         adversarial_count=generate.adversarial_count,
@@ -355,13 +381,14 @@ def _drafted_by(
     generate: GenerateFlags,
     bodies: str,
     *,
+    generator_model: str | None = None,
     reviewed: bool | None = None,
 ) -> QuerySetProvenance:
     """Construct QuerySetProvenance detailing synthetic generation parameters."""
     return QuerySetProvenance(
         origin=Origin.GENERATED,
         tool_version=metadata.version("skill-reach"),
-        generator_model=generate.generator_model,
+        generator_model=generator_model or generate.generator_model,
         generator_arm=generate.generator_arm.value,
         queries_per_target=generate.count,
         rivals_in_view=_rivals_in_view(catalog, generate),

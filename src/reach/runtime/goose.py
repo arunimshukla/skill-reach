@@ -396,15 +396,30 @@ class GooseGenerator(BaseTextGenerator[GooseOptions]):
         return [*cmd, *opts.extra_args]
 
     @override
-    def complete(self, prompt: str) -> str:
+    def build_env(self) -> dict[str, str]:
+        """Assemble process environment with API keys and telemetry suppression."""
+        env = super().build_env()
+        env["OTEL_SDK_DISABLED"] = "true"
+        apply_provider_api_key(
+            env,
+            provider=self.options.provider,
+            api_key=self.options.api_key,
+            default_provider="openai",
+        )
+        return sync_google_and_gemini_keys(env)
+
+    @override
+    def complete(self, prompt: str, *, schema: str | Mapping[str, Any] | None = None) -> str:
         """Execute text completion subprocess and return response string."""
+        effective_prompt = self.format_prompt_with_schema(prompt, schema)
         completed = subprocess.run(
-            self.build_completion_command(prompt),
+            self.build_completion_command(effective_prompt),
             capture_output=True,
             text=True,
             timeout=self.timeout_s,
             check=False,
             stdin=subprocess.DEVNULL,
+            env=self.build_env(),
         )
         if completed.returncode != 0:
             reason = completed.stderr.strip() or f"exit code {completed.returncode}"

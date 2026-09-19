@@ -16,7 +16,6 @@
 
 from __future__ import annotations
 
-from reach.runtime import SelectionOutcome
 from typing import TYPE_CHECKING
 
 import pytest
@@ -25,6 +24,7 @@ from reach.catalog import resolve_sweep_scales
 from reach.config import CatalogSettings, PlanSettings, RunConfig, StudySettings
 from reach.models import CatalogMode, Query, QueryKind, Skill
 from reach.queries import Origin, QuerySet, QuerySetProvenance, save_query_set
+from reach.runtime import SelectionOutcome
 from reach.runtime.fake import FakeRuntime
 from reach.sweep import (
     ScalingPoint,
@@ -822,7 +822,9 @@ def test_run_scaling_sweep_shares_probe_harness_cache_across_identical_scales(
     select_calls = 0
 
     class CountingKeywordRuntime(KeywordRuntime):
-        def select(self, query_text: str, workdir: Path, target_skill: str | None = None) -> SelectionOutcome:
+        def select(
+            self, query_text: str, workdir: Path, target_skill: str | None = None
+        ) -> SelectionOutcome:
             nonlocal select_calls
             select_calls += 1
             return super().select(query_text, workdir, target_skill=target_skill)

@@ -17,8 +17,8 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable, Sequence
-from typing import TYPE_CHECKING, Self, override
+from collections.abc import Iterable, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Self, override
 
 from pydantic import Field
 
@@ -198,8 +198,8 @@ class KeywordGenerator(BaseTextGenerator[KeywordOptions]):
         )
 
     @override
-    def complete(self, prompt: str) -> str:
+    def complete(self, prompt: str, *, schema: str | Mapping[str, Any] | None = None) -> str:
         """Return empty string as keyword drivers do not generate text."""
-        del prompt
+        del prompt, schema
         self.completions += 1
         return ""

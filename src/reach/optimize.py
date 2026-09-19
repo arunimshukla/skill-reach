@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import difflib
+import json
 import random
 import shutil
 import tempfile
@@ -35,6 +36,7 @@ from pydantic import (
 )
 
 from reach._io import atomic_write_text
+from reach._json import parse_model_json
 from reach.catalog import load_skills, split_frontmatter
 from reach.config import (
     OptimizeSettings,
@@ -628,6 +630,10 @@ class _OptimizationResponse(BaseModel):
     candidates: tuple[_CandidatePayload, ...]
 
 
+#: Precomputed JSON schema string for structured candidate optimization completions.
+_OPTIMIZATION_RESPONSE_JSON_SCHEMA: str = json.dumps(_OptimizationResponse.model_json_schema())
+
+
 def _synthesize_via_llm(
     driver: TextGenerator,
     target: Skill,
@@ -655,15 +661,11 @@ def _synthesize_via_llm(
         iteration=iteration,
     )
     try:
-        raw_text = driver.complete(prompt)
+        raw_text = driver.complete(prompt, schema=_OPTIMIZATION_RESPONSE_JSON_SCHEMA)
         if not raw_text:
             return None
-        text = raw_text
-        if "```json" in text:
-            text = text.split("```json")[1].split("```")[0]
-        elif "```" in text:
-            text = text.split("```")[1].split("```")[0]
-        response = _OptimizationResponse.model_validate_json(text.strip())
+        payload = parse_model_json(raw_text)
+        response = _OptimizationResponse.model_validate(payload)
         if response.candidates:
             return [
                 OptimizationCandidate(
@@ -1100,7 +1102,7 @@ def _bootstrap_queries(
         try:
             driver = _setup_driver(agent, config=config)
             if driver.name != FAKE_AGENT:
-                return generate_query_set(
+                res = generate_query_set(
                     catalog=catalog,
                     skills=all_skills,
                     targets=[target_skill.name],
@@ -1110,6 +1112,8 @@ def _bootstrap_queries(
                     adversarial_count=adversarial_count,
                     top_rivals=len(rival_skills) or 1,
                 )
+                if res.queries:
+                    return res
         except (OSError, RuntimeError, ValueError):
             pass
 

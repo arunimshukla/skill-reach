@@ -1915,11 +1915,11 @@ def test_agent_runtime_effective_effort_and_resident_paths(tmp_path: Path) -> No
     from reach.runtime.fake import FakeOptions, FakeRuntime
 
     # Default model profile effort resolution
-    runtime = FakeRuntime(options=FakeOptions(model="gemini-2.5-flash"))
+    runtime = FakeRuntime(options=FakeOptions(model="gemini-3.8-flash"))
     assert runtime.effective_effort == "low"
 
     # Explicit effort override on options takes precedence
-    runtime_override = FakeRuntime(options=FakeOptions(model="gemini-2.5-flash", effort="high"))
+    runtime_override = FakeRuntime(options=FakeOptions(model="gemini-3.8-flash", effort="high"))
     assert runtime_override.effective_effort == "high"
 
     # resident_skill_paths resolves resident skills under skills_dir

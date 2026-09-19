@@ -474,3 +474,47 @@ def test_goose_runtime_initializes_base_attributes() -> None:
     assert rt.completions == 0
     assert rt.completion_cost_usd == 0.0
     assert rt.is_cli is True
+
+
+def test_goose_generator_command_and_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify GooseGenerator command line assembly, environment, and schema formatting."""
+    opts = GooseOptions(
+        model="gemini-3-flash-preview",
+        provider="google",
+        api_key="test-secret-key",
+        no_profile=True,
+    )
+    generator = GooseGenerator(model="gemini-3-flash-preview", options=opts)
+
+    cmd = generator.build_completion_command("test prompt")
+    assert cmd[:6] == ["goose", "run", "-q", "--no-session", "-t", "test prompt"]
+    assert "--no-profile" in cmd
+    assert "--model" in cmd
+    assert cmd[cmd.index("--model") + 1] == "gemini-3-flash-preview"
+    assert "--provider" in cmd
+    assert cmd[cmd.index("--provider") + 1] == "google"
+
+    env = generator.build_env()
+    assert env["OTEL_SDK_DISABLED"] == "true"
+    assert env.get("GEMINI_API_KEY") == "test-secret-key"
+
+    captured: dict[str, Any] = {}
+
+    def mock_run(command: list[str], **kwargs: Any) -> Any:
+        captured["command"] = command
+        captured["env"] = kwargs.get("env")
+        import subprocess
+
+        return subprocess.CompletedProcess(
+            command, returncode=0, stdout='{"queries": []}', stderr=""
+        )
+
+    monkeypatch.setattr("subprocess.run", mock_run)
+
+    schema = {"type": "object", "properties": {"queries": {"type": "array"}}}
+    result = generator.complete("draft queries", schema=schema)
+    assert result == '{"queries": []}'
+    assert captured["env"]["OTEL_SDK_DISABLED"] == "true"
+    # Verify schema instruction was appended to the prompt in command arguments
+    prompt_arg = captured["command"][captured["command"].index("-t") + 1]
+    assert "Respond with valid JSON adhering to this JSON schema:" in prompt_arg

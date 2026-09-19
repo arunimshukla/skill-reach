@@ -91,6 +91,7 @@ class FakeGenerator(BaseTextGenerator[FakeOptions]):
         self.cost_usd = cost_usd
         self.completion = completion
         self.prompts: list[str] = []
+        self.schemas: list[Any] = []
 
     @override
     def prompt_budget_chars(self) -> int | None:
@@ -99,9 +100,10 @@ class FakeGenerator(BaseTextGenerator[FakeOptions]):
             return self._prompt_budget_chars
         return super().prompt_budget_chars()
 
-    def complete(self, prompt: str) -> str:
+    def complete(self, prompt: str, *, schema: str | Mapping[str, Any] | None = None) -> str:
         """Record prompt and return scripted completion string."""
         self.prompts.append(prompt)
+        self.schemas.append(schema)
         self.completions += 1
         self.completion_cost_usd += self.cost_usd
         if self.completion:

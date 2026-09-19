@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING, Never
+from typing import TYPE_CHECKING, Any, Never
 
 import pytest
 
@@ -435,11 +435,11 @@ def dying(generator: FakeGenerator, monkeypatch: pytest.MonkeyPatch) -> FakeGene
     class OneTargetThenGone(FakeGenerator):
         """Mock generator that answers first prompt and then raises exception."""
 
-        def complete(self, prompt: str) -> str:
+        def complete(self, prompt: str, *args: Any, **kwargs: Any) -> str:
             if self.completions:
                 msg = "the generator went away"
                 raise RuntimeError(msg)
-            return super().complete(prompt)
+            return super().complete(prompt, *args, **kwargs)
 
     runtime = OneTargetThenGone()
     runtime.completion = generator.completion

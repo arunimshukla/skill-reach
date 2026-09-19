@@ -1044,6 +1044,76 @@ def test_build_completion_command_resolves_profile_effort(
     assert cmd[cmd.index("--effort") + 1] == "low"
 
 
+def test_build_completion_command_passes_json_schema_from_parameter(
+    generator: AntigravityCliGenerator,
+) -> None:
+    """Verify build_completion_command includes --json-schema when explicitly passed."""
+    cmd = generator.build_completion_command(schema='{"type": "object"}')
+    assert "--json-schema" in cmd
+    assert cmd[cmd.index("--json-schema") + 1] == '{"type": "object"}'
+
+
+def test_build_completion_command_passes_json_schema_from_options(
+    home_dir: Path,
+) -> None:
+    """Verify build_completion_command uses json_schema from configured options."""
+    generator = AntigravityCliGenerator(
+        options=AntigravityCliOptions(
+            model=DEFAULT_GEMINI_MODEL,
+            home_dir=home_dir,
+            json_schema='{"type": "array"}',
+        ),
+    )
+    cmd = generator.build_completion_command()
+    assert "--json-schema" in cmd
+    assert cmd[cmd.index("--json-schema") + 1] == '{"type": "array"}'
+
+
+def test_complete_serializes_mapping_schema(
+    monkeypatch: pytest.MonkeyPatch,
+    generator: AntigravityCliGenerator,
+) -> None:
+    """Verify complete serializes Mapping schema to JSON string for --json-schema."""
+    captured_cmd: list[str] | None = None
+
+    def fake_run(*args: Any, **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        nonlocal captured_cmd
+        del kwargs
+        captured_cmd = list(args[0])
+        return subprocess.CompletedProcess(
+            args=args,
+            returncode=0,
+            stdout=json.dumps({"response": "result"}),
+            stderr="",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    generator.complete("test", schema={"type": "object", "properties": {}})
+    assert captured_cmd is not None
+    assert "--json-schema" in captured_cmd
+    idx = captured_cmd.index("--json-schema")
+    assert json.loads(captured_cmd[idx + 1]) == {"type": "object", "properties": {}}
+
+
+def test_resolve_schema_allows_empty_mapping_and_string_override() -> None:
+    """Verify explicit empty mapping or string overrides options schema rather than falling back."""
+    opts = AntigravityCliOptions(json_schema='{"type": "object"}')
+    gen = AntigravityCliGenerator(options=opts)
+    assert gen.resolve_schema({}) == "{}"
+    assert gen.resolve_schema("") == ""
+    assert gen.resolve_schema(None) == '{"type": "object"}'
+
+
+def test_build_completion_command_allows_empty_schema_override() -> None:
+    """Verify build_completion_command respects empty schema override without falling back."""
+    opts = AntigravityCliOptions(json_schema='{"type": "object"}')
+    gen = AntigravityCliGenerator(options=opts)
+    cmd_override = gen.build_completion_command(schema="")
+    assert "--json-schema" not in cmd_override
+    cmd_default = gen.build_completion_command()
+    assert "--json-schema" in cmd_default
+
+
 def test_complete_pipes_prompt_via_stdin_and_handles_large_payload(
     monkeypatch: pytest.MonkeyPatch,
     generator: AntigravityCliGenerator,
