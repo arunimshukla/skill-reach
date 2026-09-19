@@ -521,4 +521,3 @@ def test_goose_generator_command_and_env(monkeypatch: pytest.MonkeyPatch) -> Non
     assert captured["env"]["OTEL_SDK_DISABLED"] == "true"
     assert "Respond with valid JSON adhering to this JSON schema:" in captured["input"]
     assert "-t" not in captured["command"]
-

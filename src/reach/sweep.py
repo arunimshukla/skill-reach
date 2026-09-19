@@ -225,23 +225,15 @@ def _classify_probe_outcome(
     """Classify a single probe result into (is_tp, is_fp, is_fn) confusion indicators."""
     if target_skill is not None:
         is_tp = (
-            not result.error
-            and expected == target_skill
-            and result.predicted_label == target_skill
+            not result.error and expected == target_skill and result.predicted_label == target_skill
         )
         is_fn = expected == target_skill and not is_tp
         is_fp = (
-            not result.error
-            and result.predicted_label == target_skill
-            and expected != target_skill
+            not result.error and result.predicted_label == target_skill and expected != target_skill
         )
         return is_tp, is_fp, is_fn
 
-    is_tp = (
-        not result.error
-        and expected is not None
-        and result.predicted_label == expected
-    )
+    is_tp = not result.error and expected is not None and result.predicted_label == expected
     is_fn = expected is not None and not is_tp
     is_fp = (
         not result.error
@@ -467,9 +459,7 @@ def _compute_negative_counts(
     """Compute true negatives, distractor false positives, and abstention intervals."""
     tn = sum(1 for r in negative if not r.error and r.predicted_label == NO_SKILL)
     fp_distractor = sum(
-        1
-        for r in negative
-        if _classify_probe_outcome(r, None, installed, target_skill)[1]
+        1 for r in negative if _classify_probe_outcome(r, None, installed, target_skill)[1]
     )
     if not negative:
         return tn, fp_distractor, None, None
@@ -563,9 +553,7 @@ def _aggregate_scale_telemetry(results: Sequence[ProbeResult]) -> _ScaleTelemetr
             if getattr(r, "disclosure_state", None) is not None
         )
     )
-    tokens: list[float] = [
-        float(r.prompt_tokens) for r in results if r.prompt_tokens is not None
-    ]
+    tokens: list[float] = [float(r.prompt_tokens) for r in results if r.prompt_tokens is not None]
     avg_tokens = statistics.fmean(tokens) if tokens else None
     prompt_tokens_mean = round(avg_tokens, 2) if avg_tokens is not None else None
 

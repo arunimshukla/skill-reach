@@ -161,7 +161,7 @@ class BaseTextGenerator[OptionsT](ABC):
     def complete(self, prompt: str, *, schema: str | Mapping[str, Any] | None = None) -> str:
         """Execute text completion subprocess piping prompt via stdin and return response string."""
         effective_prompt = self.format_prompt_with_schema(prompt, schema)
-        completed = subprocess.run(
+        completed: subprocess.CompletedProcess[str] = subprocess.run(
             self.build_completion_command(effective_prompt),
             input=effective_prompt,
             capture_output=True,

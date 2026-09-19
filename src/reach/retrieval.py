@@ -636,7 +636,6 @@ class HybridScorer(BaseModel):
         )
 
 
-
 def build_scorer(
     name: str,
     skills: Sequence[Skill],

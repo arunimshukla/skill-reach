@@ -1327,4 +1327,3 @@ def test_skill_score_and_unreached_respect_multi_turn_trajectory(
     assert score.trajectory_reached == expected_traj_reached
     assert score.trajectory_recall == expected_traj_recall
     assert (score in built.unreached) is expected_in_unreached
-

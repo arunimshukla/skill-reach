@@ -1013,6 +1013,3 @@ def test_prompt_tokens_telemetry_propagates_from_outcome_to_scaling_point() -> N
         target_skill="my-skill",
     )
     assert point.prompt_tokens_mean == 1250.0
-
-
-

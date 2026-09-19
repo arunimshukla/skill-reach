@@ -2296,8 +2296,6 @@ def test_bare_query_command_auto_discovers_skills(
     assert out.is_file()
 
 
-
-
 def test_build_drafter_runtime_resolution() -> None:
     """Verify _build_drafter_runtime respects generator_agent override and defaults."""
     from reach.cli.drafting import _build_drafter_runtime

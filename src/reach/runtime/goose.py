@@ -408,5 +408,3 @@ class GooseGenerator(BaseTextGenerator[GooseOptions]):
             default_provider="openai",
         )
         return sync_google_and_gemini_keys(env)
-
-

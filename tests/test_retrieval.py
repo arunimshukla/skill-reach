@@ -222,9 +222,7 @@ def test_hybrid_scorer_no_alphabetical_rrf_bias_for_zero_bm25_matches() -> None:
     # Pure semantic match (no keyword overlap at all, but vector close)
     cand_sem = _make_skill("provision-compute", "Setup virtual machines, host hypervisors.")
     # Irrelevant skills with alphabetically early names and zero keyword overlap
-    distractors = [
-        _make_skill(f"aaa-{i}", f"Irrelevant unrelated topic {i}.") for i in range(5)
-    ]
+    distractors = [_make_skill(f"aaa-{i}", f"Irrelevant unrelated topic {i}.") for i in range(5)]
 
     skills = [target, cand_lex, cand_sem, *distractors]
     vectors = {
@@ -243,8 +241,6 @@ def test_hybrid_scorer_no_alphabetical_rrf_bias_for_zero_bm25_matches() -> None:
     for d in distractors:
         assert ranked_names.index("provision-compute") < ranked_names.index(d.name)
     assert set(ranked_names[:2]) == {"provision-compute", "workload-deployer"}
-
-
 
 
 def test_build_scorer_factory() -> None:

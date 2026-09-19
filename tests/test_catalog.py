@@ -89,7 +89,6 @@ def test_unparseable_frontmatter_is_skipped(text: str, tmp_path: Path) -> None:
     assert parse_frontmatter(text, tmp_path / "x" / "SKILL.md") is None
 
 
-
 def test_split_frontmatter_separates_the_yaml_from_the_body() -> None:
     """Verify split_frontmatter partitions YAML frontmatter from markdown body."""
     assert split_frontmatter("---\nname: x\n---\nbody text\n") == (

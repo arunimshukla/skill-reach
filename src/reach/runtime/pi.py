@@ -389,7 +389,7 @@ class PiGenerator(BaseTextGenerator[PiOptions]):
         del prompt  # Prompt is passed via stdin to avoid Linux MAX_ARG_STRLEN limits
         cmd = [
             self.options.executable,
-            "-p",
+            "-p",  # Boolean flag (--print); pi reads stdin when no positional message is given
             "--no-session",
             "--no-skills",
             "--no-context-files",
@@ -419,5 +419,3 @@ class PiGenerator(BaseTextGenerator[PiOptions]):
             default_provider="google",
         )
         return sync_google_and_gemini_keys(env)
-
-

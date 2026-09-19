@@ -20,6 +20,7 @@ import contextlib
 import functools
 import hashlib
 import json
+import logging
 import math
 import re
 from pathlib import Path
@@ -217,7 +218,7 @@ class _SkillFrontmatter(BaseModel):
     @field_validator("description")
     @classmethod
     def _reject_blank_description(cls, value: str) -> str:
-        """Require frontmatter description to be a non-empty, non-whitespace string."""
+        """Validate that frontmatter description is a non-empty, non-whitespace string."""
         if not value or not value.strip():
             msg = "skill description must not be empty or whitespace"
             raise ValueError(msg)
@@ -288,9 +289,9 @@ def parse_frontmatter(text: str, path: Path) -> Skill | None:
             manifest_source=manifest_src,
             model_invocable=parsed.is_model_invocable(),
         )
-    except (ValueError, ValidationError):
+    except (ValueError, ValidationError) as exc:
+        logging.getLogger(__name__).warning("Skipping invalid SKILL.md at %s: %s", path, exc)
         return None
-
 
 
 def _skill_files(root: Path) -> list[Path]:

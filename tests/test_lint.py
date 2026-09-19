@@ -601,7 +601,5 @@ def test_missing_description_in_lint_tree_does_not_crash(
     report = lint_tree(tmp_path)
     assert report.skills_checked == 1
     assert any(
-        i.rule == "missing-description" and i.severity == Severity.ERROR
-        for i in report.issues
+        i.rule == "missing-description" and i.severity == Severity.ERROR for i in report.issues
     )
-
