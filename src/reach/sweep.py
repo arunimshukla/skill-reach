@@ -37,7 +37,7 @@ from reach.config import RunConfig
 from reach.diff import DEFAULT_CONFIDENCE, NOISE_INFLATION
 from reach.diff import noise_floor as diff_noise_floor
 from reach.metrics import DecompositionResult, decompose_pass_rate_drop
-from reach.models import NO_SKILL, Catalog, CatalogMode, ProbeResult, Query, Skill
+from reach.models import NO_SKILL, Catalog, CatalogMode, ProbeResult, Query, QueryKind, Skill
 from reach.queries import QuerySet, load_query_set
 from reach.run import Composition, conduct
 from reach.runtime import AgentRuntime, build_runtime
@@ -350,7 +350,9 @@ def _resolve_sweep_target_and_queries(
         raise KeyError(msg)
 
     target_queries = tuple(
-        q for q in raw_query_set.queries if q.expected_skill == target or q.is_out_of_scope
+        q
+        for q in raw_query_set.queries
+        if q.expected_skill == target or q.is_out_of_scope or q.kind is QueryKind.NEIGHBOR_NEGATIVE
     )
     if not target_queries:
         target_queries = raw_query_set.queries
@@ -409,12 +411,31 @@ class _ScaleDecomposition(NamedTuple):
 def _calculate_scale_pass_rate(
     results: Sequence[ProbeResult],
     truth_labels: Mapping[str, str],
+    truth_expected: Mapping[str, str | None] | None = None,
+    target_skill: str | None = None,
 ) -> _ScalePassRate:
     """Calculate overall pass rate, failure count, and Wilson confidence interval."""
     executed = len(results)
-    hits = sum(
-        1 for r in results if not r.error and r.predicted_label == truth_labels.get(r.query_id)
-    )
+    if target_skill is not None and truth_expected is not None:
+        hits = sum(
+            1
+            for r in results
+            if not r.error
+            and (
+                (
+                    truth_expected.get(r.query_id) == target_skill
+                    and r.predicted_label == target_skill
+                )
+                or (
+                    truth_expected.get(r.query_id) != target_skill
+                    and r.predicted_label != target_skill
+                )
+            )
+        )
+    else:
+        hits = sum(
+            1 for r in results if not r.error and r.predicted_label == truth_labels.get(r.query_id)
+        )
     fails = executed - hits
     pass_rate = hits / executed if executed else 0.0
     interval_obj = wilson_interval(hits, executed)
@@ -471,12 +492,11 @@ def _compute_negative_counts(
 
 def _compute_precision_metrics(
     tp: int,
-    fn_misroute: int,
+    internal_fp: int,
     fp_distractor: int,
     has_negatives: bool,
 ) -> tuple[float, float | None, float, tuple[float, float]]:
     """Compute internal precision, external distractor precision, and overall precision."""
-    internal_fp = fn_misroute
     internal_precision = tp / (tp + internal_fp) if (tp + internal_fp) else 1.0
     ext_prec = (
         round(tp / (tp + fp_distractor), 4)
@@ -508,14 +528,14 @@ def _calculate_scale_classification(
     in_scope = [r for r in results if truth_expected.get(r.query_id) is not None]
     negative = [r for r in results if truth_expected.get(r.query_id) is None]
 
-    tp, fn_misroute, recall, recall_interval = _compute_scope_counts(
+    tp, internal_fp, recall, recall_interval = _compute_scope_counts(
         in_scope, truth_expected, installed, target_skill=target_skill
     )
     _tn, fp_distractor, abstention_rate, abstention_interval = _compute_negative_counts(
         negative, installed, target_skill=target_skill
     )
     internal_prec, ext_prec, precision, precision_interval = _compute_precision_metrics(
-        tp, fn_misroute, fp_distractor, bool(negative)
+        tp, internal_fp, fp_distractor, bool(negative)
     )
 
     f1 = _compute_f1_score(precision, recall)
@@ -572,6 +592,7 @@ def _evaluate_baseline_decomposition(
     baseline_results: Sequence[ProbeResult],
     queries: Sequence[Query],
     seed: int,
+    target_skill: str | None = None,
 ) -> _ScaleDecomposition:
     """Evaluate loss decomposition against baseline results if baseline is provided."""
     if not baseline_results:
@@ -581,10 +602,18 @@ def _evaluate_baseline_decomposition(
             delta_shadowing=0.0,
             decomposition=None,
         )
+    scoped_queries = (
+        [q for q in queries if q.expected_skill == target_skill or q.is_out_of_scope]
+        if target_skill is not None
+        else list(queries)
+    )
+    scoped_ids = {q.id for q in scoped_queries}
+    scoped_base = [r for r in baseline_results if r.query_id in scoped_ids]
+    scoped_res = [r for r in results if r.query_id in scoped_ids]
     decomp = decompose_pass_rate_drop(
-        baseline_results=baseline_results,
-        scaled_results=results,
-        queries=queries,
+        baseline_results=scoped_base,
+        scaled_results=scoped_res,
+        queries=scoped_queries,
         seed=seed,
     )
     return _ScaleDecomposition(
@@ -610,12 +639,16 @@ def _build_scaling_point(
     truth_labels = {q.id: q.truth_label for q in queries}
     truth_expected = {q.id: q.expected_skill for q in queries}
 
-    pass_stats = _calculate_scale_pass_rate(results, truth_labels)
+    pass_stats = _calculate_scale_pass_rate(
+        results, truth_labels, truth_expected=truth_expected, target_skill=target_skill
+    )
     class_stats = _calculate_scale_classification(
         results, truth_expected, installed_skills, seed, target_skill=target_skill
     )
     telemetry = _aggregate_scale_telemetry(results)
-    decomp_stats = _evaluate_baseline_decomposition(results, baseline_results, queries, seed)
+    decomp_stats = _evaluate_baseline_decomposition(
+        results, baseline_results, queries, seed, target_skill=target_skill
+    )
 
     point = ScalingPoint(
         scale=scale,

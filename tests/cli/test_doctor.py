@@ -247,3 +247,19 @@ def test_check_agent_registry_uses_custom_workdir_cache(tmp_path: Path) -> None:
         res = _check_agent_registry(custom_workdir)
         assert res.status == "ok"
         assert "bytes cached" in res.detail
+
+
+def test_check_cli_binary_supports_alternates() -> None:
+    """Verify _check_cli_binary detects alternate executable names such as 'antigravity'."""
+    with patch(
+        "shutil.which",
+        side_effect=lambda cmd: "/usr/local/bin/antigravity" if cmd == "antigravity" else None,
+    ):
+        res = _check_cli_binary(
+            "Antigravity CLI",
+            "agy",
+            "antigravity-cli",
+            alternates=("antigravity",),
+        )
+        assert res.status == "ok"
+        assert res.detail == "/usr/local/bin/antigravity"

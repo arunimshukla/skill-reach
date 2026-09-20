@@ -1327,3 +1327,33 @@ def test_skill_score_and_unreached_respect_multi_turn_trajectory(
     assert score.trajectory_reached == expected_traj_reached
     assert score.trajectory_recall == expected_traj_recall
     assert (score in built.unreached) is expected_in_unreached
+
+
+def test_confusion_pairs_excludes_non_entrypoint_trajectory_hit(
+    whole_catalog: Catalog,
+    corpus: list[Skill],
+    make_config: Any,
+) -> None:
+    """Verify assemble confusion pairs exclude non-entrypoint multi-turn trajectory hits."""
+    cfg = make_config(catalog={"mode": CatalogMode.ALL}, plan={"attempts": 1})
+    qs = QuerySet(
+        catalog_id=whole_catalog.id,
+        queries=(Query(id="q-life", text="configure lifecycle", expected_skill=LIFECYCLE),),
+        provenance=QuerySetProvenance(origin=Origin.AUTHORED),
+    )
+    res = [
+        ProbeResult(
+            query_id="q-life",
+            catalog_id=whole_catalog.id,
+            catalog_mode=CatalogMode.ALL,
+            catalog_size=len(whole_catalog.skills),
+            invoked_skills=(BASICS, LIFECYCLE),
+            runtime=cfg.runtime.agent,
+            model="sonnet",
+            config_fingerprint=cfg.fingerprint,
+            corpus_digest=corpus_digest(corpus),
+            queries_digest=query_set_digest(qs),
+        )
+    ]
+    built = assemble(res, qs, whole_catalog, corpus, cfg)
+    assert built.confusion == ()

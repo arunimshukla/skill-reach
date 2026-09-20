@@ -44,6 +44,7 @@ from reach.metrics import (
     compute_f1,
     confusion,
     consistency_counts,
+    is_non_entrypoint_trajectory_hit,
 )
 from reach.models import (
     NO_SKILL,
@@ -724,7 +725,14 @@ def _confusion_pairs(
         query = truth.get(row.query_id)
         if row.error or query is None:
             continue
-        pair_key = (query.truth_label, row.invoked_skill)
+        if is_non_entrypoint_trajectory_hit(query, row.invoked_skill, row.invoked_skills):
+            continue
+        effective_invoked = (
+            query.expected_skill
+            if row.invoked_skill is not None and row.invoked_skill in query.acceptable_skills
+            else row.invoked_skill
+        )
+        pair_key = (query.truth_label, effective_invoked)
         quoted.setdefault(pair_key, Counter())[row.query_id] += 1
         if row.reasoning and (pair_key, row.query_id) not in reasonings:
             reasonings[(pair_key, row.query_id)] = row.reasoning

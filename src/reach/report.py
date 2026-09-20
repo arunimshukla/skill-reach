@@ -100,11 +100,7 @@ def _render_classification_header(artifact: Artifact) -> list[str]:
         f"  scored            {scores.scored}",
         f"  top-1 accuracy    {_pct(scores.top1_accuracy)}{_ci(scores.top1_interval)}",
     ]
-    if (
-        scores.trajectory_reachability > 0
-        or scores.entrypoint_accuracy > 0
-        or scores.redundancy > 0
-    ):
+    if scores.scored > 0:
         header.extend(
             [
                 (

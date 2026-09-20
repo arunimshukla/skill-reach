@@ -1438,3 +1438,29 @@ def test_select_rivals_preserves_rank_order() -> None:
     # Test top_rivals < 1 raises ValueError
     with pytest.raises(ValueError, match="must show at least 1 rival"):
         select_rivals(target, residents, top_rivals=0)
+
+
+def test_generate_adversarial_for_skill_enforces_prompt_budget(
+    target: Skill,
+    rival: Skill,
+) -> None:
+    """Verify generate_adversarial_for_skill checks prompt budget and suggests --top-rivals."""
+    from reach.generate import generate_adversarial_for_skill
+
+    class _TightBudgetGenerator(FakeGenerator):
+        def prompt_budget_chars(self) -> int:
+            return 50
+
+    catalog = Catalog(
+        id="test:tight",
+        mode=CatalogMode.ALL,
+        skills=("target-skill", "rival-skill"),
+    )
+    with pytest.raises(ValueError, match="the prompt drafting 'target-skill' is"):
+        generate_adversarial_for_skill(
+            "target-skill",
+            catalog,
+            [target, rival],
+            count=1,
+            runtime=_TightBudgetGenerator(),
+        )

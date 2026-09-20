@@ -683,3 +683,34 @@ def test_sweep_with_target_skill_path(
     assert code == 0
     data = json.loads(capsys.readouterr().out)
     assert data["target_skill"] == "skill-00"
+
+
+def test_sweep_auto_discovers_skills_when_reach_toml_omits_skills_path(
+    sweep_corpus: tuple[Path, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify reach sweep auto-discovers skills when reach.toml exists without study.skills."""
+    import shutil
+
+    corpus_dir, queries_file = sweep_corpus
+    workspace = tmp_path / "auto_ws"
+    skills_dest = workspace / ".agents" / "skills"
+    skills_dest.parent.mkdir(parents=True)
+    shutil.copytree(corpus_dir, skills_dest)
+    (workspace / "reach.toml").write_text('[runtime]\nagent = "keyword"\n', encoding="utf-8")
+    monkeypatch.chdir(workspace)
+
+    code = main(
+        [
+            "sweep",
+            "--config",
+            str(workspace / "reach.toml"),
+            "--queries",
+            str(queries_file),
+            "--scales",
+            "2",
+            "--no-early-stop",
+        ]
+    )
+    assert code == 0

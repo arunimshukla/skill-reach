@@ -240,12 +240,19 @@ def render_ascii_curve(
     scale_cols = [f"{prefix}={p.scale}" for p in points]
     col_width = max(max(len(c) for c in scale_cols) + 2, 6)
 
+    nearest_level_by_point = [
+        min(
+            range(len(levels)),
+            key=lambda idx: abs((p.f1_score if metric == "f1" else p.pass_rate) - levels[idx]),
+        )
+        for p in points
+    ]
+
     lines: list[str] = [title]
-    for lvl in levels:
+    for lvl_idx, lvl in enumerate(levels):
         row_cells: list[str] = [f"{int(lvl * 100):3d}% |"]
-        for p in points:
-            val = p.f1_score if metric == "f1" else p.pass_rate
-            symbol = "●" if abs(val - lvl) <= _LEVEL_TOLERANCE else " "
+        for pt_idx in range(len(points)):
+            symbol = "●" if nearest_level_by_point[pt_idx] == lvl_idx else " "
             row_cells.append(symbol.center(col_width))
         lines.append("".join(row_cells))
 

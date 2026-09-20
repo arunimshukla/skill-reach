@@ -293,7 +293,6 @@ def _sweep(
         driver=driver,
         effective_config=effective_config,
         skills=skills,
-        run_config=run_config,
         global_scope=global_,
     )
 
@@ -413,11 +412,10 @@ def _load_sweep_corpus(
     driver: AgentRuntime,
     effective_config: RunConfig,
     skills: Path | None,
-    run_config: RunConfig | None,
     global_scope: bool,
 ) -> tuple[Skill, ...]:
     """Load or discover candidate skills for sweep execution."""
-    if skills is not None or run_config is None:
+    if skills is not None or effective_config.study.skills is None:
         eff_runtime = effective_config.runtime
         found, _roots, _discovered = _corpus(
             console,

@@ -787,3 +787,19 @@ def test_review_server_handler_is_valid_origin(origin: str | None, *, expected: 
         msg["Origin"] = origin
     handler.headers = msg
     assert handler._is_valid_origin() is expected
+
+
+def test_poll_terminal_enter_windows_msvcrt(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify _poll_terminal_enter uses msvcrt on Windows without calling select.select."""
+    import sys
+    import types
+
+    from reach.review import _poll_terminal_enter
+
+    fake_msvcrt = types.ModuleType("msvcrt")
+    monkeypatch.setattr(fake_msvcrt, "kbhit", lambda: True, raising=False)
+    monkeypatch.setattr(fake_msvcrt, "getwch", lambda: "\r", raising=False)
+    monkeypatch.setattr("os.name", "nt")
+    monkeypatch.setitem(sys.modules, "msvcrt", fake_msvcrt)
+
+    assert _poll_terminal_enter() is True
