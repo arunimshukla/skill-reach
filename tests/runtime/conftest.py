@@ -547,15 +547,40 @@ class FakeSdkResponse:
         return self._text
 
 
+class FakeSdkStep:
+    """Simulate a single SDK conversation step with HTTP status and error details."""
+
+    def __init__(
+        self,
+        *,
+        status: Any = "STATE_ERROR",
+        http_code: int = 0,
+        error: str = "",
+    ) -> None:
+        """Initialize mock conversation step with status, HTTP code, and error message."""
+        self.status = status
+        self.http_code = http_code
+        self.error = error
+
+
+class FakeSdkConversation:
+    """Mock SDK Conversation exposing step history for error inspection tests."""
+
+    def __init__(self, history: Sequence[object] = ()) -> None:
+        """Initialize mock conversation with canned step history."""
+        self.history: list[object] = list(history)
+
+
 class FakeSdkAgent:
     """Mock SDK Agent context manager tracking configurations and queries."""
 
     response: Any = None
 
-    def __init__(self, config: Any) -> None:
-        """Initialize mock agent with configuration."""
+    def __init__(self, config: Any, *, history: Sequence[object] = ()) -> None:
+        """Initialize mock agent with configuration and optional step history."""
         self.config = config
         self.sent: str | None = None
+        self.conversation = FakeSdkConversation(history=history)
 
     async def __aenter__(self) -> Self:
         """Enter the asynchronous agent context manager."""
@@ -574,12 +599,14 @@ class FakeSdkAgent:
 def patch_sdk_agent(
     monkeypatch: pytest.MonkeyPatch,
     response: Any,
+    *,
+    history: Sequence[object] = (),
 ) -> list[FakeSdkAgent]:
     """Patch SDK Agent class with mock agent answering scripted response."""
     instances: list[FakeSdkAgent] = []
 
     def factory(config: Any) -> FakeSdkAgent:
-        agent = FakeSdkAgent(config)
+        agent = FakeSdkAgent(config, history=history)
         agent.response = response
         instances.append(agent)
         return agent

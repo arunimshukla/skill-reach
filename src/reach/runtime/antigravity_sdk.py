@@ -184,6 +184,62 @@ def _extract_selection_and_reasoning(
     return invoked, reasoning
 
 
+_HTTP_TOO_MANY_REQUESTS = 429
+
+
+def _format_step_error(step: object, error_status: object) -> str | None:
+    """Format a single SDK conversation step error when present."""
+    status = getattr(step, "status", None)
+    raw_err = str(getattr(step, "error", "") or "").strip()
+    if status not in (error_status, "STATE_ERROR", "ERROR") and not raw_err:
+        return None
+    http_code = int(getattr(step, "http_code", 0) or 0)
+    err_msg = raw_err or "unknown system error"
+    lower_err = err_msg.lower()
+    if http_code == _HTTP_TOO_MANY_REQUESTS or any(
+        k in lower_err for k in ("429", "resource exhausted", "quota")
+    ):
+        return f"rate limit (429): {err_msg}"
+    if http_code > 0:
+        return f"sdk step error (HTTP {http_code}): {err_msg}"
+    return f"sdk step error: {err_msg}"
+
+
+def _extract_history_error(agent: object) -> str | None:
+    """Extract formatted rate-limit or system error from SDK conversation history."""
+    conv = getattr(agent, "conversation", None)
+    history = getattr(conv, "history", None)
+    if not history:
+        return None
+    error_status = (
+        getattr(ag_types.StepStatus, "ERROR", "STATE_ERROR")
+        if ag_types is not None
+        else "STATE_ERROR"
+    )
+    for step in reversed(history):
+        if formatted := _format_step_error(step, error_status):
+            return formatted
+    return None
+
+
+def _resolve_empty_selection_error(
+    history_error: str | None,
+    stop_reason: object,
+    observed_tools: tuple[str, ...],
+) -> str | None:
+    """Resolve error string when an agent turn produces no skill selection or structured output."""
+    if history_error:
+        return history_error
+    max_calls = (
+        ag_types.StopReason.MAX_MODEL_CALLS_EXCEEDED
+        if ag_types is not None
+        else "MAX_MODEL_CALLS_EXCEEDED"
+    )
+    if stop_reason == max_calls and observed_tools:
+        return None
+    return "empty selection (likely rate-limited)"
+
+
 class AntigravitySdkOptions(AgentOptions):
     """Specify runtime configuration options for the Antigravity SDK driver."""
 
@@ -195,6 +251,8 @@ class AntigravitySdkOptions(AgentOptions):
     vertex: bool | None = None
     project: str | None = None
     location: str | None = None
+    api_max_retries: int | None = Field(default=None, ge=0)
+    api_retry_jitter: float | None = Field(default=None, ge=0.0, le=1.0)
 
 
 class _AntigravitySdkConfigMixin:
@@ -272,6 +330,39 @@ class _AntigravitySdkConfigMixin:
             api_key=self.effective_api_key,
         )
 
+    def _build_retry_config(self) -> object | None:
+        """Construct RetryConfig when api_max_retries or api_retry_jitter is configured."""
+        if (
+            ag_types is None
+            or not hasattr(ag_types, "RetryConfig")
+            or (self.options.api_max_retries is None and self.options.api_retry_jitter is None)
+        ):
+            return None
+        api_kwargs: dict[str, Any] = {}
+        if self.options.api_max_retries is not None:
+            api_kwargs["max_retries"] = self.options.api_max_retries
+        if self.options.api_retry_jitter is not None:
+            api_kwargs["jitter_range"] = self.options.api_retry_jitter
+        return ag_types.RetryConfig(api_retry=ag_types.ModelAPIRetryConfig(**api_kwargs))
+
+    def _base_config_kwargs(
+        self,
+        model: str | ag_types.ModelTarget,
+        env: dict[str, str],
+    ) -> dict[str, Any]:
+        """Assemble shared LocalAgentConfig keyword arguments across runtime and generator."""
+        kwargs: dict[str, Any] = {
+            "model": model,
+            "api_key": self.effective_api_key,
+            "vertex": self.effective_vertex,
+            "project": self.effective_project,
+            "location": self.effective_location,
+            "env": env,
+        }
+        if (retry_cfg := self._build_retry_config()) is not None:
+            kwargs["retry_config"] = retry_cfg
+        return kwargs
+
 
 class AntigravitySdkRuntime(_AntigravitySdkConfigMixin, AntigravityRuntime):
     """Execute evaluation queries using the Google Antigravity Python SDK."""
@@ -331,23 +422,21 @@ class AntigravitySdkRuntime(_AntigravitySdkConfigMixin, AntigravityRuntime):
             )
             enabled_tools = [builtin_by_name.get(t, t) for t in self.allowed_tools]
 
-        return LocalAgentConfig(
-            model=self._model_spec(),
-            skills_paths=[str(self.skills_dir(workdir))],
-            capabilities=ag_types.CapabilitiesConfig(
-                enabled_tools=enabled_tools,
-                enable_subagents=False,
-            ),
-            budget_config=ag_types.BudgetConfig(max_model_calls=self.options.max_turns),
-            response_schema=self.selection_schema(self._resident),
-            api_key=self.effective_api_key,
-            vertex=self.effective_vertex,
-            project=self.effective_project,
-            location=self.effective_location,
-            app_data_dir=app_data_dir,
-            env=self.build_env(workdir),
-            hooks=hooks,
+        kwargs = self._base_config_kwargs(self._model_spec(), self.build_env(workdir))
+        kwargs.update(
+            {
+                "skills_paths": [str(self.skills_dir(workdir))],
+                "capabilities": ag_types.CapabilitiesConfig(
+                    enabled_tools=enabled_tools,
+                    enable_subagents=False,
+                ),
+                "budget_config": ag_types.BudgetConfig(max_model_calls=self.options.max_turns),
+                "response_schema": self.selection_schema(self._resident),
+                "app_data_dir": app_data_dir,
+                "hooks": hooks,
+            }
         )
+        return LocalAgentConfig(**kwargs)
 
     async def _select_async(
         self,
@@ -389,16 +478,22 @@ class AntigravitySdkRuntime(_AntigravitySdkConfigMixin, AntigravityRuntime):
                     [_tool_name(call.name) async for call in response.tool_calls],
                 )
                 stop_reason = response.stop_reason
+                history_error = _extract_history_error(agent)
         except (AntigravityValidationError, Exception) as err:
             if isinstance(err, RuntimeError):
                 raise
             msg = f"Antigravity SDK execution error: {err}"
             raise RuntimeError(msg) from err
 
+        active_tool_set = (
+            MULTI_TURN_SELECTION_TOOLS
+            if not self.options.early_exit and self.options.max_turns > 1
+            else SELECTION_TOOLS
+        )
         allowed_tool_names = (
             set(self.allowed_tools)
             if self.allowed_tools
-            else (set(self.ANTIGRAVITY_SELECTION_TOOLS) | {_tool_name(t) for t in SELECTION_TOOLS})
+            else (set(self.ANTIGRAVITY_SELECTION_TOOLS) | {_tool_name(t) for t in active_tool_set})
         )
         error = None
         if stop_reason not in EXPECTED_STOP_REASONS:
@@ -418,6 +513,9 @@ class AntigravitySdkRuntime(_AntigravitySdkConfigMixin, AntigravityRuntime):
             invoked_skills = (invoked,)
         else:
             invoked_skills = ()
+
+        if not error and not tracker.early_exit_hit and not invoked_skills and data is None:
+            error = _resolve_empty_selection_error(history_error, stop_reason, observed_tools)
 
         return SelectionOutcome(
             invoked_skills=invoked_skills,
@@ -455,9 +553,9 @@ class AntigravitySdkRuntime(_AntigravitySdkConfigMixin, AntigravityRuntime):
                 ),
             )
         except TimeoutError:
-            return SelectionOutcome(error="timeout")
+            return SelectionOutcome(error="timeout", observed_catalog=self._resident)
         except Exception as exc:  # noqa: BLE001
-            return SelectionOutcome(error=str(exc))
+            return SelectionOutcome(error=str(exc), observed_catalog=self._resident)
         finally:
             self.post_probe(workdir)
 
@@ -520,27 +618,26 @@ class AntigravitySdkGenerator(_AntigravitySdkConfigMixin, BaseTextGenerator[Anti
         """Construct model target with reasoning effort endpoint options when configured."""
         return self._target_model_spec(self.options.model or self.model, self.effective_effort)
 
+    def _resolve_schema_dict(
+        self,
+        schema: str | Mapping[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        """Parse optional JSON schema argument or options fallback into a dictionary."""
+        if isinstance(schema, Mapping):
+            return dict(schema)
+        raw_schema = schema if isinstance(schema, str) else self.options.json_schema
+        if not raw_schema:
+            return None
+        try:
+            parsed = json.loads(raw_schema)
+        except json.JSONDecodeError:
+            return None
+        return parsed if isinstance(parsed, dict) else None
+
     @override
     def complete(self, prompt: str, *, schema: str | Mapping[str, Any] | None = None) -> str:
         """Execute text completion using the Antigravity SDK."""
-        schema_dict: dict[str, Any] | None = None
-        if isinstance(schema, Mapping):
-            schema_dict = dict(schema)
-        elif isinstance(schema, str):
-            try:
-                parsed = json.loads(schema)
-                if isinstance(parsed, dict):
-                    schema_dict = parsed
-            except json.JSONDecodeError:
-                schema_dict = None
-        elif self.options.json_schema:
-            try:
-                parsed = json.loads(self.options.json_schema)
-                if isinstance(parsed, dict):
-                    schema_dict = parsed
-            except json.JSONDecodeError:
-                schema_dict = None
-
+        schema_dict = self._resolve_schema_dict(schema)
         caps = (
             ag_types.CapabilitiesConfig(enabled_tools=[], enable_subagents=False)
             if ag_types is not None and hasattr(ag_types, "CapabilitiesConfig")
@@ -548,14 +645,7 @@ class AntigravitySdkGenerator(_AntigravitySdkConfigMixin, BaseTextGenerator[Anti
         )
 
         async def _complete_async() -> str:
-            kwargs: dict[str, Any] = {
-                "model": self._model_spec(),
-                "api_key": self.effective_api_key,
-                "vertex": self.effective_vertex,
-                "project": self.effective_project,
-                "location": self.effective_location,
-                "env": self.build_env(),
-            }
+            kwargs = self._base_config_kwargs(self._model_spec(), self.build_env())
             if schema_dict is not None:
                 kwargs["response_schema"] = schema_dict
             if caps is not None:
@@ -575,7 +665,17 @@ class AntigravitySdkGenerator(_AntigravitySdkConfigMixin, BaseTextGenerator[Anti
                         if hasattr(structured, "model_dump"):
                             return json.dumps(structured.model_dump())
                         return json.dumps(structured)
-                return await response.text()
+                    err_msg = _extract_history_error(agent) or (
+                        "empty structured output (likely rate-limited)"
+                    )
+                    raise ValueError(err_msg)
+                text_out = await response.text()
+                if not text_out.strip():
+                    err_msg = _extract_history_error(agent) or (
+                        "empty response (likely rate-limited)"
+                    )
+                    raise ValueError(err_msg)
+                return text_out
 
         try:
             text = _run_sync(asyncio.wait_for(_complete_async(), timeout=self.timeout_s))
