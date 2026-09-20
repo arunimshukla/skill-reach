@@ -125,13 +125,22 @@ def test_select_config_enables_only_finish(
     runtime: AntigravitySdkRuntime,
     tmp_path: Path,
 ) -> None:
-    """Verify select agent configuration restricts tools exclusively to BuiltinTools.FINISH."""
+    """Verify _select_config enables multi-turn tools by default and FINISH when max_turns=1."""
+    from reach.runtime.antigravity_sdk import MULTI_TURN_SELECTION_TOOLS
+
     runtime._resident = ("a", "b")
     config = runtime._select_config(tmp_path / "work")
-    assert config.capabilities.enabled_tools == [ag_types.BuiltinTools.FINISH]
+    assert config.capabilities.enabled_tools == list(MULTI_TURN_SELECTION_TOOLS)
     assert config.capabilities.enable_subagents is False
     assert config.budget_config is not None
     assert config.budget_config.max_model_calls == 3
+
+    single_turn_rt = AntigravitySdkRuntime(
+        options=AntigravitySdkOptions(model="test-model", max_turns=1),
+    )
+    single_turn_rt._resident = ("a", "b")
+    single_cfg = single_turn_rt._select_config(tmp_path / "work")
+    assert single_cfg.capabilities.enabled_tools == [ag_types.BuiltinTools.FINISH]
 
 
 def test_select_config_names_the_resident_catalog_in_the_schema(
@@ -993,7 +1002,8 @@ def test_select_async_hook_records_skill_when_early_exit_false_and_allows_view_f
 @pytest.mark.parametrize(
     ("max_turns", "early_exit", "allowed_tools", "expect_multi_turn"),
     [
-        pytest.param(3, True, (), False, id="default-early-exit-uses-selection-tools"),
+        pytest.param(3, True, (), True, id="default-early-exit-uses-multi-turn-selection-tools"),
+        pytest.param(1, True, (), False, id="single-turn-early-exit-uses-selection-tools"),
         pytest.param(1, False, (), False, id="single-turn-uses-selection-tools"),
         pytest.param(
             3, False, (), True, id="multi-turn-trajectory-uses-multi-turn-selection-tools"
@@ -1278,11 +1288,13 @@ def test_select_multi_turn_max_model_calls_exceeded_abstention_vs_error(
 
 def test_select_single_turn_flags_multi_turn_only_tool_as_leak(
     monkeypatch: pytest.MonkeyPatch,
-    runtime: AntigravitySdkRuntime,
     tmp_path: Path,
 ) -> None:
-    """Verify single-turn select still flags MULTI_TURN_SELECTION_TOOLS (list_dir) as tool leak."""
-    runtime._resident = ("gke-basics",)
+    """Verify single-turn (max_turns=1) select flags MULTI_TURN_SELECTION_TOOLS as tool leak."""
+    rt = AntigravitySdkRuntime(
+        options=AntigravitySdkOptions(model="test-model", max_turns=1, allowed_tools=("finish",)),
+    )
+    rt._resident = ("gke-basics",)
     _fake_agent(
         monkeypatch,
         _FakeResponse(
@@ -1290,7 +1302,7 @@ def test_select_single_turn_flags_multi_turn_only_tool_as_leak(
             tool_calls=[ag_types.ToolCall(name=ag_types.BuiltinTools.LIST_DIR, args={})],
         ),
     )
-    outcome = runtime.select("how do I set up a cluster?", tmp_path / "work")
+    outcome = rt.select("how do I set up a cluster?", tmp_path / "work")
     assert outcome.error == "tool leak: list_directory"
 
 

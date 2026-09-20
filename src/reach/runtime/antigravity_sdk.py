@@ -436,8 +436,8 @@ class AntigravitySdkRuntime(_AntigravitySdkConfigMixin, AntigravityRuntime):
 
     @property
     def _default_selection_tools(self) -> tuple[Any, ...]:
-        """Return default selection tool tuple based on turn budget and early exit settings."""
-        if not self.options.early_exit and self.options.max_turns > 1:
+        """Return default selection tool tuple based on turn budget."""
+        if self.options.max_turns > 1:
             return MULTI_TURN_SELECTION_TOOLS
         return SELECTION_TOOLS
 
