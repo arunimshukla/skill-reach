@@ -42,6 +42,9 @@ from .conftest import (
     FakeSdkResponse as _FakeResponse,
 )
 from .conftest import (
+    FakeSdkStep as _FakeStep,
+)
+from .conftest import (
     patch_sdk_agent as _fake_agent,
 )
 
@@ -122,13 +125,22 @@ def test_select_config_enables_only_finish(
     runtime: AntigravitySdkRuntime,
     tmp_path: Path,
 ) -> None:
-    """Verify select agent configuration restricts tools exclusively to BuiltinTools.FINISH."""
+    """Verify _select_config enables multi-turn tools by default and FINISH when max_turns=1."""
+    from reach.runtime.antigravity_sdk import MULTI_TURN_SELECTION_TOOLS
+
     runtime._resident = ("a", "b")
     config = runtime._select_config(tmp_path / "work")
-    assert config.capabilities.enabled_tools == [ag_types.BuiltinTools.FINISH]
+    assert config.capabilities.enabled_tools == list(MULTI_TURN_SELECTION_TOOLS)
     assert config.capabilities.enable_subagents is False
     assert config.budget_config is not None
     assert config.budget_config.max_model_calls == 3
+
+    single_turn_rt = AntigravitySdkRuntime(
+        options=AntigravitySdkOptions(model="test-model", max_turns=1),
+    )
+    single_turn_rt._resident = ("a", "b")
+    single_cfg = single_turn_rt._select_config(tmp_path / "work")
+    assert single_cfg.capabilities.enabled_tools == [ag_types.BuiltinTools.FINISH]
 
 
 def test_select_config_names_the_resident_catalog_in_the_schema(
@@ -265,17 +277,18 @@ def test_select_reports_abstention_when_nothing_was_selected(
     assert outcome.error is None
 
 
-def test_select_reports_no_structured_output_as_abstention(
+def test_select_reports_no_structured_output_as_rate_limited_error(
     monkeypatch: pytest.MonkeyPatch,
     runtime: AntigravitySdkRuntime,
     tmp_path: Path,
 ) -> None:
-    """Verify missing structured output defaults to abstention outcome."""
+    """Verify missing structured output with no invoked skills flags empty selection error."""
     runtime._resident = ("gke-basics",)
     _fake_agent(monkeypatch, _FakeResponse(structured=None))
     outcome = runtime.select("q", tmp_path / "work")
     assert outcome.invoked_skill is None
-    assert outcome.error is None
+    assert outcome.invoked_skills == ()
+    assert outcome.error == "empty selection (likely rate-limited)"
 
 
 def test_select_flags_a_tool_surviving_denial_as_a_leak(
@@ -416,7 +429,7 @@ def test_complete_uses_no_isolation(
     generator: AntigravitySdkGenerator,
 ) -> None:
     """Verify complete creates agent config without budget or skill path constraints."""
-    instances = _fake_agent(monkeypatch, _FakeResponse(text=""))
+    instances = _fake_agent(monkeypatch, _FakeResponse(text="ok"))
     generator.complete("q")
     config = instances[0].config
     assert config.budget_config is None
@@ -428,7 +441,7 @@ def test_complete_passes_response_schema(
     generator: AntigravitySdkGenerator,
 ) -> None:
     """Verify complete populates response_schema on agent config when schema is provided."""
-    instances = _fake_agent(monkeypatch, _FakeResponse(text="{}"))
+    instances = _fake_agent(monkeypatch, _FakeResponse(structured={"queries": []}, text="{}"))
     schema = {"type": "object", "properties": {"queries": {"type": "array"}}}
     generator.complete("q", schema=schema)
     config = instances[0].config
@@ -989,7 +1002,8 @@ def test_select_async_hook_records_skill_when_early_exit_false_and_allows_view_f
 @pytest.mark.parametrize(
     ("max_turns", "early_exit", "allowed_tools", "expect_multi_turn"),
     [
-        pytest.param(3, True, (), False, id="default-early-exit-uses-selection-tools"),
+        pytest.param(3, True, (), True, id="default-early-exit-uses-multi-turn-selection-tools"),
+        pytest.param(1, True, (), False, id="single-turn-early-exit-uses-selection-tools"),
         pytest.param(1, False, (), False, id="single-turn-uses-selection-tools"),
         pytest.param(
             3, False, (), True, id="multi-turn-trajectory-uses-multi-turn-selection-tools"
@@ -1133,3 +1147,316 @@ def test_generator_complete_handles_pydantic_structured_output(
     _fake_agent(monkeypatch, _FakeResponse(structured=model_obj, text="Finished"))
     out = generator.complete("generate", schema={"type": "object"})
     assert json.loads(out) == {"queries": [{"text": "deploy a job", "citation": "cloud-run docs"}]}
+
+
+@pytest.mark.parametrize(
+    ("steps", "stop_reason", "expected_error"),
+    [
+        pytest.param(
+            [_FakeStep(http_code=429, error="Resource exhausted")],
+            "UNSPECIFIED",
+            "rate limit (429): Resource exhausted",
+            id="http-429-resource-exhausted",
+        ),
+        pytest.param(
+            [_FakeStep(http_code=429, error="Resource exhausted")],
+            "END_TURN",
+            "rate limit (429): Resource exhausted",
+            id="end-turn-stop-reason-surfaces-429-instead-of-runtime-error",
+        ),
+        pytest.param(
+            [_FakeStep(http_code=0, error="HTTP 429 Too Many Requests: quota exceeded")],
+            "UNSPECIFIED",
+            "rate limit (429): HTTP 429 Too Many Requests: quota exceeded",
+            id="implicit-429-in-error-string",
+        ),
+        pytest.param(
+            [_FakeStep(http_code=503, error="Service Unavailable")],
+            "UNSPECIFIED",
+            "sdk step error (HTTP 503): Service Unavailable",
+            id="http-503-service-unavailable",
+        ),
+        pytest.param(
+            [_FakeStep(http_code="invalid", error="Internal stream disconnect")],
+            "UNSPECIFIED",
+            "sdk step error: Internal stream disconnect",
+            id="non-numeric-http-code-system-step-error",
+        ),
+        pytest.param(
+            [_FakeStep(status="COMPLETED", http_code=200, error="non-fatal info notice")],
+            "UNSPECIFIED",
+            "empty selection (likely rate-limited)",
+            id="completed-step-with-info-string-ignored",
+        ),
+    ],
+)
+def test_select_surfaces_history_error_when_output_empty(
+    monkeypatch: pytest.MonkeyPatch,
+    runtime: AntigravitySdkRuntime,
+    tmp_path: Path,
+    steps: list[_FakeStep],
+    stop_reason: str,
+    expected_error: str,
+) -> None:
+    """Verify select extracts HTTP/system error from conversation history on empty output."""
+    runtime._resident = ("gke-basics",)
+    _fake_agent(
+        monkeypatch,
+        _FakeResponse(structured=None, stop_reason=stop_reason),
+        history=steps,
+    )
+    outcome = runtime.select("how do I set up a cluster?", tmp_path / "work")
+    assert outcome.invoked_skills == ()
+    assert outcome.error == expected_error
+    assert outcome.observed_catalog == ("gke-basics",)
+
+
+def test_select_ignores_transient_history_error_when_turn_succeeded(
+    monkeypatch: pytest.MonkeyPatch,
+    runtime: AntigravitySdkRuntime,
+    tmp_path: Path,
+) -> None:
+    """Verify transient 429 step is ignored when internal retry succeeds."""
+    runtime._resident = ("gke-basics",)
+    transient_429 = _FakeStep(http_code=429, error="Resource exhausted")
+    _fake_agent(
+        monkeypatch,
+        _FakeResponse(structured={"selected_skill": "gke-basics", "reasoning": "Recovered"}),
+        history=[transient_429],
+    )
+    outcome = runtime.select("how do I set up a cluster?", tmp_path / "work")
+    assert outcome.invoked_skill == "gke-basics"
+    assert outcome.error is None
+
+
+@pytest.mark.parametrize(
+    ("tool_calls", "history_steps", "expected_error"),
+    [
+        pytest.param(
+            [ag_types.ToolCall(name=ag_types.BuiltinTools.LIST_DIR, args={})]
+            if ag_types is not None
+            else [],
+            [],
+            None,
+            id="max-model-calls-with-observed-tools-is-valid-abstention",
+        ),
+        pytest.param(
+            [],
+            [],
+            "empty selection (likely rate-limited)",
+            id="max-model-calls-with-zero-tools-is-flagged-as-error",
+        ),
+        pytest.param(
+            [ag_types.ToolCall(name=ag_types.BuiltinTools.LIST_DIR, args={})]
+            if ag_types is not None
+            else [],
+            [_FakeStep(http_code=429, error="Resource exhausted")],
+            "rate limit (429): Resource exhausted",
+            id="max-model-calls-with-history-429-surfaces-rate-limit",
+        ),
+    ],
+)
+def test_select_multi_turn_max_model_calls_exceeded_abstention_vs_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    tool_calls: list[Any],
+    history_steps: list[Any],
+    expected_error: str | None,
+) -> None:
+    """Verify multi-turn MAX_MODEL_CALLS_EXCEEDED separates exploration from silent drops."""
+    rt = AntigravitySdkRuntime(
+        options=AntigravitySdkOptions(
+            model="test-model",
+            max_turns=3,
+            early_exit=False,
+        ),
+    )
+    rt._resident = ("gke-basics",)
+    _fake_agent(
+        monkeypatch,
+        _FakeResponse(
+            structured=None,
+            tool_calls=tool_calls,
+            stop_reason=ag_types.StopReason.MAX_MODEL_CALLS_EXCEEDED,
+        ),
+        history=history_steps,
+    )
+    outcome = rt.select("explore workspace", tmp_path / "work")
+    assert outcome.invoked_skills == ()
+    assert outcome.error == expected_error
+
+
+def test_select_single_turn_flags_multi_turn_only_tool_as_leak(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Verify single-turn (max_turns=1) select flags MULTI_TURN_SELECTION_TOOLS as tool leak."""
+    rt = AntigravitySdkRuntime(
+        options=AntigravitySdkOptions(model="test-model", max_turns=1, allowed_tools=("finish",)),
+    )
+    rt._resident = ("gke-basics",)
+    _fake_agent(
+        monkeypatch,
+        _FakeResponse(
+            structured={"selected_skill": "gke-basics", "reasoning": "ok"},
+            tool_calls=[ag_types.ToolCall(name=ag_types.BuiltinTools.LIST_DIR, args={})],
+        ),
+    )
+    outcome = rt.select("how do I set up a cluster?", tmp_path / "work")
+    assert outcome.error == "tool leak: list_directory"
+
+
+def test_select_triggers_probe_harness_retry_on_429_and_empty_selection(
+    monkeypatch: pytest.MonkeyPatch,
+    runtime: AntigravitySdkRuntime,
+    tmp_path: Path,
+) -> None:
+    """Verify ProbeHarness._with_retries automatically retries 429/empty selection until success."""
+    from reach.models import Catalog, CatalogMode, Query
+    from reach.run import ProbeHarness
+
+    runtime._resident = ("gke-basics",)
+    attempts = 0
+
+    def stateful_factory(config: Any) -> _FakeAgent:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            agent = _FakeAgent(
+                config,
+                history=[_FakeStep(http_code=429, error="Resource exhausted")],
+            )
+            agent.response = _FakeResponse(structured=None)
+            return agent
+        if attempts == 2:
+            agent = _FakeAgent(config)
+            agent.response = _FakeResponse(structured=None)
+            return agent
+        agent = _FakeAgent(config)
+        agent.response = _FakeResponse(
+            structured={"selected_skill": "gke-basics", "reasoning": "Succeeded on retry 2"},
+        )
+        return agent
+
+    monkeypatch.setattr("reach.runtime.antigravity_sdk.Agent", stateful_factory)
+    sleeps: list[float] = []
+    harness = ProbeHarness(
+        runtime,
+        retries=2,
+        backoff_s=1.5,
+        sleep=sleeps.append,
+        cache_outcomes=False,
+    )
+    catalog = Catalog(id="cat-1", mode=CatalogMode.ALL, skills=("gke-basics",))
+    query = Query(id="q-1", text="create a gke cluster", expected_skill="gke-basics")
+
+    results = list(harness.run_probes([query], catalog, tmp_path / "work", attempts=1))
+    assert len(results) == 1
+    assert attempts == 3
+    assert sleeps == [1.5, 3.0]
+    assert results[0].error is None
+    assert results[0].invoked_skill == "gke-basics"
+
+
+@pytest.mark.parametrize(
+    ("schema", "history_steps", "expected_match"),
+    [
+        pytest.param(
+            {"type": "object"},
+            [_FakeStep(http_code=429, error="Resource exhausted")],
+            r"generation failed: rate limit \(429\): Resource exhausted",
+            id="schema-with-429-history-step",
+        ),
+        pytest.param(
+            {"type": "object"},
+            [],
+            r"generation failed: empty structured output \(likely rate-limited\)",
+            id="schema-with-missing-structured-output",
+        ),
+        pytest.param(
+            None,
+            [_FakeStep(http_code=429, error="Quota exceeded")],
+            r"generation failed: rate limit \(429\): Quota exceeded",
+            id="plain-text-with-429-history-step",
+        ),
+        pytest.param(
+            None,
+            [],
+            r"generation failed: empty response \(likely rate-limited\)",
+            id="plain-text-with-empty-response",
+        ),
+    ],
+)
+def test_generator_complete_surfaces_history_and_empty_errors(
+    monkeypatch: pytest.MonkeyPatch,
+    generator: AntigravitySdkGenerator,
+    schema: dict[str, Any] | None,
+    history_steps: list[Any],
+    expected_match: str,
+) -> None:
+    """Verify AntigravitySdkGenerator.complete raises RuntimeError on 429 and empty responses."""
+    _fake_agent(
+        monkeypatch,
+        _FakeResponse(structured=None, text=""),
+        history=history_steps,
+    )
+    with pytest.raises(RuntimeError, match=expected_match):
+        generator.complete("generate queries", schema=schema)
+    assert generator.completions == 0
+
+
+def test_antigravity_sdk_options_retry_config(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Verify api_max_retries and api_retry_jitter wire RetryConfig into LocalAgentConfig."""
+    opts = AntigravitySdkOptions(
+        model="test-model",
+        api_max_retries=5,
+        api_retry_jitter=0.25,
+    )
+    rt = AntigravitySdkRuntime(options=opts)
+    rt._resident = ("gke-basics",)
+    select_cfg = rt._select_config(tmp_path / "work")
+    assert select_cfg.retry_config is not None
+    assert select_cfg.retry_config.api_retry is not None
+    assert select_cfg.retry_config.api_retry.max_retries == 5
+    assert select_cfg.retry_config.api_retry.jitter_range == 0.25
+
+    gen = AntigravitySdkGenerator(options=opts)
+    instances = _fake_agent(monkeypatch, _FakeResponse(text="ok"))
+    gen.complete("hello")
+    assert instances[0].config.retry_config is not None
+    assert instances[0].config.retry_config.api_retry is not None
+    assert instances[0].config.retry_config.api_retry.max_retries == 5
+    assert instances[0].config.retry_config.api_retry.jitter_range == 0.25
+
+
+def test_select_preserves_observed_catalog_on_timeout_and_exception(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Verify select preserves observed_catalog when TimeoutError or Exception occurs."""
+    rt = AntigravitySdkRuntime(options=AntigravitySdkOptions(model="test-model"))
+    rt._resident = ("gke-basics", "cloud-run-basics")
+
+    async def timeout(fut: Any, *_args: Any, **_kwargs: Any) -> Never:
+        if asyncio.iscoroutine(fut):
+            fut.close()
+        raise TimeoutError
+
+    monkeypatch.setattr(asyncio, "wait_for", timeout)
+    timeout_outcome = rt.select("q", tmp_path / "work")
+    assert timeout_outcome.error == "timeout"
+    assert timeout_outcome.observed_catalog == ("gke-basics", "cloud-run-basics")
+
+    async def boom(fut: Any, *_args: Any, **_kwargs: Any) -> Never:
+        if asyncio.iscoroutine(fut):
+            fut.close()
+        msg = "connection reset"
+        raise RuntimeError(msg)
+
+    monkeypatch.setattr(asyncio, "wait_for", boom)
+    exc_outcome = rt.select("q", tmp_path / "work")
+    assert exc_outcome.error == "connection reset"
+    assert exc_outcome.observed_catalog == ("gke-basics", "cloud-run-basics")
