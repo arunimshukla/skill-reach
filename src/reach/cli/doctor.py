@@ -21,6 +21,7 @@ import os
 import platform
 import shutil
 import sys
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Final
@@ -70,9 +71,18 @@ def _check_python(version_info: tuple[int, ...] | None = None) -> CheckResult:
     )
 
 
-def _check_cli_binary(name: str, executable: str, required_by: str) -> CheckResult:
+def _check_cli_binary(
+    name: str,
+    executable: str,
+    required_by: str,
+    *,
+    alternates: Sequence[str] = (),
+) -> CheckResult:
     """Check whether an external CLI agent executable exists in PATH."""
-    path = shutil.which(executable)
+    path = next(
+        (found for candidate in (executable, *alternates) if (found := shutil.which(candidate))),
+        None,
+    )
     if path is None:
         return CheckResult(
             category="Agent Runtime Drivers",
@@ -283,7 +293,12 @@ def run_doctor_checks(workdir: Path | None = None) -> list[CheckResult]:
     return [
         _check_python(),
         _check_cli_binary("Claude Code CLI", "claude", "claude-code"),
-        _check_cli_binary("Antigravity CLI", "agy", "antigravity-cli"),
+        _check_cli_binary(
+            "Antigravity CLI",
+            "agy",
+            "antigravity-cli",
+            alternates=("antigravity",),
+        ),
         _check_sdk("Antigravity SDK", "google.antigravity", "antigravity-sdk"),
         _check_cli_binary("Goose CLI", "goose", "goose"),
         _check_cli_binary("Pi CLI", "pi", "pi"),

@@ -313,3 +313,29 @@ def test_check_quiet_short_flag(
         description="A completely valid skill description providing sufficient context.",
     )
     assert main(["check", "-q", "--skills", str(tmp_path / "valid-tool")]) == 0
+
+
+def test_render_check_concise_reports_failed_on_strict_warnings(capsys) -> None:
+    """Verify render_check_concise prints FAILED when strict mode fails on warnings."""
+    from pathlib import Path
+
+    from reach.check import CheckOutcome, CheckStage
+    from reach.cli.check import render_check_concise
+    from reach.lint import LintIssue, LintReport, Severity
+    from reach.views import build_console
+
+    warning = LintIssue(
+        rule="description-too-short",
+        severity=Severity.WARN,
+        skill="my-skill",
+        path=Path("SKILL.md"),
+        message="Too short",
+    )
+    outcome = CheckOutcome(
+        lint_report=LintReport(issues=(warning,), skills_checked=1),
+        exit_code=1,
+        stage_failed=CheckStage.STATIC,
+    )
+    render_check_concise(build_console(), outcome)
+    err = capsys.readouterr().err
+    assert "FAILED (strict: 1 warnings)" in err

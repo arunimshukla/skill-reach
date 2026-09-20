@@ -741,3 +741,33 @@ def test_trajectory_scores_aggregates_multi_attempt_replicates() -> None:
     assert scores["q-rep"].step_efficiency == pytest.approx(0.5)
     assert scores["q-rep"].skill_f1 == pytest.approx(0.5)
     assert scores["q-rep"].entrypoint_hit is True
+
+
+def test_multi_turn_trajectory_hit_excludes_stepping_stone_from_false_positives() -> None:
+    """Verify prerequisite turn-1 skill in a valid trajectory is not penalized as FP/collision."""
+    query = Query(id="q-deploy", text="deploy my service", expected_skill="deploy-service")
+    result = ProbeResult(
+        query_id="q-deploy",
+        catalog_id="c",
+        catalog_mode=CatalogMode.ALL,
+        catalog_size=2,
+        model="m",
+        runtime="fake",
+        invoked_skills=("gcloud-auth", "deploy-service"),
+    )
+    report = classification_report([result], [query], labels=["gcloud-auth", "deploy-service"])
+    deploy_cls = report.by_label("deploy-service")
+    auth_cls = report.by_label("gcloud-auth")
+
+    # Entrypoint recall is 0.0 (turn 1 was gcloud-auth), while trajectory recall is 1.0
+    assert deploy_cls.true_positives == 0
+    assert deploy_cls.recall == 0.0
+    assert deploy_cls.trajectory_true_positives == 1
+    assert deploy_cls.trajectory_recall == 1.0
+
+    # Stepping-stone skill gcloud-auth is not penalized as a false positive / collision
+    assert auth_cls.false_positives == 0
+    assert collisions([result], [query]) == {}
+    conf = confusion([result], [query])
+    assert conf[("deploy-service", "gcloud-auth")] == 0
+    assert conf[("deploy-service", "deploy-service")] == 0

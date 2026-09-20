@@ -358,3 +358,11 @@ def test_csv_document_with_no_rows_is_the_header_alone() -> None:
 def test_csv_document_quotes_a_value_containing_the_delimiter() -> None:
     """Verify csv_document encloses values containing commas in quotation marks."""
     assert csv_document(["note"], [["a, b"]]) == 'note\n"a, b"\n'
+
+
+def test_trajectory_section_renders_when_reachability_is_zero(composition: Composition) -> None:
+    """Verify trajectory metrics render in text report when scored > 0 even at 0% reachability."""
+    built = build_report(composition, [probe("q-lifecycle", None)])
+    text = render_text(built)
+    assert "entrypoint acc." in text
+    assert "reachability" in text

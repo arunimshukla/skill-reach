@@ -425,6 +425,23 @@ def _convert_saved_queries(
     return updated_queries
 
 
+def _poll_terminal_enter(timeout: float = 0.2) -> bool:
+    """Poll terminal stdin for an Enter keypress across Windows and POSIX."""
+    with contextlib.suppress(Exception):
+        if os.name == "nt":
+            import msvcrt  # type: ignore[import-not-found]
+
+            if msvcrt.kbhit():  # type: ignore[attr-defined]
+                ch = msvcrt.getwch()  # type: ignore[attr-defined]
+                return ch in ("\r", "\n")
+            return False
+        rlist, _, _ = select.select([sys.stdin], [], [], timeout)
+        if rlist:
+            line = sys.stdin.readline()
+            return bool(line)
+    return False
+
+
 def launch_query_review(
     query_set: QuerySet,
     skill: Skill,
@@ -489,14 +506,9 @@ def launch_query_review(
                 )
                 break
 
-            # Poll terminal stdin for Enter key with small timeout
-            with contextlib.suppress(Exception):
-                rlist, _, _ = select.select([sys.stdin], [], [], 0.2)
-                if rlist:
-                    line = sys.stdin.readline()
-                    if line:
-                        console.print("\n[dim]Proceeding from terminal approval...[/dim]")
-                        break
+            if _poll_terminal_enter(timeout=0.2):
+                console.print("\n[dim]Proceeding from terminal approval...[/dim]")
+                break
 
             time.sleep(0.1)
     finally:

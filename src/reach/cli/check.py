@@ -26,7 +26,7 @@ if TYPE_CHECKING:
 
 from cyclopts import Parameter
 
-from reach.check import run_check
+from reach.check import CheckStage, run_check
 from reach.config import CheckSettings, RegistrySettings, RunConfig, resolve_path
 from reach.views import (
     Console,
@@ -91,15 +91,16 @@ def _render_check_output(
 
 def render_check_concise(console: Console, outcome: CheckOutcome) -> None:
     """Render concise check summary suitable for CI step headers."""
-    lint_status = (
-        f"[red]FAILED ({len(outcome.lint_report.errors)} errors)[/]"
-        if outcome.lint_report.has_errors
-        else (
-            f"[yellow]PASSED with {len(outcome.lint_report.warnings)} warnings[/]"
-            if outcome.lint_report.warnings
-            else "[green]PASSED[/]"
+    if outcome.stage_failed is CheckStage.STATIC or outcome.lint_report.has_errors:
+        lint_status = (
+            f"[red]FAILED ({len(outcome.lint_report.errors)} errors)[/]"
+            if outcome.lint_report.has_errors
+            else f"[red]FAILED (strict: {len(outcome.lint_report.warnings)} warnings)[/]"
         )
-    )
+    elif outcome.lint_report.warnings:
+        lint_status = f"[yellow]PASSED with {len(outcome.lint_report.warnings)} warnings[/]"
+    else:
+        lint_status = "[green]PASSED[/]"
     console.print(f"Static lint: {lint_status}")
     if outcome.assertions:
         failed = [a for a in outcome.assertions if not a.passed]

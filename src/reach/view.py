@@ -172,7 +172,7 @@ def _collisions_html(artifact: Artifact) -> str:
                 "<tr>"
                 f"<td>{_esc(pair.expected)}</td>"
                 f"<td>{_esc(pair.invoked)}</td>"
-                f"<td>{pair.probes}</td>"
+                f"<td>{q.probes}</td>"
                 f"<td>{_esc(q.text)}{thought_html}</td>"
                 "</tr>"
             )

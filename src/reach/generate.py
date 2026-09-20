@@ -273,15 +273,32 @@ def build_adversarial_prompt(
     return ADVERSARIAL_PROMPT_WITH_RIVALS.format(count=count, target=safe_target, rivals=rivals)
 
 
+def _build_generation_prompt(
+    target_body: str,
+    rival_bodies: Sequence[str] = (),
+    count: int = DEFAULT_COUNT,
+    arm: GeneratorArm = GeneratorArm.CONTENT,
+    *,
+    adversarial: bool = False,
+) -> str:
+    """Dispatch prompt construction between standard and adversarial templates."""
+    if adversarial:
+        return build_adversarial_prompt(target_body, rival_bodies, count=count)
+    return build_prompt(target_body, rival_bodies, count, arm)
+
+
 def cap_that_fits(
     target_body: str,
     rival_bodies: Sequence[str],
     budget_chars: int,
     count: int = DEFAULT_COUNT,
     arm: GeneratorArm = GeneratorArm.CONTENT,
+    *,
+    adversarial: bool = False,
 ) -> int | None:
     """Calculate the maximum rival count that fits within prompt character limits."""
-    room = budget_chars - len(build_prompt(target_body, (), count, arm))
+    base_prompt = _build_generation_prompt(target_body, (), count, arm, adversarial=adversarial)
+    room = budget_chars - len(base_prompt)
     kept = 0
     for position, body in enumerate(sorted(rival_bodies, key=len, reverse=True), 1):
         room -= len(RIVAL_BLOCK.format(index=position, body=body))
@@ -298,13 +315,17 @@ def assert_prompt_fits(
     rival_bodies: Sequence[str] = (),
     count: int = DEFAULT_COUNT,
     arm: GeneratorArm = GeneratorArm.CONTENT,
+    *,
+    adversarial: bool = False,
 ) -> str:
     """Construct and validate that the generation prompt fits within runtime limits."""
-    prompt = build_prompt(target_body, rival_bodies, count, arm)
+    prompt = _build_generation_prompt(
+        target_body, rival_bodies, count, arm, adversarial=adversarial
+    )
     budget = runtime.prompt_budget_chars()
     if budget is None or len(prompt) <= budget:
         return prompt
-    cap = cap_that_fits(target_body, rival_bodies, budget, count, arm)
+    cap = cap_that_fits(target_body, rival_bodies, budget, count, arm, adversarial=adversarial)
     advice = (
         f"Pass --top-rivals {cap} to show only the {cap} closest"
         if cap is not None
@@ -474,7 +495,14 @@ def generate_adversarial_for_skill(
         top_rivals,
         scorer,
     )
-    prompt = build_adversarial_prompt(target_body, rival_bodies, count=count)
+    prompt = assert_prompt_fits(
+        driver,
+        target,
+        target_body,
+        rival_bodies,
+        count=count,
+        adversarial=True,
+    )
     drafts = parse_response(driver.complete(prompt, schema=_RESPONSE_JSON_SCHEMA))
 
     queries: list[Query] = []

@@ -1013,3 +1013,133 @@ def test_prompt_tokens_telemetry_propagates_from_outcome_to_scaling_point() -> N
         target_skill="my-skill",
     )
     assert point.prompt_tokens_mean == 1250.0
+
+
+def test_single_skill_sweep_retains_neighbor_negative_queries_and_tracks_internal_fp(
+    tmp_path: Path,
+) -> None:
+    """Verify _resolve_sweep_target_and_queries retains NEIGHBOR_NEGATIVE queries."""
+    from reach.models import CatalogMode, ProbeResult, Query, QueryKind, Skill
+    from reach.queries import Origin, QuerySet, QuerySetProvenance
+    from reach.sweep import _build_scaling_point, _resolve_sweep_target_and_queries
+
+    skills = [
+        Skill(name="my-skill", description="Target skill", path=tmp_path / "my-skill"),
+        Skill(name="rival-skill", description="Rival skill", path=tmp_path / "rival-skill"),
+    ]
+    raw_qs = QuerySet(
+        catalog_id="c",
+        queries=(
+            Query(
+                id="pos-1", text="use target", expected_skill="my-skill", kind=QueryKind.IMPLICIT
+            ),
+            Query(
+                id="adv-1",
+                text="use rival near miss",
+                expected_skill="rival-skill",
+                kind=QueryKind.NEIGHBOR_NEGATIVE,
+            ),
+            Query(
+                id="other-pos",
+                text="unrelated rival positive",
+                expected_skill="rival-skill",
+                kind=QueryKind.IMPLICIT,
+            ),
+        ),
+        provenance=QuerySetProvenance(origin=Origin.AUTHORED),
+    )
+    target, filtered_qs = _resolve_sweep_target_and_queries(skills, raw_qs, "my-skill")
+    assert target == "my-skill"
+    assert [q.id for q in filtered_qs.queries] == ["pos-1", "adv-1"]
+
+    # At k=1 (only my-skill installed), abstaining on adv-1 is a pass (pass_rate = 1.0)
+    baseline_results = (
+        ProbeResult(
+            query_id="pos-1",
+            catalog_id="c1",
+            invoked_skills=("my-skill",),
+            catalog_mode=CatalogMode.SWEEP,
+            catalog_size=1,
+            model="mock",
+            runtime="mock",
+        ),
+        ProbeResult(
+            query_id="adv-1",
+            catalog_id="c1",
+            invoked_skills=(),
+            catalog_mode=CatalogMode.SWEEP,
+            catalog_size=1,
+            model="mock",
+            runtime="mock",
+        ),
+    )
+    point_k1, _ = _build_scaling_point(
+        scale=1,
+        catalog_id="c1",
+        results=baseline_results,
+        resolved_query_set=filtered_qs,
+        baseline_results=(),
+        installed_skills={"my-skill"},
+        target_skill="my-skill",
+    )
+    assert point_k1.pass_rate == 1.0
+    assert point_k1.internal_precision == 1.0
+
+    # If my-skill hijacks adv-1 at k=2, pass_rate = 0.5 and internal_precision = 0.5
+    results = (
+        ProbeResult(
+            query_id="pos-1",
+            catalog_id="c",
+            invoked_skills=("my-skill",),
+            catalog_mode=CatalogMode.SWEEP,
+            catalog_size=2,
+            model="mock",
+            runtime="mock",
+        ),
+        ProbeResult(
+            query_id="adv-1",
+            catalog_id="c",
+            invoked_skills=("my-skill",),
+            catalog_mode=CatalogMode.SWEEP,
+            catalog_size=2,
+            model="mock",
+            runtime="mock",
+        ),
+    )
+    point, _ = _build_scaling_point(
+        scale=2,
+        catalog_id="c",
+        results=results,
+        resolved_query_set=filtered_qs,
+        baseline_results=baseline_results,
+        installed_skills={"my-skill", "rival-skill"},
+        target_skill="my-skill",
+    )
+    assert point.pass_rate == 0.5
+    assert point.recall == 1.0
+    assert point.internal_precision == 0.5
+    assert point.delta_vs_baseline == 0.0
+
+
+def test_render_ascii_curve_single_bullet_per_column_on_midpoint_boundaries() -> None:
+    """Verify render_ascii_curve maps midpoint boundary values to exactly one row bullet."""
+    from reach.views.sweep import render_ascii_curve
+
+    points = [
+        ScalingPoint(
+            scale=s,
+            catalog_id=f"c:{s}",
+            pass_rate=val,
+            pass_rate_interval=(0.0, 1.0),
+            f1_score=val,
+            delta_vs_baseline=0.0,
+            delta_context=0.0,
+            delta_shadowing=0.0,
+            probes_executed=10,
+        )
+        for s, val in [(10, 0.875), (20, 0.625), (30, 0.375), (40, 0.125)]
+    ]
+    lines = render_ascii_curve(points, metric="f1")
+    level_rows = [line.split("|", 1)[1] for line in lines if "|" in line]
+    total_bullets = sum(row.count("●") for row in level_rows)
+    assert total_bullets == len(points)

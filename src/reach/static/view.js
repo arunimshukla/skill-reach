@@ -90,7 +90,7 @@ document.addEventListener('DOMContentLoaded', () => {
   if (matrixTable) {
     matrixTable.addEventListener('click', (e) => {
       const td = e.target.closest('td');
-      if (!td) return;
+      if (!td || td.textContent.trim() === '') return;
       const cellIndex = td.cellIndex;
       const tr = td.closest('tr');
       const expected = tr.querySelector('th') ? tr.querySelector('th').textContent.trim() : '';

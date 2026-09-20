@@ -459,3 +459,27 @@ def test_queries_render_exact_data_attributes_and_exact_js_matching(artifact: Ar
     js_text = script.text()
     assert "getSelectedSkills(q).includes(" in js_text
     assert "q.textContent.includes(" not in js_text
+    assert "td.textContent.trim() === ''" in js_text
+
+
+def test_collisions_html_renders_individual_query_probe_count(artifact: Artifact) -> None:
+    """Verify _collisions_html renders q.probes for each sample query row instead of pair.probes."""
+    from reach.artifact import NO_SKILL, SampleQuery
+
+    collision_pair = next(p for p in artifact.confusion if p.invoked not in (p.expected, NO_SKILL))
+    updated_pair = collision_pair.model_copy(
+        update={
+            "probes": 5,
+            "collisions": 5,
+            "queries": (
+                SampleQuery(query_id="q-1", text="First query", probes=2),
+                SampleQuery(query_id="q-2", text="Second query", probes=3),
+            ),
+        },
+    )
+    test_artifact = artifact.model_copy(update={"confusion": (updated_pair,)})
+    tree = HTMLParser(render_view_html(test_artifact))
+    rows = tree.css("#collisions-table tbody tr")
+    assert len(rows) == 2
+    assert rows[0].css("td")[2].text().strip() == "2"
+    assert rows[1].css("td")[2].text().strip() == "3"
