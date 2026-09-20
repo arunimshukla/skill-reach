@@ -554,7 +554,7 @@ class FakeSdkStep:
         self,
         *,
         status: Any = "STATE_ERROR",
-        http_code: int = 0,
+        http_code: int | str = 0,
         error: str = "",
     ) -> None:
         """Initialize mock conversation step with status, HTTP code, and error message."""

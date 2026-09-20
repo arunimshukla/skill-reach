@@ -1140,31 +1140,43 @@ def test_generator_complete_handles_pydantic_structured_output(
 
 
 @pytest.mark.parametrize(
-    ("http_code", "error_msg", "expected_error"),
+    ("steps", "stop_reason", "expected_error"),
     [
         pytest.param(
-            429,
-            "Resource exhausted",
+            [_FakeStep(http_code=429, error="Resource exhausted")],
+            "UNSPECIFIED",
             "rate limit (429): Resource exhausted",
             id="http-429-resource-exhausted",
         ),
         pytest.param(
-            0,
-            "HTTP 429 Too Many Requests: quota exceeded",
+            [_FakeStep(http_code=429, error="Resource exhausted")],
+            "END_TURN",
+            "rate limit (429): Resource exhausted",
+            id="end-turn-stop-reason-surfaces-429-instead-of-runtime-error",
+        ),
+        pytest.param(
+            [_FakeStep(http_code=0, error="HTTP 429 Too Many Requests: quota exceeded")],
+            "UNSPECIFIED",
             "rate limit (429): HTTP 429 Too Many Requests: quota exceeded",
             id="implicit-429-in-error-string",
         ),
         pytest.param(
-            503,
-            "Service Unavailable",
+            [_FakeStep(http_code=503, error="Service Unavailable")],
+            "UNSPECIFIED",
             "sdk step error (HTTP 503): Service Unavailable",
             id="http-503-service-unavailable",
         ),
         pytest.param(
-            0,
-            "Internal stream disconnect",
+            [_FakeStep(http_code="invalid", error="Internal stream disconnect")],
+            "UNSPECIFIED",
             "sdk step error: Internal stream disconnect",
-            id="non-http-system-step-error",
+            id="non-numeric-http-code-system-step-error",
+        ),
+        pytest.param(
+            [_FakeStep(status="COMPLETED", http_code=200, error="non-fatal info notice")],
+            "UNSPECIFIED",
+            "empty selection (likely rate-limited)",
+            id="completed-step-with-info-string-ignored",
         ),
     ],
 )
@@ -1172,14 +1184,17 @@ def test_select_surfaces_history_error_when_output_empty(
     monkeypatch: pytest.MonkeyPatch,
     runtime: AntigravitySdkRuntime,
     tmp_path: Path,
-    http_code: int,
-    error_msg: str,
+    steps: list[_FakeStep],
+    stop_reason: str,
     expected_error: str,
 ) -> None:
     """Verify select extracts HTTP/system error from conversation history on empty output."""
     runtime._resident = ("gke-basics",)
-    step = _FakeStep(http_code=http_code, error=error_msg)
-    _fake_agent(monkeypatch, _FakeResponse(structured=None), history=[step])
+    _fake_agent(
+        monkeypatch,
+        _FakeResponse(structured=None, stop_reason=stop_reason),
+        history=steps,
+    )
     outcome = runtime.select("how do I set up a cluster?", tmp_path / "work")
     assert outcome.invoked_skills == ()
     assert outcome.error == expected_error
