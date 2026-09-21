@@ -633,3 +633,94 @@ def test_check_empirical_probes_cache_and_invalidation(
         assert count3 == 1
         assert m3.accuracy == 1.0
         assert select_calls == 2
+
+
+def test_filter_check_queries_includes_competing_neighbor_guardrails(
+    write_skill: Callable[..., Path],
+    write_queries: Callable[..., Path],
+    tmp_path: Path,
+) -> None:
+    """Verify _filter_check_queries includes competing neighbor queries when --changed is active."""
+    from reach.catalog import load_skills
+    from reach.check import _filter_check_queries
+
+    write_skill(
+        name="gke-storage-troubleshooting",
+        description=(
+            "Diagnoses GKE storage issues including PVC Pending and Cloud Storage FUSE OOM. "
+            "Don't use for initial storage provisioning (use `gke-storage`)."
+        ),
+    )
+    write_skill(
+        name="google-cloud-storage-fuse",
+        description="Configures, mounts, and tunes Cloud Storage FUSE on GKE clusters.",
+    )
+    write_skill(
+        name="unrelated-billing-export",
+        description="Exports billing invoices to CSV reports for finance auditing.",
+    )
+    skills = load_skills(tmp_path)
+
+    queries_file = write_queries(
+        queries=[
+            Query(
+                id="q-gke-1",
+                text="debug PVC pending state in GKE",
+                expected_skill="gke-storage-troubleshooting",
+            ),
+            Query(
+                id="oos-storage-fuse-1",
+                text="tune Cloud Storage FUSE read cache for GKE training",
+                expected_skill="google-cloud-storage-fuse",
+            ),
+            Query(
+                id="q-billing-1",
+                text="export monthly finance invoice to CSV",
+                expected_skill="unrelated-billing-export",
+            ),
+        ],
+    )
+
+    selected, exhausted = _filter_check_queries(
+        queries_file,
+        modified={"gke-storage-troubleshooting"},
+        changed=True,
+        budget=10,
+        skills=skills,
+    )
+    assert not exhausted
+    selected_ids = [q.id for q in selected]
+    assert "q-gke-1" in selected_ids
+    assert "oos-storage-fuse-1" in selected_ids
+    assert "q-billing-1" not in selected_ids
+
+
+def test_find_competing_neighbors_includes_dense_semantic_rivals(tmp_path: Path) -> None:
+    """Verify find_competing_neighbors retains neighbors with semantic similarity >= 0.75."""
+    from reach.lint import find_competing_neighbors
+    from reach.models import Skill
+
+    skills = [
+        Skill(
+            name="bigquery-observability",
+            description="Monitor active slot utilization and job timeline metrics.",
+            path=tmp_path / "bigquery-observability" / "SKILL.md",
+        ),
+        Skill(
+            name="bigquery-slot-cost-optimizer",
+            description="Analyze warehouse reservation sizing and query billing tiers.",
+            path=tmp_path / "bigquery-slot-cost-optimizer" / "SKILL.md",
+        ),
+        Skill(
+            name="cloud-dns-routing",
+            description="Configure DNS forwarding zones and health check policies.",
+            path=tmp_path / "cloud-dns-routing" / "SKILL.md",
+        ),
+    ]
+    dense_sims = {("bigquery-observability", "bigquery-slot-cost-optimizer"): 0.81}
+    neighbors = find_competing_neighbors(
+        {"bigquery-observability"},
+        skills,
+        dense_similarities=dense_sims,
+    )
+    assert neighbors == {"bigquery-slot-cost-optimizer"}

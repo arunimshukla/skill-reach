@@ -95,6 +95,8 @@ power = 0.80
 max_description_length = 1024
 max_name_length = 64
 min_description_length = 20
+mutual_handoff_lexical_threshold = 0.35
+mutual_handoff_similarity_threshold = 0.75
 
 [lint.rules]
 # Customize rule severities: "error", "warn", or "ignore".
@@ -106,9 +108,11 @@ invalid-yaml = "error"
 listing-overflow = "warn"
 lockfile-drift = "warn"
 missing-description = "error"
+missing-mutual-handoff = "warn"
 missing-name = "error"
 name-mismatch = "error"
 reserved-name-collision = "warn"
+unknown-skill-reference = "error"
 unresolved-declared-dependency = "warn"
 unresolved-placeholder = "warn"
 unbounded-attractor = "warn"

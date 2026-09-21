@@ -91,6 +91,8 @@ class Rewrite(BaseModel):
     ceded: tuple[CededTerm, ...] = ()
     unclaimed: tuple[str, ...] = ()
     contenders: tuple[str, ...] = ()
+    rival_disclaims_target: bool = False
+    missing_mutual_handoffs: tuple[str, ...] = ()
 
     @property
     def reword(self) -> tuple[CededTerm, ...]:
@@ -309,12 +311,42 @@ def suggest_rewrite(
         tokenized_corpus=tokenized,
     )
     contenders = tuple(r.name for r in competition.ranked_rivals if r.score >= band * nearest.score)
+    from reach.lint import (
+        _claims_neighbor_name_phrase,
+        extract_skill_references,
+        hands_off_to_skill,
+    )
+
+    by_name = {s.name: s for s in skills}
+    target_refs = frozenset(extract_skill_references(target.description, self_name=target.name))
+    rival_refs = frozenset(extract_skill_references(rival.description, self_name=rival.name))
+    rival_disclaims = hands_off_to_skill(rival.description, target.name, rival_refs)
+    target_has_boundaries = bool(target_refs) or any(t.disclaimed for t in ceded)
+
+    missing_mutual: list[str] = []
+    for contender_name in contenders:
+        contender_skill = by_name.get(contender_name)
+        if contender_skill is None:
+            continue
+        c_refs = frozenset(
+            extract_skill_references(contender_skill.description, self_name=contender_name)
+        )
+        claims_phrase = _claims_neighbor_name_phrase(
+            contender_skill, target
+        ) or _claims_neighbor_name_phrase(target, contender_skill)
+        if (target_has_boundaries or bool(c_refs) or claims_phrase) and not hands_off_to_skill(
+            contender_skill.description, target.name, c_refs
+        ):
+            missing_mutual.append(contender_name)
+
     return Rewrite(
         skill=target.name,
         rival=rival.name,
         ceded=ceded,
         unclaimed=unclaimed,
         contenders=contenders,
+        rival_disclaims_target=rival_disclaims,
+        missing_mutual_handoffs=tuple(missing_mutual),
     )
 
 

@@ -34,6 +34,7 @@ from reach.runtime.claude_code import DEFAULT_DENIED_TOOLS, SKILL_TOOL_NAME
 
 if TYPE_CHECKING:
     from reach.models import Skill
+    from reach.retrieval import Bm25Scorer
 
 __all__ = [
     "RULES",
@@ -43,6 +44,10 @@ __all__ = [
     "RuleDefinition",
     "Severity",
     "explain_rule",
+    "extract_skill_references",
+    "find_competing_neighbors",
+    "find_unknown_skill_references",
+    "hands_off_to_skill",
     "lint_file",
     "lint_skills",
     "lint_tree",
@@ -266,6 +271,35 @@ RULES: dict[str, RuleDefinition] = {
         remedy=(
             "Narrow the description to specific domains, tools, and trigger conditions, "
             "and add directional disclaimers specifying when not to invoke the skill."
+        ),
+    ),
+    "unknown-skill-reference": RuleDefinition(
+        rule="unknown-skill-reference",
+        default_severity=Severity.ERROR,
+        summary="Description hands off to a skill name that does not exist in the catalog",
+        explanation=(
+            "Negative routing instructions (e.g. 'Don't use for X — use <other-skill>') "
+            "that reference a missing or unmerged skill actively repel the router away "
+            "from the resident skill while the target skill is absent, creating a 0% "
+            "recall sinkhole."
+        ),
+        remedy=(
+            "Remove the handoff reference until the target skill is added to the catalog, "
+            "or correct the referenced skill name."
+        ),
+    ),
+    "missing-mutual-handoff": RuleDefinition(
+        rule="missing-mutual-handoff",
+        default_severity=Severity.WARN,
+        summary="Overlapping neighbor skills lack mutual routing handoffs ('use <other-skill>')",
+        explanation=(
+            "When closely related skills share domain vocabulary or one skill defines a "
+            "one-way boundary without a reciprocal handoff on the neighbor, the unguarded "
+            "skill acts as a one-way attractor sink and hijacks queries."
+        ),
+        remedy=(
+            "Add reciprocal 'Don't use for X (use <neighbor-skill>)' handoff clauses to "
+            "both overlapping skills so each carves out the other's territory."
         ),
     ),
 }
@@ -592,26 +626,609 @@ def _check_duplicates(
     return issues
 
 
-def _check_duplicate_capabilities(
+#: Common hyphenated compound adjectives and technical terms that are not skill identifiers.
+_NON_SKILL_HYPHENATED_TERMS: Final[frozenset[str]] = frozenset(
+    {
+        "all-in-one",
+        "apt-get",
+        "auto-scaling",
+        "built-in",
+        "ci-cd",
+        "client-side",
+        "command-line",
+        "cross-origin",
+        "cross-platform",
+        "cross-project",
+        "cross-region",
+        "day-to-day",
+        "docker-compose",
+        "dry-run",
+        "end-to-end",
+        "event-driven",
+        "fail-fast",
+        "fine-grained",
+        "first-party",
+        "flat-rate",
+        "full-text",
+        "general-purpose",
+        "git-lfs",
+        "high-availability",
+        "high-level",
+        "high-performance",
+        "high-throughput",
+        "huggingface-hub",
+        "in-memory",
+        "in-place",
+        "key-value",
+        "kebab-case",
+        "least-privilege",
+        "long-lived",
+        "long-running",
+        "low-latency",
+        "low-level",
+        "machine-learning",
+        "multi-agent",
+        "multi-channel",
+        "multi-cloud",
+        "multi-cluster",
+        "multi-region",
+        "multi-stage",
+        "multi-step",
+        "multi-tenant",
+        "multi-turn",
+        "near-duplicate",
+        "non-empty",
+        "non-interactive",
+        "non-null",
+        "non-zero",
+        "object-oriented",
+        "on-demand",
+        "on-prem",
+        "on-premises",
+        "one-off",
+        "one-shot",
+        "one-way",
+        "open-source",
+        "out-of-scope",
+        "out-of-the-box",
+        "pay-as-you-go",
+        "pip-compile",
+        "point-in-time",
+        "pre-built",
+        "pre-commit",
+        "pre-configured",
+        "pre-flight",
+        "production-ready",
+        "pull-based",
+        "push-based",
+        "read-only",
+        "read-write",
+        "real-time",
+        "red-green-refactor",
+        "role-based",
+        "root-cause",
+        "round-robin",
+        "rule-based",
+        "run-to-run",
+        "scikit-learn",
+        "self-contained",
+        "self-hosted",
+        "self-managed",
+        "self-repulsion",
+        "self-service",
+        "self-signed",
+        "server-side",
+        "sha-256",
+        "short-form",
+        "short-lived",
+        "side-by-side",
+        "single-node",
+        "single-page",
+        "source-to-image",
+        "split-horizon",
+        "stage-level",
+        "state-of-the-art",
+        "step-by-step",
+        "sub-agent",
+        "sub-agents",
+        "test-driven",
+        "test-first",
+        "third-party",
+        "time-series",
+        "token-based",
+        "top-1",
+        "top-k",
+        "top-level",
+        "two-stage",
+        "type-safe",
+        "utf-8",
+        "user-defined",
+        "user-facing",
+        "well-architected",
+        "well-formed",
+        "well-structured",
+        "write-in",
+        "zero-downtime",
+        "zero-trust",
+    }
+)
+
+#: Generic platform/domain prefixes excluded when extracting distinctive skill name runs.
+_GENERIC_NAME_TOKENS: Final[frozenset[str]] = frozenset(
+    {
+        "agent",
+        "agents",
+        "api",
+        "aws",
+        "azure",
+        "basics",
+        "cli",
+        "cloud",
+        "common",
+        "core",
+        "default",
+        "gcp",
+        "general",
+        "google",
+        "helper",
+        "sdk",
+        "skill",
+        "skills",
+        "tool",
+        "tools",
+    }
+)
+
+_HANDOFF_VERB = r"(?:use|see|prefer|refer\s+to|defer\s+to|delegate\s+to|hand\s+off\s+to)"
+_KEBAB_ID = r"[a-z0-9]+(?:-[a-z0-9]+)+"
+_KEBAB_ID_RE = re.compile(_KEBAB_ID, re.IGNORECASE)
+_ANY_SKILL_ID = r"[a-z0-9]+(?:-[a-z0-9]+)*"
+_KEBAB_LIST = (
+    rf"`?{_KEBAB_ID}`?(?:\s+(?:first|instead|skill))?"
+    rf"(?:\s*(?:,\s*(?:or|and)\b|,|\bor\b|\band\b)\s*(?:use\s+|see\s+|prefer\s+|the\s+)?`?{_KEBAB_ID}`?(?:\s+(?:first|instead|skill))?)*"
+)
+
+_PAREN_HANDOFF_RE = re.compile(
+    rf"\([^)]*?\b{_HANDOFF_VERB}\s+(?:the\s+)?(?P<targets>{_KEBAB_LIST})[^)]*\)",
+    re.IGNORECASE,
+)
+
+_QUALIFIED_HANDOFF_RE = re.compile(
+    rf"\b{_HANDOFF_VERB}\s+(?:the\s+)?`?({_ANY_SKILL_ID})`?\s+(?:instead|first|skill)\b",
+    re.IGNORECASE,
+)
+
+_BACKTICK_HANDOFF_RE = re.compile(
+    rf"\b{_HANDOFF_VERB}\s+(?:the\s+)?`({_KEBAB_ID})`",
+    re.IGNORECASE,
+)
+
+_NEGATIVE_CLAUSE_MARKER_RE = re.compile(
+    r"\b(?:don't\s+use|do\s+not\s+use|not\s+for\b|never\s+use|avoid\s+using|"
+    r"instead\s+of\b|rather\s+than\b|for\s+[^.!?;]+,\s*(?:use|prefer|defer\s+to|see)\b)",
+    re.IGNORECASE,
+)
+
+_VERB_TARGET_IN_CLAUSE_RE = re.compile(
+    rf"\b{_HANDOFF_VERB}\s+(?:the\s+)?(?P<targets>{_KEBAB_LIST})",
+    re.IGNORECASE,
+)
+
+
+#: Minimum distinctive token count in a neighbor skill name to detect phrase encroachment.
+_MIN_DISTINCTIVE_NAME_TOKENS: Final = 2
+
+#: Minimum character length for shared trigger terms reported in mutual handoff diagnostics.
+_MIN_SHARED_TRIGGER_LENGTH: Final = 3
+
+
+def _is_valid_skill_ref(
+    candidate: str,
+    self_lower: str | None,
+    require_hyphen: bool = True,
+) -> bool:
+    """Check whether an extracted token is a plausible skill reference rather than prose."""
+    cleaned = candidate.strip().lower()
+    if not cleaned or (self_lower is not None and cleaned == self_lower):
+        return False
+    if require_hyphen and "-" not in cleaned:
+        return False
+    if not _KEBAB_NAME.match(cleaned):
+        return False
+    return cleaned not in _NON_SKILL_HYPHENATED_TERMS and cleaned not in RESERVED_TOOL_NAMES
+
+
+def _add_if_valid_ref(
+    found: set[str],
+    candidate: str | None,
+    self_lower: str | None,
+    *,
+    require_hyphen: bool = True,
+) -> None:
+    """Add candidate to found set if it passes skill reference validation."""
+    if candidate and _is_valid_skill_ref(candidate, self_lower, require_hyphen=require_hyphen):
+        found.add(candidate.lower())
+
+
+def extract_skill_references(
+    description: str,
+    *,
+    self_name: str | None = None,
+) -> tuple[str, ...]:
+    """Extract skill identifiers referenced in routing handoff or disclaimer clauses.
+
+    Args:
+        description: Raw skill description text from SKILL.md frontmatter.
+        self_name: Optional name of the skill itself to exclude self-references.
+
+    Returns:
+        Sorted tuple of unique referenced skill names in kebab-case.
+    """
+    if not description or not description.strip():
+        return ()
+
+    self_lower = self_name.strip().lower() if self_name else None
+    found: set[str] = set()
+
+    for match in _PAREN_HANDOFF_RE.finditer(description):
+        for token in _KEBAB_ID_RE.findall(match.group("targets")):
+            _add_if_valid_ref(found, token, self_lower, require_hyphen=True)
+
+    for match in _QUALIFIED_HANDOFF_RE.finditer(description):
+        qualifier_is_skill = match.group(0).strip().lower().endswith("skill")
+        _add_if_valid_ref(
+            found,
+            match.group(1),
+            self_lower,
+            require_hyphen=not qualifier_is_skill,
+        )
+
+    for match in _BACKTICK_HANDOFF_RE.finditer(description):
+        _add_if_valid_ref(found, match.group(1), self_lower, require_hyphen=True)
+
+    for sentence in re.split(r"[.!?]+", description):
+        if not _NEGATIVE_CLAUSE_MARKER_RE.search(sentence):
+            continue
+        for match in _VERB_TARGET_IN_CLAUSE_RE.finditer(sentence):
+            for token in _KEBAB_ID_RE.findall(match.group("targets")):
+                _add_if_valid_ref(found, token, self_lower, require_hyphen=True)
+
+    return tuple(sorted(found))
+
+
+_HANDOFF_SENTENCE_RE: Final = re.compile(
+    r"\b(?:use|see|prefer|refer|defer|delegate|instead|don't|do\s+not|not\s+for|avoid)\b",
+    re.IGNORECASE,
+)
+
+
+def find_unknown_skill_references(
+    description: str,
+    known_skills: Sequence[str] | set[str] | frozenset[str],
+    *,
+    self_name: str | None = None,
+    settings: LintSettings | None = None,
+) -> tuple[str, ...]:
+    """Return referenced skill names in description that are absent from known_skills.
+
+    Respects the configured severity for ``unknown-skill-reference`` and returns
+    an empty tuple when the rule is set to ``ignore``.
+    """
+    cfg = settings if settings is not None else LintSettings.from_settings()
+    if _resolve_severity("unknown-skill-reference", cfg) is None:
+        return ()
+    known_lower = {name.lower() for name in known_skills}
+    refs = extract_skill_references(description, self_name=self_name)
+    return tuple(ref for ref in refs if ref not in known_lower)
+
+
+def _check_unknown_skill_references(
     skills: Sequence[Skill],
+    names_seen: Mapping[str, int],
     paths_by_name: Mapping[str, Sequence[Path]],
     cfg: LintSettings,
 ) -> list[LintIssue]:
-    """Identify and record near-duplicate capability semantic collisions across a corpus."""
-    if _resolve_severity("duplicate-capability", cfg) is None or len(skills) < MIN_PAIRWISE_SKILLS:
+    """Identify routing handoffs in descriptions that point to non-existent skills."""
+    if _resolve_severity("unknown-skill-reference", cfg) is None:
         return []
 
+    issues: list[LintIssue] = []
+    known_names = {name.lower() for name in names_seen}
+    for skill in skills:
+        unknown_refs = find_unknown_skill_references(
+            skill.description,
+            known_names,
+            self_name=skill.name,
+            settings=cfg,
+        )
+        for ref in unknown_refs:
+            for skill_path in paths_by_name.get(skill.name, ()):
+                msg = (
+                    f"Skill '{skill.name}' hands off to unknown skill '{ref}' in its "
+                    "description, which is missing from the catalog and causes routing "
+                    "self-repulsion."
+                )
+                _record_issue(
+                    issues,
+                    "unknown-skill-reference",
+                    skill.name,
+                    skill_path,
+                    msg,
+                    cfg,
+                )
+    return issues
+
+
+def hands_off_to_skill(
+    source_description: str,
+    target_name: str,
+    extracted_refs: frozenset[str] | None = None,
+) -> bool:
+    """Return True if source_description explicitly hands off to or disclaims target_name."""
+    target_lower = target_name.lower()
+    refs = (
+        extracted_refs
+        if extracted_refs is not None
+        else frozenset(extract_skill_references(source_description))
+    )
+    if target_lower in refs:
+        return True
+
+    from reach.leak import contains_run
+    from reach.retrieval import tokenize
+
+    wanted = tokenize(target_lower)
+    if not wanted:
+        return False
+
+    for sentence in re.split(r"[.!?]+", source_description):
+        if _HANDOFF_SENTENCE_RE.search(sentence) and contains_run(tokenize(sentence), wanted):
+            return True
+    return False
+
+
+def _claims_neighbor_name_phrase(source: Skill, neighbor: Skill) -> bool:
+    """Check whether source description contains neighbor's distinctive multi-token name."""
+    from reach.leak import contains_run
+    from reach.retrieval import tokenize
+
+    neighbor_tokens = [t for t in tokenize(neighbor.name) if t not in _GENERIC_NAME_TOKENS]
+    if len(neighbor_tokens) < _MIN_DISTINCTIVE_NAME_TOKENS:
+        return False
+    source_desc_tokens = tokenize(source.description)
+    return contains_run(source_desc_tokens, neighbor_tokens)
+
+
+def _max_lexical_ratio(
+    s1_name: str,
+    s2_name: str,
+    comp_by_name: Mapping[str, object],
+) -> float:
+    """Compute maximum directional BM25 rival score ratio between two skills."""
+    from reach.overlap import Competition
+
+    c1 = comp_by_name.get(s1_name)
+    c2 = comp_by_name.get(s2_name)
+    r12 = (
+        next((r.score for r in c1.rivals if r.name == s2_name), 0.0) / c1.self_score
+        if isinstance(c1, Competition) and c1.self_score > 0
+        else 0.0
+    )
+    r21 = (
+        next((r.score for r in c2.rivals if r.name == s1_name), 0.0) / c2.self_score
+        if isinstance(c2, Competition) and c2.self_score > 0
+        else 0.0
+    )
+    return max(r12, r21)
+
+
+def find_competing_neighbors(
+    modified: set[str],
+    skills: Sequence[Skill],
+    *,
+    settings: LintSettings | None = None,
+    dense_similarities: Mapping[tuple[str, str], float] | None = None,
+) -> set[str]:
+    """Identify competing neighbor skills that could be hijacked by modified skills."""
+    if not modified or len(skills) < MIN_PAIRWISE_SKILLS:
+        return set()
+
+    from reach.overlap import rank_corpus
+
+    cfg = settings if settings is not None else LintSettings.from_settings()
+    lex_thresh = cfg.mutual_handoff_lexical_threshold
+    sem_thresh = cfg.mutual_handoff_similarity_threshold
+    sim_map = (
+        dense_similarities
+        if dense_similarities is not None
+        else _compute_dense_similarities(skills)
+    )
+    overlap = rank_corpus(skills)
+    comp_by_name = {c.skill: c for c in overlap.competitions}
+    by_name = {s.name: s for s in skills}
+    refs_by_name = {
+        s.name: frozenset(extract_skill_references(s.description, self_name=s.name)) for s in skills
+    }
+    neighbors: set[str] = set()
+
+    for mod_name in modified:
+        mod_skill = by_name.get(mod_name)
+        if mod_skill is None:
+            continue
+        neighbors.update(refs_by_name.get(mod_name, frozenset()) & (set(by_name) - modified))
+        for candidate in skills:
+            if candidate.name in modified:
+                continue
+            sem_sim = max(
+                sim_map.get((mod_name, candidate.name), 0.0),
+                sim_map.get((candidate.name, mod_name), 0.0),
+            )
+            lex_ratio = _max_lexical_ratio(mod_name, candidate.name, comp_by_name)
+            if (
+                lex_ratio >= lex_thresh
+                or sem_sim >= sem_thresh
+                or mod_name in refs_by_name.get(candidate.name, ())
+                or _claims_neighbor_name_phrase(mod_skill, candidate)
+                or _claims_neighbor_name_phrase(candidate, mod_skill)
+            ):
+                neighbors.add(candidate.name)
+
+    return neighbors
+
+
+def _shared_trigger_terms(
+    s1: Skill,
+    s2: Skill,
+    scorer: Bm25Scorer | None = None,
+    limit: int = 3,
+) -> tuple[str, ...]:
+    """Extract top shared high-IDF domain vocabulary terms between two skills."""
+    from reach.leak import FUNCTION_WORDS
+    from reach.retrieval import tokenize
+
+    ignored = FUNCTION_WORDS | _GENERIC_NAME_TOKENS | {"and"}
+    t1 = set(tokenize(s1.description)) - ignored
+    t2 = set(tokenize(s2.description)) - ignored
+    shared = [t for t in t1.intersection(t2) if len(t) >= _MIN_SHARED_TRIGGER_LENGTH]
+    if scorer is not None:
+        shared.sort(key=lambda term: (-scorer.idf(term), term))
+    else:
+        shared.sort()
+    return tuple(shared[:limit])
+
+
+def _check_missing_mutual_handoffs(
+    skills: Sequence[Skill],
+    paths_by_name: Mapping[str, Sequence[Path]],
+    cfg: LintSettings,
+    dense_similarities: Mapping[tuple[str, str], float] | None = None,
+    skill_filter: str | None = None,
+) -> list[LintIssue]:
+    """Identify overlapping neighbor pairs with one-way or missing reciprocal routing handoffs."""
+    if (
+        _resolve_severity("missing-mutual-handoff", cfg) is None
+        or len(skills) < MIN_PAIRWISE_SKILLS
+    ):
+        return []
+
+    from reach.overlap import rank_corpus
+    from reach.retrieval import Bm25Scorer
+
+    scorer = Bm25Scorer.from_skills(skills)
+    overlap = rank_corpus(skills)
+    comp_by_name = {c.skill: c for c in overlap.competitions}
+    refs_by_name = {
+        s.name: frozenset(extract_skill_references(s.description, self_name=s.name)) for s in skills
+    }
+
+    issues: list[LintIssue] = []
+    lex_thresh = cfg.mutual_handoff_lexical_threshold
+    sem_thresh = cfg.mutual_handoff_similarity_threshold
+
+    for i, s1 in enumerate(skills):
+        for s2 in skills[i + 1 :]:
+            if skill_filter is not None and skill_filter not in {s1.name, s2.name}:
+                continue
+            s1_to_s2 = hands_off_to_skill(s1.description, s2.name, refs_by_name[s1.name])
+            s2_to_s1 = hands_off_to_skill(s2.description, s1.name, refs_by_name[s2.name])
+            if s1_to_s2 and s2_to_s1:
+                continue
+
+            max_lex_ratio = _max_lexical_ratio(s1.name, s2.name, comp_by_name)
+            sem_sim = 0.0
+            if dense_similarities is not None:
+                sem_sim = max(
+                    dense_similarities.get((s1.name, s2.name), 0.0),
+                    dense_similarities.get((s2.name, s1.name), 0.0),
+                )
+
+            one_way_handoff = (s1_to_s2 != s2_to_s1) and (
+                max_lex_ratio > 0.0 or sem_sim >= sem_thresh
+            )
+            either_has_boundaries = bool(refs_by_name[s1.name] or refs_by_name[s2.name])
+            high_neighbor_contention = (
+                _claims_neighbor_name_phrase(s1, s2)
+                or _claims_neighbor_name_phrase(s2, s1)
+                or (sem_sim >= sem_thresh and max_lex_ratio >= lex_thresh)
+                or (
+                    either_has_boundaries and (max_lex_ratio >= lex_thresh or sem_sim >= sem_thresh)
+                )
+            )
+
+            if not (one_way_handoff or high_neighbor_contention):
+                continue
+
+            shared_terms = _shared_trigger_terms(s1, s2, scorer)
+            shared_str = (
+                f" (shared triggers: {', '.join(repr(t) for t in shared_terms)})"
+                if shared_terms
+                else ""
+            )
+
+            for subject, partner, subj_hands_to_partner in (
+                (s1, s2, s1_to_s2),
+                (s2, s1, s2_to_s1),
+            ):
+                if subj_hands_to_partner:
+                    msg = (
+                        f"Skill '{subject.name}' hands off to '{partner.name}', but "
+                        f"'{partner.name}' has no reciprocal handoff back to '{subject.name}'"
+                        f"{shared_str}."
+                    )
+                else:
+                    msg = (
+                        f"Skill '{subject.name}' overlaps with '{partner.name}'{shared_str} "
+                        f"but does not include a mutual routing handoff "
+                        f'(e.g. "Don\'t use for ... (use {partner.name})").'
+                    )
+                for skill_path in paths_by_name.get(subject.name, ()):
+                    _record_issue(
+                        issues,
+                        "missing-mutual-handoff",
+                        subject.name,
+                        skill_path,
+                        msg,
+                        cfg,
+                    )
+
+    return issues
+
+
+def _compute_dense_similarities(skills: Sequence[Skill]) -> dict[tuple[str, str], float]:
+    """Compute pairwise semantic similarities when DenseScorer is available."""
+    if len(skills) < MIN_PAIRWISE_SKILLS:
+        return {}
     try:
         from reach.retrieval import DenseScorer
 
         scorer = DenseScorer.from_skills(skills)
         pairs = scorer.pairwise_similarity(skills)
+        return {(s1, s2): sim for s1, s2, sim in pairs}
     except (RuntimeError, ValueError, OSError):
+        return {}
+
+
+def _check_duplicate_capabilities(
+    skills: Sequence[Skill],
+    paths_by_name: Mapping[str, Sequence[Path]],
+    cfg: LintSettings,
+    dense_similarities: Mapping[tuple[str, str], float] | None = None,
+) -> list[LintIssue]:
+    """Identify and record near-duplicate capability semantic collisions across a corpus."""
+    if _resolve_severity("duplicate-capability", cfg) is None or len(skills) < MIN_PAIRWISE_SKILLS:
+        return []
+
+    sim_map = (
+        dense_similarities
+        if dense_similarities is not None
+        else _compute_dense_similarities(skills)
+    )
+    if not sim_map:
         return []
 
     issues: list[LintIssue] = []
     threshold = cfg.similarity_threshold
-    for s1_name, s2_name, sim in pairs:
+    for (s1_name, s2_name), sim in sim_map.items():
         if sim >= threshold:
             for s1_path in paths_by_name.get(s1_name, ()):
                 msg = (
@@ -666,11 +1283,6 @@ def _lint_paths(
         file_report = lint_file(file_path, config=cfg)
         skill_name = file_report.skill_name or file_path.parent.name
 
-        if skill_filter is not None and skill_name != skill_filter:
-            continue
-
-        skills_checked += 1
-        all_issues.extend(file_report.issues)
         names_seen[skill_name] += 1
         paths_by_name.setdefault(skill_name, []).append(file_path)
 
@@ -681,9 +1293,47 @@ def _lint_paths(
         except (OSError, yaml.YAMLError, UnicodeDecodeError):
             pass
 
-    all_issues.extend(_check_duplicates(names_seen, paths_by_name, cfg))
-    all_issues.extend(_check_duplicate_capabilities(valid_skills, paths_by_name, cfg))
-    all_issues.extend(_check_declared_dependencies(valid_skills, names_seen, paths_by_name, cfg))
+        if skill_filter is not None and skill_name != skill_filter:
+            continue
+
+        skills_checked += 1
+        all_issues.extend(file_report.issues)
+
+    has_filtered_target = skill_filter is None or any(s.name == skill_filter for s in valid_skills)
+    need_dense = has_filtered_target and (
+        _resolve_severity("duplicate-capability", cfg) is not None
+        or _resolve_severity("missing-mutual-handoff", cfg) is not None
+    )
+    dense_sims = _compute_dense_similarities(valid_skills) if need_dense else {}
+
+    corpus_issues: list[LintIssue] = []
+    corpus_issues.extend(_check_duplicates(names_seen, paths_by_name, cfg))
+    corpus_issues.extend(
+        _check_duplicate_capabilities(
+            valid_skills,
+            paths_by_name,
+            cfg,
+            dense_similarities=dense_sims,
+        )
+    )
+    corpus_issues.extend(_check_declared_dependencies(valid_skills, names_seen, paths_by_name, cfg))
+    corpus_issues.extend(
+        _check_unknown_skill_references(valid_skills, names_seen, paths_by_name, cfg)
+    )
+    corpus_issues.extend(
+        _check_missing_mutual_handoffs(
+            valid_skills,
+            paths_by_name,
+            cfg,
+            dense_similarities=dense_sims,
+            skill_filter=skill_filter,
+        )
+    )
+
+    if skill_filter is not None:
+        corpus_issues = [i for i in corpus_issues if i.skill == skill_filter]
+
+    all_issues.extend(corpus_issues)
     all_issues.sort(key=lambda i: (str(i.path or ""), i.line or 0, i.rule))
     return LintReport(issues=tuple(all_issues), skills_checked=skills_checked)
 
