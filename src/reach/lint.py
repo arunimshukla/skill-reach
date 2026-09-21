@@ -1047,8 +1047,7 @@ def find_competing_neighbors(
     comp_by_name = {c.skill: c for c in overlap.competitions}
     by_name = {s.name: s for s in skills}
     refs_by_name = {
-        s.name: frozenset(extract_skill_references(s.description, self_name=s.name))
-        for s in skills
+        s.name: frozenset(extract_skill_references(s.description, self_name=s.name)) for s in skills
     }
     neighbors: set[str] = set()
 
@@ -1119,8 +1118,7 @@ def _check_missing_mutual_handoffs(
     overlap = rank_corpus(skills)
     comp_by_name = {c.skill: c for c in overlap.competitions}
     refs_by_name = {
-        s.name: frozenset(extract_skill_references(s.description, self_name=s.name))
-        for s in skills
+        s.name: frozenset(extract_skill_references(s.description, self_name=s.name)) for s in skills
     }
 
     issues: list[LintIssue] = []
@@ -1153,8 +1151,7 @@ def _check_missing_mutual_handoffs(
                 or _claims_neighbor_name_phrase(s2, s1)
                 or (sem_sim >= sem_thresh and max_lex_ratio >= lex_thresh)
                 or (
-                    either_has_boundaries
-                    and (max_lex_ratio >= lex_thresh or sem_sim >= sem_thresh)
+                    either_has_boundaries and (max_lex_ratio >= lex_thresh or sem_sim >= sem_thresh)
                 )
             )
 
@@ -1182,7 +1179,7 @@ def _check_missing_mutual_handoffs(
                     msg = (
                         f"Skill '{subject.name}' overlaps with '{partner.name}'{shared_str} "
                         f"but does not include a mutual routing handoff "
-                        f"(e.g. \"Don't use for ... (use {partner.name})\")."
+                        f'(e.g. "Don\'t use for ... (use {partner.name})").'
                     )
                 for skill_path in paths_by_name.get(subject.name, ()):
                     _record_issue(

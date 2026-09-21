@@ -1930,4 +1930,3 @@ def test_filter_candidates_rejects_unknown_skill_references() -> None:
     assert filtered[0].lint_clean is False
     assert "bigquery-troubleshooting" in (filtered[0].filter_reason or "")
     assert filtered[1].lint_clean is True
-

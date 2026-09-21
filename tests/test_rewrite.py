@@ -798,4 +798,3 @@ def test_suggest_rewrite_tracks_missing_mutual_handoffs(corpus_builder) -> None:
     assert rw_2.rival == "bigquery-slot-cost-optimizer"
     assert rw_2.rival_disclaims_target is True
     assert rw_2.missing_mutual_handoffs == ()
-

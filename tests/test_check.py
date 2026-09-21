@@ -724,4 +724,3 @@ def test_find_competing_neighbors_includes_dense_semantic_rivals(tmp_path: Path)
         dense_similarities=dense_sims,
     )
     assert neighbors == {"bigquery-slot-cost-optimizer"}
-

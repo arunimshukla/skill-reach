@@ -878,4 +878,3 @@ def test_missing_mutual_handoff_fires_when_neither_skill_has_existing_boundaries
     mutual_issues = [i for i in report.issues if i.rule == "missing-mutual-handoff"]
     skills_flagged = {i.skill for i in mutual_issues}
     assert skills_flagged == {"gke-storage-troubleshooting", "google-cloud-storage-fuse"}
-
