@@ -333,8 +333,8 @@ Controls probe replication and network resilience.
 
 Controls static frontmatter and budget thresholds.
 
-| Key                      | Type    | Default  | Description                                                                              |
-| :----------------------- | :------ | :------- | :--------------------------------------------------------------------------------------- |
+| Key                                   | Type    | Default  | Description                                                                              |
+| :------------------------------------ | :------ | :------- | :--------------------------------------------------------------------------------------- |
 | `max_description_length`              | Integer | `1024`   | Maximum allowable character length for description before triggering `listing-overflow`. |
 | `min_description_length`              | Integer | `20`     | Minimum character length before triggering `description-too-short`.                      |
 | `max_name_length`                     | Integer | `64`     | Maximum character length for skill name.                                                 |

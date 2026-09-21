@@ -597,7 +597,11 @@ def filter_candidates(
     from reach.lint import find_unknown_skill_references
 
     lint_config = config or LintSettings()
-    known_lower = {s.lower() for s in known_skills} | {skill_name.lower()} if known_skills else None
+    known_lower = (
+        {s.lower() for s in known_skills} | {skill_name.lower()}
+        if known_skills is not None
+        else None
+    )
     results: list[OptimizationCandidate] = []
 
     for candidate in candidates:

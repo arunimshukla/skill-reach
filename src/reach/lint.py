@@ -20,7 +20,7 @@ import hashlib
 import json
 import re
 from collections import Counter
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
@@ -896,9 +896,15 @@ def extract_skill_references(
     return tuple(sorted(found))
 
 
+_HANDOFF_SENTENCE_RE: Final = re.compile(
+    r"\b(?:use|see|prefer|refer|defer|delegate|instead|don't|do\s+not|not\s+for|avoid)\b",
+    re.IGNORECASE,
+)
+
+
 def find_unknown_skill_references(
     description: str,
-    known_skills: Iterable[str],
+    known_skills: Sequence[str] | set[str] | frozenset[str],
     *,
     self_name: str | None = None,
     settings: LintSettings | None = None,
@@ -975,17 +981,10 @@ def hands_off_to_skill(
     if not wanted:
         return False
 
-    handoff_sentence_re = re.compile(
-        r"\b(?:use|see|prefer|refer|defer|delegate|instead|don't|do\s+not|not\s+for|avoid)\b",
-        re.IGNORECASE,
-    )
     for sentence in re.split(r"[.!?]+", source_description):
-        if handoff_sentence_re.search(sentence) and contains_run(tokenize(sentence), wanted):
+        if _HANDOFF_SENTENCE_RE.search(sentence) and contains_run(tokenize(sentence), wanted):
             return True
     return False
-
-
-_hands_off_to_skill = hands_off_to_skill
 
 
 def _claims_neighbor_name_phrase(source: Skill, neighbor: Skill) -> bool:
@@ -1091,7 +1090,7 @@ def _shared_trigger_terms(
     ignored = FUNCTION_WORDS | _GENERIC_NAME_TOKENS | {"and"}
     t1 = set(tokenize(s1.description)) - ignored
     t2 = set(tokenize(s2.description)) - ignored
-    shared = [t for t in (t1 & t2) if len(t) >= _MIN_SHARED_TRIGGER_LENGTH]
+    shared = [t for t in t1.intersection(t2) if len(t) >= _MIN_SHARED_TRIGGER_LENGTH]
     if scorer is not None:
         shared.sort(key=lambda term: (-scorer.idf(term), term))
     else:
@@ -1104,6 +1103,7 @@ def _check_missing_mutual_handoffs(
     paths_by_name: Mapping[str, Sequence[Path]],
     cfg: LintSettings,
     dense_similarities: Mapping[tuple[str, str], float] | None = None,
+    skill_filter: str | None = None,
 ) -> list[LintIssue]:
     """Identify overlapping neighbor pairs with one-way or missing reciprocal routing handoffs."""
     if (
@@ -1129,6 +1129,8 @@ def _check_missing_mutual_handoffs(
 
     for i, s1 in enumerate(skills):
         for s2 in skills[i + 1 :]:
+            if skill_filter is not None and skill_filter not in {s1.name, s2.name}:
+                continue
             s1_to_s2 = hands_off_to_skill(s1.description, s2.name, refs_by_name[s1.name])
             s2_to_s1 = hands_off_to_skill(s2.description, s1.name, refs_by_name[s2.name])
             if s1_to_s2 and s2_to_s1:
@@ -1300,7 +1302,8 @@ def _lint_paths(
         skills_checked += 1
         all_issues.extend(file_report.issues)
 
-    need_dense = (
+    has_filtered_target = skill_filter is None or any(s.name == skill_filter for s in valid_skills)
+    need_dense = has_filtered_target and (
         _resolve_severity("duplicate-capability", cfg) is not None
         or _resolve_severity("missing-mutual-handoff", cfg) is not None
     )
@@ -1326,6 +1329,7 @@ def _lint_paths(
             paths_by_name,
             cfg,
             dense_similarities=dense_sims,
+            skill_filter=skill_filter,
         )
     )
 
