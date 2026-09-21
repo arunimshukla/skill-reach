@@ -143,3 +143,18 @@ reach query external.csv -o .reach/queries.json --text-column prompt --expected-
 reach eval --queries queries.jsonl
 reach eval --queries queries.csv
 ```
+
+---
+
+## Query Schema (`Query`)
+
+Each entry in a `.reach/queries.json` (or `.jsonl` / `.csv` dataset) conforms to the [`Query`](../api/models.md) model:
+
+| Field               | Type                | Default | Description                                                                                                                                               |
+| :------------------ | :------------------ | :------ | :-------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `id`                | `str`               | —       | Unique identifier for the evaluation query.                                                                                                               |
+| `text`              | `str`               | —       | Realistic user prompt text presented to the agent runtime.                                                                                                |
+| `kind`              | `QueryKind \| None` | `None`  | Structural category (`implicit`, `contextual`, `neighbor_negative`, or `out_of_scope`).                                                                   |
+| `expected_skill`    | `str \| None`       | `None`  | Ground-truth target skill expected to be invoked, or `None` for out-of-scope queries.                                                                     |
+| `acceptable_skills` | `tuple[str, ...]`   | `()`    | Optional neutral helper or router skills (e.g. `finding-google-skills`) that consume turns at runtime but are neither rewarded as TP nor penalized as FP. |
+| `notes`             | `str`               | `""`    | Author notes, rationale, or difficulty context.                                                                                                           |
