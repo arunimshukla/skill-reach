@@ -126,19 +126,15 @@ class KeywordRuntime(AgentRuntime[KeywordOptions]):
             if self._pattern is None and self._resident:
                 self._set_resident(self._resident)
 
-            invoked = self.match_skill(query_text)
-            invoked_skills = (invoked,) if invoked is not None else ()
-            early_exit_hit = bool(
-                self.options.early_exit and invoked is not None and invoked == target_skill,
-            )
-            return SelectionOutcome(
-                invoked_skills=invoked_skills,
-                early_exit=early_exit_hit,
-                turns_taken=1,
-                observed_catalog=self._resident,
-                observed_tools=("keyword",),
-                cost_usd=0.0,
-                duration_ms=1,
+            matched = self.match_skill(query_text)
+            return self.make_tracker(target_skill).apply_to_outcome(
+                SelectionOutcome(
+                    invoked_skills=(matched,) if matched is not None else (),
+                    observed_catalog=self._resident,
+                    observed_tools=("keyword",),
+                    cost_usd=0.0,
+                    duration_ms=1,
+                ),
             )
         finally:
             self.post_probe(workdir)

@@ -68,7 +68,7 @@ def classify_invocation_pattern(
     invoked_skills: Sequence[str],
 ) -> InvocationPattern:
     """Classify trajectory invocation behavior relative to query ground truth."""
-    invoked = tuple(invoked_skills)
+    invoked = query.scored_invocations(invoked_skills)
     if query.is_out_of_scope:
         return (
             InvocationPattern.CORRECT_ABSTENTION
@@ -108,7 +108,7 @@ def score_trajectory(
     invoked_skills: Sequence[str],
 ) -> TrajectoryScore:
     """Evaluate an observed skill trajectory against query target skill and acceptable skills."""
-    invoked_seq = tuple(invoked_skills)
+    invoked_seq = query.scored_invocations(invoked_skills)
 
     if query.is_out_of_scope:
         abstained = len(invoked_seq) == 0
@@ -345,7 +345,7 @@ def labeled_pairs(
     pairs = _paired(results, queries)
     return (
         [query.truth_label for query, _ in pairs],
-        [query.effective_predicted_label(result.predicted_label) for query, result in pairs],
+        [query.effective_predicted_label(result) for query, result in pairs],
     )
 
 
@@ -365,20 +365,15 @@ def _class_metrics(
     y_true: Sequence[str],
     y_pred: Sequence[str],
     trajectory_tp: int | None = None,
-    trajectory_hits: Sequence[bool] | None = None,
 ) -> ClassMetrics:
     """Compute precision, recall, and support metrics for a single label."""
-    traj_flags = trajectory_hits if trajectory_hits is not None else (False,) * len(y_true)
     tp = sum(t == label and p == label for t, p in zip(y_true, y_pred, strict=True))
-    fp = sum(
-        t != label and p == label and not th
-        for t, p, th in zip(y_true, y_pred, traj_flags, strict=True)
-    )
+    fp = sum(t != label and p == label for t, p in zip(y_true, y_pred, strict=True))
     fn = sum(t == label and p != label for t, p in zip(y_true, y_pred, strict=True))
     return ClassMetrics(
         label=label,
         support=sum(t == label for t in y_true),
-        predicted=tp + fp,
+        predicted=sum(p == label for p in y_pred),
         true_positives=tp,
         trajectory_true_positives=trajectory_tp if trajectory_tp is not None else tp,
         false_positives=fp,
@@ -391,7 +386,6 @@ def _build_per_class(
     y_pred: Sequence[str],
     universe: Sequence[str],
     trajectory_hits_by_label: Mapping[str, int] | None = None,
-    trajectory_hits: Sequence[bool] | None = None,
 ) -> tuple[ClassMetrics, ...]:
     """Compute per-class metrics across all labels in the universe."""
     return tuple(
@@ -402,7 +396,6 @@ def _build_per_class(
             trajectory_tp=trajectory_hits_by_label.get(label, 0)
             if trajectory_hits_by_label is not None
             else None,
-            trajectory_hits=trajectory_hits,
         )
         for label in universe
     )
@@ -416,10 +409,11 @@ def _mean(values: Sequence[float]) -> float:
 def _macro_averages(
     per_class: Sequence[ClassMetrics],
 ) -> tuple[float, float, float]:
-    """Calculate macro precision, recall, and f1 over classes with support."""
+    """Calculate macro precision over active classes and recall/f1 over classes with support."""
+    active = [c for c in per_class if c.support or c.predicted]
     present = [c for c in per_class if c.support]
     return (
-        _mean([c.precision for c in per_class]),
+        _mean([c.precision for c in active]),
         _mean([c.recall for c in present]),
         _mean([c.f1 for c in present]),
     )
@@ -445,10 +439,9 @@ def classification_report(
     """Generate a comprehensive classification report across all probe results."""
     pairs = _paired(results, queries)
     y_true = [q.truth_label for q, _ in pairs]
-    y_pred = [q.effective_predicted_label(r.predicted_label) for q, r in pairs]
+    y_pred = [q.effective_predicted_label(r) for q, r in pairs]
     universe = _label_universe(y_true, y_pred, labels)
     traj_scores = [score_trajectory(q, r.invoked_skills) for q, r in pairs]
-    traj_hit_flags = [s.trajectory_hit for s in traj_scores]
     traj_hits_by_label = Counter(
         t for t, s in zip(y_true, traj_scores, strict=True) if s.trajectory_hit
     )
@@ -457,7 +450,6 @@ def classification_report(
         y_pred,
         universe,
         trajectory_hits_by_label=traj_hits_by_label,
-        trajectory_hits=traj_hit_flags,
     )
     precision, recall, f1 = _macro_averages(per_class)
     in_count, false_abs, out_count, out_detected = _scope_metrics(y_true, y_pred)
@@ -534,20 +526,6 @@ def consistency(results: Sequence[ProbeResult], queries: Sequence[Query]) -> flo
     return unanimous / observed if observed else 0.0
 
 
-def is_non_entrypoint_trajectory_hit(
-    query: Query,
-    invoked_skill: str | None,
-    invoked_skills: Sequence[str],
-) -> bool:
-    """Return True when a multi-turn trajectory hit target after a different Turn-1 entrypoint."""
-    return (
-        query.expected_skill is not None
-        and invoked_skill != query.expected_skill
-        and (invoked_skill is None or invoked_skill not in query.acceptable_skills)
-        and score_trajectory(query, invoked_skills).trajectory_hit
-    )
-
-
 def confusion(
     results: Sequence[ProbeResult],
     queries: Sequence[Query],
@@ -561,15 +539,7 @@ def confusion(
         query = truth.get(result.query_id)
         if query is None:
             continue
-        if is_non_entrypoint_trajectory_hit(query, result.invoked_skill, result.invoked_skills):
-            continue
-        effective_invoked = (
-            query.expected_skill
-            if (
-                result.invoked_skill is not None and result.invoked_skill in query.acceptable_skills
-            )
-            else result.invoked_skill
-        )
+        effective_invoked = query.effective_invoked_skill(result)
         pairs[(query.truth_label, effective_invoked)] += 1
     return pairs
 
@@ -585,14 +555,12 @@ def collisions(
         if result.error or not result.selected:
             continue
         query = truth.get(result.query_id)
-        if (
-            query is None
-            or result.invoked_skill is None
-            or query.matches_skill(result.invoked_skill)
-            or score_trajectory(query, result.invoked_skills).trajectory_hit
-        ):
+        if query is None:
             continue
-        pairs[(query.truth_label, result.invoked_skill)] += 1
+        effective_invoked = query.effective_invoked_skill(result)
+        if effective_invoked is None or query.matches_skill(effective_invoked):
+            continue
+        pairs[(query.truth_label, effective_invoked)] += 1
     return pairs
 
 
@@ -680,7 +648,7 @@ def _probe_outcome_is_pass(result: ProbeResult, query: Query | None = None) -> b
     if result.error:
         return False
     if query is not None:
-        return result.predicted_label == query.truth_label
+        return query.effective_predicted_label(result) == query.truth_label
     if result.invocation_pattern is not None:
         return result.invocation_pattern in (
             InvocationPattern.ORACLE_ONLY,

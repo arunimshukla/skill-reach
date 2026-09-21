@@ -681,35 +681,93 @@ def test_compute_precursor_graph_edge_cases() -> None:
     assert edge.avg_step_latency == 0.0
 
 
-def test_acceptable_skills_credited_in_classification_trajectory_and_collisions() -> None:
-    """Verify acceptable_skills are credited as hits and not false-positive collisions."""
+@pytest.mark.parametrize(
+    (
+        "invoked_skills",
+        "expected_hit",
+        "expected_f1",
+        "expected_top1_hits",
+        "expected_false_abs",
+        "expected_fn",
+        "expected_recall",
+        "expected_macro_prec",
+        "expected_confusion_invoked",
+    ),
+    [
+        pytest.param(
+            ("gke-basics",),
+            False,
+            0.0,
+            0,
+            1,
+            1,
+            0.0,
+            0.0,
+            None,
+            id="solo_neutral",
+        ),
+        pytest.param(
+            ("gke-basics", "cloud-run-basics"),
+            True,
+            1.0,
+            1,
+            0,
+            0,
+            1.0,
+            1.0,
+            "cloud-run-basics",
+            id="assisted_hit",
+        ),
+    ],
+)
+def test_acceptable_skills_are_neutral_in_classification_trajectory_and_collisions(
+    invoked_skills: tuple[str, ...],
+    expected_hit: bool,
+    expected_f1: float,
+    expected_top1_hits: int,
+    expected_false_abs: int,
+    expected_fn: int,
+    expected_recall: float,
+    expected_macro_prec: float,
+    expected_confusion_invoked: str | None,
+) -> None:
+    """Verify acceptable_skills act as neutral steps (neither TP alone nor FP when followed)."""
     query = Query(
         id="q-accept",
         text="deploy container to cloud",
         expected_skill="cloud-run-basics",
         acceptable_skills=("gke-basics",),
     )
-    result = ProbeResult(
+    probe = ProbeResult(
         query_id="q-accept",
         catalog_id="c",
         catalog_mode=CatalogMode.ALL,
         catalog_size=2,
         model="m",
         runtime="fake",
-        invoked_skills=("gke-basics",),
+        invoked_skills=invoked_skills,
     )
 
-    traj = score_trajectory(query, result.invoked_skills)
-    assert traj.entrypoint_hit is True
-    assert traj.trajectory_hit is True
-    assert traj.skill_f1 == 1.0
+    traj = score_trajectory(query, probe.invoked_skills)
+    assert traj.entrypoint_hit is expected_hit
+    assert traj.trajectory_hit is expected_hit
+    assert traj.skill_f1 == expected_f1
+    assert traj.redundancy == 0
 
-    report = classification_report([result], [query])
-    assert report.top1_hits == 1
-    assert report.entrypoint_hits == 1
-    assert report.by_label("cloud-run-basics").recall == 1.0
-    assert collisions([result], [query]) == {}
-    assert confusion([result], [query])[("cloud-run-basics", "cloud-run-basics")] == 1
+    report = classification_report(
+        [probe],
+        [query],
+        labels=["cloud-run-basics", "gke-basics"],
+    )
+    assert report.top1_hits == expected_top1_hits
+    assert report.entrypoint_hits == expected_top1_hits
+    assert report.false_abstentions == expected_false_abs
+    assert report.by_label("cloud-run-basics").false_negatives == expected_fn
+    assert report.by_label("cloud-run-basics").recall == expected_recall
+    assert report.by_label("gke-basics").false_positives == 0
+    assert report.macro_precision == expected_macro_prec
+    assert collisions([probe], [query]) == {}
+    assert confusion([probe], [query])[("cloud-run-basics", expected_confusion_invoked)] == 1
 
 
 def test_trajectory_scores_aggregates_multi_attempt_replicates() -> None:
@@ -743,8 +801,8 @@ def test_trajectory_scores_aggregates_multi_attempt_replicates() -> None:
     assert scores["q-rep"].entrypoint_hit is True
 
 
-def test_multi_turn_trajectory_hit_excludes_stepping_stone_from_false_positives() -> None:
-    """Verify prerequisite turn-1 skill in a valid trajectory is not penalized as FP/collision."""
+def test_multi_turn_trajectory_hit_preserves_turn1_conservation() -> None:
+    """Verify turn-1 metrics preserve FP/FN conservation while trajectory_recall credits turn 2."""
     query = Query(id="q-deploy", text="deploy my service", expected_skill="deploy-service")
     result = ProbeResult(
         query_id="q-deploy",
@@ -761,13 +819,16 @@ def test_multi_turn_trajectory_hit_excludes_stepping_stone_from_false_positives(
 
     # Entrypoint recall is 0.0 (turn 1 was gcloud-auth), while trajectory recall is 1.0
     assert deploy_cls.true_positives == 0
+    assert deploy_cls.false_negatives == 1
     assert deploy_cls.recall == 0.0
     assert deploy_cls.trajectory_true_positives == 1
     assert deploy_cls.trajectory_recall == 1.0
 
-    # Stepping-stone skill gcloud-auth is not penalized as a false positive / collision
-    assert auth_cls.false_positives == 0
-    assert collisions([result], [query]) == {}
+    # Turn-1 prediction conservation: 1 FN on deploy-service pairs with 1 FP on gcloud-auth
+    assert auth_cls.false_positives == 1
+    assert auth_cls.predicted == 1
+    assert sum(c.predicted for c in report.per_class) == report.scored
+    assert collisions([result], [query]) == {("deploy-service", "gcloud-auth"): 1}
     conf = confusion([result], [query])
-    assert conf[("deploy-service", "gcloud-auth")] == 0
-    assert conf[("deploy-service", "deploy-service")] == 0
+    assert conf[("deploy-service", "gcloud-auth")] == 1
+    assert sum(conf.values()) == report.scored

@@ -2,7 +2,6 @@
 
 [![CI](https://github.com/google/skill-reach/actions/workflows/ci.yml/badge.svg)](https://github.com/google/skill-reach/actions/workflows/ci.yml)
 [![Documentation](https://img.shields.io/badge/docs-gh--pages-blue)](https://google.github.io/skill-reach/)
-[![PyPI](https://img.shields.io/pypi/v/skill-reach.svg)](https://pypi.org/project/skill-reach/)
 [![Python 3.12 | 3.13 | 3.14](https://img.shields.io/badge/python-3.12%20%7C%203.13%20%7C%203.14-blue.svg)](https://www.python.org/)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 
@@ -179,19 +178,20 @@ flowchart LR
 
 | Metric                      |       Symbol        | Description                                                                                                                |
 | :-------------------------- | :-----------------: | :------------------------------------------------------------------------------------------------------------------------- |
-| **Entrypoint Accuracy**     | $A_{\text{entry}}$  | Proportion of queries where the initial skill invocation satisfies the primary requirement $\mathcal{R}_1$.                |
-| **Trajectory Reachability** |  $R_{\text{traj}}$  | Proportion of queries where all required capabilities are reached across the trajectory.                                   |
-| **Step Efficiency**         |    $\text{MRR}$     | Mean reciprocal rank ($\frac{1}{\text{step}}$) of step positions where required skills were invoked.                       |
-| **Skill Selection F1**      |        $F_1$        | Harmonic mean of precision (relevant skills called / total called) and recall (requirements met / total).                  |
-| **Skill Redundancy**        | $\text{Redundancy}$ | Excess skill invocations beyond the required target: $\max(0, \text{len}(\vec{s}) - 1)$. Zero indicates optimal execution. |
+| **Entrypoint Accuracy**     | $A_{\text{entry}}$  | Proportion of queries where the first skill invocation matches `expected_skill`.                                           |
+| **Trajectory Reachability** |  $R_{\text{traj}}$  | Proportion of queries where `expected_skill` is reached at any turn within `max_turns` (`ClassMetrics.trajectory_recall`). |
+| **Step Efficiency**         |    $\text{MRR}$     | Mean reciprocal rank ($\frac{1}{\text{step}}$) of the first step where `expected_skill` was invoked.                       |
+| **Skill Selection F1**      |        $F_1$        | Harmonic mean of precision (relevant skills called / total skills called) and recall (target reached).                     |
+| **Skill Redundancy**        | $\text{Redundancy}$ | Excess skill invocations beyond the required target: $\max(0, \text{len}(\vec{s}) - 1)$. Zero indicates optimal routing.   |
 
-### Turn Budgeting & Early Exit
+### Turn Budgeting, Early Exit & Neutral Helper Skills
 
-By default, `skill-reach` configures `max_turns = 3` and enables `early_exit = true`. During live probing:
+By default, `skill-reach` configures `max_turns = 3` and enables `early_exit = true` via `TrajectoryTracker` across all runtimes:
 
-- **Immediate Termination on Target**: When an agent invokes the expected target skill, execution terminates immediately, avoiding redundant post-target turns and saving API spend.
-- **Precursor Continuity**: Non-target precursor skills do not abort execution early, allowing multi-step workflows to proceed naturally.
-- **Turn Budget Enforcement**: If the target skill is not reached within `max_turns`, the probe halts cleanly.
+- **Immediate Termination on Target**: When an agent invokes `expected_skill`, execution terminates immediately and locks the trajectory tracker, avoiding redundant post-target turns and saving API spend.
+- **Neutral Router / Helper Skills (`acceptable_skills`)**: Optional helper/discovery skills declared in `acceptable_skills` consume 1 turn like any other step, do **not** trigger early exit (allowing the agent to reach `expected_skill` on a subsequent turn), and are stripped before scoring (`Query.scored_invocations`) so they are neither rewarded as a True Positive alone nor penalized as a False Positive / redundancy when followed by `expected_skill`.
+- **Turn-1 Prediction Conservation**: Per-class `false_positives`, `predicted`, `confusion()`, and `collisions()` strictly reflect Turn-1 scored selections so greedy distractors that hijack Turn 1 still surface in `top_attractors()` even when the agent recovers on Turn 2.
+- **Turn Budget Enforcement**: If `expected_skill` is not reached within `max_turns`, the probe halts cleanly.
 - **Configurable**: Override defaults via CLI (`reach eval --max-turns 5 --no-early-exit`) or project configuration (`reach.toml`).
 
 ## Commands

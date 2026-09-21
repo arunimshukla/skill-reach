@@ -44,7 +44,6 @@ from reach.metrics import (
     compute_f1,
     confusion,
     consistency_counts,
-    is_non_entrypoint_trajectory_hit,
 )
 from reach.models import (
     NO_SKILL,
@@ -725,13 +724,7 @@ def _confusion_pairs(
         query = truth.get(row.query_id)
         if row.error or query is None:
             continue
-        if is_non_entrypoint_trajectory_hit(query, row.invoked_skill, row.invoked_skills):
-            continue
-        effective_invoked = (
-            query.expected_skill
-            if row.invoked_skill is not None and row.invoked_skill in query.acceptable_skills
-            else row.invoked_skill
-        )
+        effective_invoked = query.effective_invoked_skill(row)
         pair_key = (query.truth_label, effective_invoked)
         quoted.setdefault(pair_key, Counter())[row.query_id] += 1
         if row.reasoning and (pair_key, row.query_id) not in reasonings:
@@ -819,7 +812,9 @@ def _query_records(
                 kind=query.kind,
                 expected=query.truth_label,
                 probes=len(usable),
-                hits=sum(1 for row in usable if query.matches_skill(row.invoked_skill)),
+                hits=sum(
+                    1 for row in usable if query.matches_skill(query.effective_invoked_skill(row))
+                ),
                 selections=tuple(sorted({row.predicted_label for row in usable})),
                 difficulty_rank=(rank.position if (rank := ranks.get(query.id)) else None),
                 leak=flags.get(query.id),
@@ -906,7 +901,7 @@ def _build_run_scores(
             macro_f1=standard.macro_f1,
             macro_precision=standard.macro_precision,
             macro_recall=standard.macro_recall,
-            labels=tuple(entry.label for entry in standard.per_class),
+            labels=tuple(entry.label for entry in standard.per_class if entry.support),
         ),
     )
 

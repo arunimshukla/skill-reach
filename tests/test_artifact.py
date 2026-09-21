@@ -779,6 +779,7 @@ def test_declining_is_reported_apart_from_misrouting(
 
 
 def test_the_secondary_figures_name_the_labels_they_averaged_over(
+    artifact: Artifact,
     whole_catalog_queries: QuerySet,
     whole_catalog: Catalog,
     corpus: list[Skill],
@@ -786,17 +787,19 @@ def test_the_secondary_figures_name_the_labels_they_averaged_over(
     make_result,
 ) -> None:
     """Verify secondary metrics state the exact subset of labels evaluated."""
-    artifact = assemble(
+    assert artifact.scores.not_headline.labels == (LIFECYCLE, RETENTION)
+
+    single = assemble(
         [make_result("q-lifecycle", LIFECYCLE)],
         whole_catalog_queries,
         whole_catalog,
         corpus,
         config,
     )
-    assert artifact.scores.not_headline.labels == (LIFECYCLE,)
-    assert [s.skill for s in artifact.skills] == [LIFECYCLE, RETENTION, BASICS]
-    assert artifact.scores.not_headline.macro_f1 == 1.0
-    assert sum(s.recall or 0.0 for s in artifact.skills) / len(artifact.skills) < 1.0
+    assert single.scores.not_headline.labels == (LIFECYCLE,)
+    assert [s.skill for s in single.skills] == [LIFECYCLE, RETENTION, BASICS]
+    assert single.scores.not_headline.macro_f1 == 1.0
+    assert sum(s.recall or 0.0 for s in single.skills) / len(single.skills) < 1.0
 
 
 def test_a_result_for_an_unlabeled_query_is_fatal(
@@ -1329,12 +1332,12 @@ def test_skill_score_and_unreached_respect_multi_turn_trajectory(
     assert (score in built.unreached) is expected_in_unreached
 
 
-def test_confusion_pairs_excludes_non_entrypoint_trajectory_hit(
+def test_confusion_pairs_retains_turn1_collision_on_multi_turn_trajectory_hit(
     whole_catalog: Catalog,
     corpus: list[Skill],
     make_config: Any,
 ) -> None:
-    """Verify assemble confusion pairs exclude non-entrypoint multi-turn trajectory hits."""
+    """Verify assemble confusion pairs record turn-1 misroute even when turn-2 recovers."""
     cfg = make_config(catalog={"mode": CatalogMode.ALL}, plan={"attempts": 1})
     qs = QuerySet(
         catalog_id=whole_catalog.id,
@@ -1356,4 +1359,8 @@ def test_confusion_pairs_excludes_non_entrypoint_trajectory_hit(
         )
     ]
     built = assemble(res, qs, whole_catalog, corpus, cfg)
-    assert built.confusion == ()
+    assert len(built.confusion) == 1
+    assert built.confusion[0].expected == LIFECYCLE
+    assert built.confusion[0].invoked == BASICS
+    assert built.confusion[0].collisions == 1
+    assert built.scores.trajectory_reachability == 1.0

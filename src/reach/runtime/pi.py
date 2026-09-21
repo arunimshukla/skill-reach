@@ -312,29 +312,11 @@ class PiRuntime(CliAgentRuntime[PiOptions]):
                 lines = session_file.read_text(encoding="utf-8").splitlines()
                 entries = list(iter_json_lines(lines))
                 summary = parse_session_entries(entries, self._resident)
-                early_exit_hit = False
-                if self.options.early_exit and summary.invoked_skills:
-                    truncated: list[str] = []
-                    for s in summary.invoked_skills:
-                        truncated.append(s)
-                        if target_skill is not None and s == target_skill:
-                            early_exit_hit = True
-                            break
-                        if len(truncated) >= self.options.max_turns:
-                            early_exit_hit = True
-                            break
-                    if early_exit_hit:
-                        summary = summary.model_copy(
-                            update={
-                                "invoked_skills": tuple(truncated),
-                                "invoked_skill": truncated[0] if truncated else None,
-                                "early_exit": True,
-                            },
-                        )
-                outcome = summary.to_outcome(
-                    self._resident,
-                    fallback_model=self.model,
-                    early_exit=early_exit_hit,
+                outcome = self.make_tracker(target_skill).apply_to_outcome(
+                    summary.to_outcome(
+                        self._resident,
+                        fallback_model=self.model,
+                    ),
                 )
                 if validation_error := self.validate_outcome(summary, workdir):
                     return outcome.model_copy(update={"error": validation_error})

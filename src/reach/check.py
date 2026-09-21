@@ -382,7 +382,7 @@ def _execute_empirical_probes(
     misroutes = sum(
         1
         for q, r in zip(queries_to_run, results, strict=True)
-        if r.invoked_skill is not None and not q.matches_skill(r.invoked_skill)
+        if (eff := q.effective_invoked_skill(r)) is not None and not q.matches_skill(eff)
     )
     obs_misroute = misroutes / report.scored if report.scored else 0.0
 

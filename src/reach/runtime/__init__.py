@@ -328,6 +328,8 @@ class TrajectoryTracker:
 
     def observe(self, skill: str | Sequence[str] | None) -> bool:
         """Record skill invocation(s) and return True if early-exit stop condition is met."""
+        if self.early_exit and self.early_exit_hit:
+            return True
         if not skill:
             return False
         items = (skill,) if isinstance(skill, str) else tuple(skill)
@@ -349,6 +351,32 @@ class TrajectoryTracker:
     def turns_taken(self) -> int:
         """Return count of turns taken based on distinct recorded invocations."""
         return len(self.invoked_skills) if self.invoked_skills else 1
+
+    def apply_to_outcome(self, outcome: SelectionOutcome) -> SelectionOutcome:
+        """Normalize a SelectionOutcome through tracker early-exit and turn invariants."""
+        if self.early_exit and self.early_exit_hit:
+            skills = tuple(self.invoked_skills)
+            early = True
+        else:
+            replay = TrajectoryTracker(
+                target_skill=self.target_skill,
+                max_turns=self.max_turns,
+                early_exit=self.early_exit,
+            )
+            replay.observe(outcome.invoked_skills)
+            skills = tuple(replay.invoked_skills[: self.max_turns])
+            early = bool(self.early_exit and (replay.early_exit_hit or outcome.early_exit))
+        was_truncated = len(outcome.invoked_skills) > len(skills)
+        turns = min(outcome.turns_taken, len(skills) or 1) if was_truncated else outcome.turns_taken
+        new_invoked_skill = skills[0] if skills else None
+        return outcome.model_copy(
+            update={
+                "invoked_skill": new_invoked_skill,
+                "invoked_skills": skills,
+                "early_exit": early,
+                "turns_taken": turns,
+            },
+        )
 
 
 class SkillRoot(BaseModel):
@@ -712,6 +740,14 @@ class AgentRuntime[OptionsT: AgentOptions](ABC):
         del workdir
         return sanitize_subprocess_env(dict(os.environ), blocked_env_vars=self.blocked_env_vars)
 
+    def make_tracker(self, target_skill: str | None = None) -> TrajectoryTracker:
+        """Create a TrajectoryTracker configured with this runtime's turn and early-exit options."""
+        return TrajectoryTracker(
+            target_skill=target_skill,
+            max_turns=self.options.max_turns,
+            early_exit=self.options.early_exit,
+        )
+
     @abstractmethod
     def select(
         self,
@@ -857,11 +893,7 @@ class CliAgentRuntime[CliOptionsT: CliOptions](AgentRuntime[CliOptionsT], ABC):
         target_skill: str | None = None,
     ) -> SelectionOutcome:
         """Execute a query probe via the unified CLI subprocess template pipeline."""
-        tracker = TrajectoryTracker(
-            target_skill=target_skill,
-            max_turns=self.options.max_turns,
-            early_exit=self.options.early_exit,
-        )
+        tracker = self.make_tracker(target_skill)
 
         def _on_line(line: str) -> bool:
             skills = self.extract_skills_from_line(line)
@@ -898,18 +930,13 @@ class CliAgentRuntime[CliOptionsT: CliOptions](AgentRuntime[CliOptionsT], ABC):
                 )
 
             catalog = getattr(summary, "observed_catalog", ()) or self._resident
-            outcome = summary.to_outcome(
-                observed_catalog=catalog,
-                fallback_model=self.model,
-                early_exit=tracker.early_exit_hit,
+            outcome = tracker.apply_to_outcome(
+                summary.to_outcome(
+                    observed_catalog=catalog,
+                    fallback_model=self.model,
+                    early_exit=tracker.early_exit_hit,
+                ),
             )
-            if tracker.early_exit_hit and tracker.invoked_skills:
-                outcome = outcome.model_copy(
-                    update={
-                        "invoked_skills": tuple(tracker.invoked_skills),
-                        "early_exit": True,
-                    },
-                )
 
             # Security tool leak and outcome validation
             if validation_error := self.validate_outcome(summary, workdir):

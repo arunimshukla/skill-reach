@@ -860,7 +860,7 @@ def _run_candidate_probes(
 
         try:
             probe_res = next(harness.run_probes([query], active_catalog, workdir, attempts=1))
-            invoked = probe_res.invoked_skill
+            invoked = query.effective_invoked_skill(probe_res)
         except (OSError, RuntimeError, ValueError, StopIteration):
             invoked = None
 

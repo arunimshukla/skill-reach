@@ -59,7 +59,6 @@ from reach.runtime import (
     AgentOptions,
     AntigravityRuntime,
     SelectionOutcome,
-    TrajectoryTracker,
     agent_default_model,
 )
 from reach.runtime._env import (
@@ -82,15 +81,15 @@ SELECTION_TOOLS: tuple[Any, ...] = (
 
 
 def _build_multi_turn_selection_tools() -> tuple[Any, ...]:
-    """Assemble finish tool plus available read-only workspace inspection tools."""
+    """Assemble available read-only workspace inspection tools."""
     if ag_types is None or not hasattr(ag_types, "BuiltinTools"):
-        return ("finish", "view_file", "list_dir", "grep_search", "find_by_name")
-    tools: list[Any] = [ag_types.BuiltinTools.FINISH]
+        return ("view_file", "list_dir", "grep_search", "find_by_name")
+    tools: list[Any] = []
     for attr in ("VIEW_FILE", "LIST_DIR", "GREP_SEARCH", "FIND_BY_NAME"):
         member = getattr(ag_types.BuiltinTools, attr, None)
         if member is not None:
             tools.append(member)
-    if len(tools) == 1:
+    if not tools:
         tools.append("view_file")
     return tuple(tools)
 
@@ -246,24 +245,14 @@ def _extract_history_error(agent: object) -> str | None:
 
 def _resolve_empty_selection_error(
     history_error: str | None,
-    stop_reason: object,
     observed_tools: tuple[str, ...],
+    *,
+    has_text: bool = False,
 ) -> str | None:
     """Resolve error string when an agent turn produces no skill selection or structured output."""
     if history_error:
         return history_error
-    stop_reason_cls = getattr(ag_types, "StopReason", None) if ag_types is not None else None
-    max_calls = (
-        getattr(stop_reason_cls, "MAX_MODEL_CALLS_EXCEEDED", "MAX_MODEL_CALLS_EXCEEDED")
-        if stop_reason_cls is not None
-        else "MAX_MODEL_CALLS_EXCEEDED"
-    )
-    is_max_calls = (
-        stop_reason == max_calls
-        or getattr(stop_reason, "name", None) == "MAX_MODEL_CALLS_EXCEEDED"
-        or str(stop_reason) == "MAX_MODEL_CALLS_EXCEEDED"
-    )
-    if is_max_calls and observed_tools:
+    if has_text or observed_tools:
         return None
     return "empty selection (likely rate-limited)"
 
@@ -401,6 +390,26 @@ class _AntigravitySdkConfigMixin:
             kwargs["retry_config"] = retry_cfg
         return kwargs
 
+    def _resolve_schema_dict(
+        self,
+        schema: str | Mapping[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        """Parse optional JSON schema argument or options fallback into a dictionary."""
+        if isinstance(schema, Mapping):
+            return dict(schema)
+        raw_schema = schema if isinstance(schema, str) else self.options.json_schema
+        if not raw_schema:
+            return None
+        try:
+            parsed = json.loads(raw_schema)
+        except json.JSONDecodeError as exc:
+            msg = f"Invalid JSON schema: {exc}"
+            raise ValueError(msg) from exc
+        if not isinstance(parsed, dict):
+            msg = f"Expected JSON schema object, got {type(parsed).__name__}"
+            raise ValueError(msg)
+        return parsed
+
 
 class AntigravitySdkRuntime(_AntigravitySdkConfigMixin, AntigravityRuntime):
     """Execute evaluation queries using the Google Antigravity Python SDK."""
@@ -436,17 +445,17 @@ class AntigravitySdkRuntime(_AntigravitySdkConfigMixin, AntigravityRuntime):
 
     @property
     def _default_selection_tools(self) -> tuple[Any, ...]:
-        """Return default selection tool tuple based on turn budget."""
-        if self.options.max_turns > 1:
-            return MULTI_TURN_SELECTION_TOOLS
-        return SELECTION_TOOLS
+        """Return default selection tool tuple, including finish only when json_schema is set."""
+        if self.options.json_schema:
+            return (*SELECTION_TOOLS, *MULTI_TURN_SELECTION_TOOLS)
+        return MULTI_TURN_SELECTION_TOOLS
 
     def _select_config(
         self,
         workdir: Path,
         hooks: list[Any] | None = None,
     ) -> LocalAgentConfig:
-        """Assemble schema-constrained LocalAgentConfig with turn budget and hooks."""
+        """Assemble LocalAgentConfig with turn budget, inspection tools, and hooks."""
         app_data_dir = None
         if self.options.isolate_config_dir or self.options.app_data_dir:
             sdk_dir = ensure_private_directory(
@@ -472,11 +481,12 @@ class AntigravitySdkRuntime(_AntigravitySdkConfigMixin, AntigravityRuntime):
                     enable_subagents=False,
                 ),
                 "budget_config": ag_types.BudgetConfig(max_model_calls=self.options.max_turns),
-                "response_schema": self.selection_schema(self._resident),
                 "app_data_dir": app_data_dir,
                 "hooks": hooks,
             }
         )
+        if (schema_dict := self._resolve_schema_dict()) is not None:
+            kwargs["response_schema"] = schema_dict
         return LocalAgentConfig(**kwargs)
 
     async def _select_async(
@@ -486,25 +496,25 @@ class AntigravitySdkRuntime(_AntigravitySdkConfigMixin, AntigravityRuntime):
         target_skill: str | None = None,
     ) -> SelectionOutcome:
         """Execute chat evaluation asynchronously and return observed outcome."""
-        tracker = TrajectoryTracker(
-            target_skill=target_skill,
-            max_turns=self.options.max_turns,
-            early_exit=self.options.early_exit,
-        )
+        tracker = self.make_tracker(target_skill)
 
         hooks_list: list[Any] = []
+        hook_observed_tools: list[str] = []
         if ag_hooks is not None:
 
             @ag_hooks.pre_tool_call_decide
             async def _on_tool_call(call: ag_types.ToolCall) -> ag_types.HookResult:
+                if call_name := getattr(call, "name", None):
+                    hook_observed_tools.append(_tool_name(call_name))
+                if tracker.early_exit and tracker.early_exit_hit:
+                    return ag_types.HookResult(allow=False)
                 args = getattr(call, "args", None) or getattr(call, "arguments", {}) or {}
-                path = args.get("path") or args.get("AbsolutePath")
-                if path:
-                    skill = resolve_skill_from_path(path, self._resident)
-                    if skill:
-                        should_stop = tracker.observe(skill)
-                        if self.options.early_exit and should_stop:
-                            return ag_types.HookResult(allow=False)
+                if (path := args.get("path") or args.get("AbsolutePath")) and (
+                    skill := resolve_skill_from_path(path, self._resident)
+                ):
+                    should_stop = tracker.observe(skill)
+                    if self.options.early_exit and should_stop:
+                        return ag_types.HookResult(allow=False)
                 return ag_types.HookResult(allow=True)
 
             hooks_list.append(_on_tool_call)
@@ -515,9 +525,11 @@ class AntigravitySdkRuntime(_AntigravitySdkConfigMixin, AntigravityRuntime):
             async with Agent(config) as agent:
                 response = await agent.chat(query_text)
                 data = await response.structured_output()
-                observed_tools = tuple(
-                    [_tool_name(call.name) async for call in response.tool_calls],
-                )
+                text_fn = getattr(response, "text", None)
+                raw_text = await text_fn() if callable(text_fn) else None
+                text_out = str(raw_text).strip() if isinstance(raw_text, str) else ""
+                stream_tools = [_tool_name(call.name) async for call in response.tool_calls]
+                observed_tools = tuple(stream_tools or hook_observed_tools)
                 stop_reason = response.stop_reason
                 history_error = _extract_history_error(agent)
         except (AntigravityValidationError, Exception) as err:
@@ -542,29 +554,29 @@ class AntigravitySdkRuntime(_AntigravitySdkConfigMixin, AntigravityRuntime):
             error = tool_leak
 
         invoked, reasoning = _extract_selection_and_reasoning(data)
+        if not reasoning and text_out:
+            reasoning = (text_out,)
 
-        if tracker.early_exit_hit and tracker.invoked_skills:
-            invoked = tracker.invoked_skills[0]
-
-        if tracker.invoked_skills:
-            invoked_skills = tuple(tracker.invoked_skills)
-        elif invoked:
-            invoked_skills = (invoked,)
-        else:
-            invoked_skills = ()
+        invoked_skills = tuple(tracker.invoked_skills) or ((invoked,) if invoked else ())
 
         if not error and not tracker.early_exit_hit and not invoked_skills and data is None:
-            error = _resolve_empty_selection_error(history_error, stop_reason, observed_tools)
+            error = _resolve_empty_selection_error(
+                history_error,
+                observed_tools,
+                has_text=bool(text_out),
+            )
 
-        return SelectionOutcome(
-            invoked_skills=invoked_skills,
-            early_exit=tracker.early_exit_hit,
-            turns_taken=tracker.turns_taken,
-            reasoning=reasoning,
-            observed_catalog=self._resident,
-            observed_tools=observed_tools,
-            cost_usd=None,
-            error=error,
+        return tracker.apply_to_outcome(
+            SelectionOutcome(
+                invoked_skills=invoked_skills,
+                early_exit=tracker.early_exit_hit,
+                turns_taken=tracker.turns_taken,
+                reasoning=reasoning,
+                observed_catalog=self._resident,
+                observed_tools=observed_tools,
+                cost_usd=None,
+                error=error,
+            ),
         )
 
     @override
@@ -656,22 +668,6 @@ class AntigravitySdkGenerator(_AntigravitySdkConfigMixin, BaseTextGenerator[Anti
     def _model_spec(self) -> str | ag_types.ModelTarget:
         """Construct model target with reasoning effort endpoint options when configured."""
         return self._target_model_spec(self.options.model or self.model, self.effective_effort)
-
-    def _resolve_schema_dict(
-        self,
-        schema: str | Mapping[str, Any] | None,
-    ) -> dict[str, Any] | None:
-        """Parse optional JSON schema argument or options fallback into a dictionary."""
-        if isinstance(schema, Mapping):
-            return dict(schema)
-        raw_schema = schema if isinstance(schema, str) else self.options.json_schema
-        if not raw_schema:
-            return None
-        try:
-            parsed = json.loads(raw_schema)
-        except json.JSONDecodeError:
-            return None
-        return parsed if isinstance(parsed, dict) else None
 
     @override
     def complete(self, prompt: str, *, schema: str | Mapping[str, Any] | None = None) -> str:
