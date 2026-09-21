@@ -223,7 +223,11 @@ def test_a_set_without_catalog_id_or_provenance_uses_defaults(tmp_path: Path) ->
     minimal_model = QuerySet.model_validate(
         {
             "queries": [
-                {"id": "q1", "text": "deploy cloud run", "expected_skill": "cloud-run-basics"}
+                {
+                    "id": "q1",
+                    "text": "deploy container service",
+                    "expected_skill": "container-deploy",
+                }
             ]
         }
     )
@@ -235,8 +239,12 @@ def test_a_set_without_catalog_id_or_provenance_uses_defaults(tmp_path: Path) ->
         json.dumps(
             {
                 "queries": [
-                    {"id": "q1", "text": "deploy cloud run", "expected_skill": "cloud-run-basics"},
-                    {"text": "create gke cluster", "expected_skill": "gke-basics"},
+                    {
+                        "id": "q1",
+                        "text": "deploy container service",
+                        "expected_skill": "container-deploy",
+                    },
+                    {"text": "create k8s cluster", "expected_skill": "k8s-basics"},
                 ]
             }
         ),
@@ -251,13 +259,58 @@ def test_a_set_without_catalog_id_or_provenance_uses_defaults(tmp_path: Path) ->
 
     custom_yaml = tmp_path / "queries.yaml"
     custom_yaml.write_text(
-        "queries:\n  - id: q1\n    text: deploy cloud run\n    expected_skill: cloud-run-basics\n",
+        "queries:\n"
+        "  - id: q1\n"
+        "    text: deploy container service\n"
+        "    expected_skill: container-deploy\n",
         encoding="utf-8",
     )
     loaded_yaml = load_query_set(custom_yaml)
     assert loaded_yaml.catalog_id == "all"
     assert loaded_yaml.provenance.origin == Origin.AUTHORED
     assert len(loaded_yaml.queries) == 1
+
+
+def test_query_accepts_query_alias_and_serializes_to_canonical_text(tmp_path: Path) -> None:
+    """Verify Query accepts 'query' as alias for 'text' and serializes back to 'text'."""
+    direct = Query.model_validate(
+        {"id": "q-alias", "query": "restart database service", "expected_skill": "db-admin"}
+    )
+    assert direct.text == "restart database service"
+    assert "query" not in direct.model_dump()
+    assert direct.model_dump()["text"] == "restart database service"
+
+    mixed_file = tmp_path / "mixed.json"
+    mixed_file.write_text(
+        json.dumps(
+            {
+                "queries": [
+                    {"id": "q1", "text": "deploy container service", "expected_skill": "s1"},
+                    {"id": "q2", "query": "restart database service", "expected_skill": "s2"},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    loaded = load_query_set(mixed_file)
+    assert len(loaded.queries) == 2
+    assert loaded.queries[0].text == "deploy container service"
+    assert loaded.queries[1].text == "restart database service"
+
+    saved_path = save_query_set(loaded, tmp_path / "normalized.json")
+    saved_raw = json.loads(saved_path.read_text(encoding="utf-8"))
+    for item in saved_raw["queries"]:
+        assert "text" in item
+        assert "query" not in item
+
+
+@pytest.mark.parametrize("bad_alias", ["prompt", "question", "utterance"])
+def test_query_rejects_unauthorized_aliases(bad_alias: str) -> None:
+    """Verify unauthorized field aliases are strictly rejected by Query schema."""
+    with pytest.raises(Exception, match=r"text|Field required"):
+        Query.model_validate(
+            {"id": "q1", bad_alias: "deploy container service", "expected_skill": "s1"}
+        )
 
 
 def test_provenance_survives_a_trip_through_disk(tmp_path: Path) -> None:
