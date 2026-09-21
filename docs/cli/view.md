@@ -95,9 +95,9 @@ Output:
 
 ## Options
 
-| Option           | Type   | Default            | Description                                                                                                                                             |
-| :--------------- | :----- | :----------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `ARTIFACT`       | Path   | `.reach/eval.json` | Path to the evaluation artifact JSON file. If omitted, defaults to `.reach/eval.json`.                                                                  |
+| Option            | Type   | Default            | Description                                                                                                                                             |
+| :---------------- | :----- | :----------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `ARTIFACT`        | Path   | `.reach/eval.json` | Path to the evaluation artifact JSON file. If omitted, defaults to `.reach/eval.json`.                                                                  |
 | `--out`, `-o`     | Path   | -                  | Destination path to write the rendered report (defaults to stdout).                                                                                     |
 | `--open`, `-O`    | Flag   | `false`            | Open the rendered HTML report directly in the default web browser.                                                                                      |
 | `--show-queries`  | Flag   | `false`            | Display individual scored query records below the summary scorecard.                                                                                    |

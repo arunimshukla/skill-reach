@@ -523,8 +523,6 @@ class AntigravitySdkRuntime(_AntigravitySdkConfigMixin, AntigravityRuntime):
                 if isinstance(args, Mapping) and (
                     modified_args := normalize_skill_tool_args(args, skill)
                 ):
-                    if isinstance(args, dict):
-                        args.update(modified_args)
                     return ag_types.HookResult(allow=True, modified_args=modified_args)
                 return ag_types.HookResult(allow=True)
 

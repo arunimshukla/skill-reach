@@ -209,7 +209,7 @@ def resolve_skill_from_path(
 
     if p.suffix.lower() == ".md":
         candidates.append(p.stem.lower())
-    elif not p.suffix:
+    elif not p.suffix and ((p / "SKILL.md").is_file() or (p / "skill.md").is_file()):
         candidates.append(p.name.lower())
 
     for candidate in candidates:

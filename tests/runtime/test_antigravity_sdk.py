@@ -1547,7 +1547,6 @@ def test_select_async_hook_rewrites_skill_directory_to_skill_md_for_multi_turn_r
                 assert res_turn1.allow is True
                 expected_md = str(distractor_dir / "SKILL.md")
                 assert res_turn1.modified_args == {"AbsolutePath": expected_md}
-                assert call_turn1.args["AbsolutePath"] == expected_md
 
                 # Turn 2: Model recovers and calls view_file on target skill directory
                 call_turn2 = ag_types.ToolCall(

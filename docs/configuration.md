@@ -317,7 +317,6 @@ Controls probe replication and network resilience.
 | `pause_s`   | Float   | `0.0`   | Delay between consecutive probes to respect provider rate limits.                     |
 | `workers`   | Integer | `1`     | Number of concurrent worker threads executing probes in parallel.                     |
 
-
 ### `[runtime]`
 
 | Key                | Type             | Default | Description                                                                                                                                                                                                                                                                                                                                                                                                                                                              |

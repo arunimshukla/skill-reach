@@ -400,7 +400,7 @@ def _resolve_sibling_jsonl(path: Path) -> Path | None:
     """Locate sibling raw .jsonl results file (with sidecar) for an .artifact.json path."""
     candidates: list[Path] = []
     if path.name.endswith(ARTIFACT_SUFFIX):
-        base = Path(str(path)[: -len(ARTIFACT_SUFFIX)])
+        base = path.with_name(path.name[: -len(ARTIFACT_SUFFIX)])
         candidates.extend((base, base.with_suffix(".jsonl")))
     elif path.suffix == ".json":
         candidates.append(path.with_suffix(".jsonl"))
