@@ -29,10 +29,10 @@ import yaml
 from pydantic import BaseModel, ConfigDict
 
 from reach._lint_semantics import (
-    _KEBAB_NAME,
+    KEBAB_NAME_RE,
     RESERVED_TOOL_NAMES,
     SkillLintSemantics,
-    _detect_unbounded_attractor,
+    detect_unbounded_attractor,
     extract_corpus_semantics,
     extract_skill_references,
 )
@@ -414,7 +414,7 @@ def _lint_name(
     else:
         name_str = str(declared_name)
         effective_name = name_str
-        if not _KEBAB_NAME.match(name_str) or len(name_str) > config.max_name_length:
+        if not KEBAB_NAME_RE.match(name_str) or len(name_str) > config.max_name_length:
             msg = (
                 f"Skill name {name_str!r} must be lowercase kebab-case "
                 f"(max {config.max_name_length} characters)."
@@ -471,7 +471,7 @@ def _lint_description(
         msg = f"Description contains unresolved template placeholder {match.group(0)!r}."
         _record_issue(issues, "unresolved-placeholder", effective_name, skill_file, msg, config)
 
-    if phrase := _detect_unbounded_attractor(desc_str):
+    if phrase := detect_unbounded_attractor(desc_str):
         msg = (
             f"Description contains overly broad attractor phrasing {phrase!r} "
             "without concrete domain specificity, which causes distractor hijacking."
@@ -608,8 +608,9 @@ def _check_duplicates(
 
 
 _HANDOFF_SENTENCE_RE: Final = re.compile(
-    r"\b(?:see|prefer|refer|defer|delegate|instead|rather\s+than|"
-    r"don't|do\s+not|not\s+for|not\s+to\s+be\s+used|avoid|never)\b",
+    r"\b(?:don't|do\s+not|not\s+for|not\s+to\s+be\s+used|never\s+use|avoid\s+using|"
+    r"instead|rather\s+than|refer\s+to|defer\s+to|delegate\s+to|hand\s+off\s+to)\b"
+    r"|\b(?:use|see|prefer)\s+(?:the\s+)?(?:`[a-z0-9_-]+`|[a-z0-9]+(?:-[a-z0-9]+)+)",
     re.IGNORECASE,
 )
 
@@ -725,11 +726,11 @@ def hands_off_to_skill(
         return False
 
     explicit_target_re = re.compile(
-        rf"(?:\b(?:use|see|prefer|refer\s+to|defer\s+to|delegate\s+to|switch\s+to)\s+(?:the\s+)?"
-        rf"`?{re.escape(target_lower)}`?(?:\s+skill|\s+instead|\s+first|[).,;:]|$)"
-        rf"|`{re.escape(target_lower)}`)",
+        rf"\b(?:use|see|prefer|refer\s+to|defer\s+to|delegate\s+to|switch\s+to)\s+(?:the\s+)?"
+        rf"`?{re.escape(target_lower)}`?(?:\s+skill|\s+instead|\s+first|[).,;:]|$)",
         re.IGNORECASE,
     )
+    backtick_target_re = re.compile(rf"`{re.escape(target_lower)}`", re.IGNORECASE)
     stem = (
         wanted[:-1]
         if len(wanted) >= _MIN_STEM_TOKENS and wanted[-1] in _META_NAME_SUFFIXES
@@ -739,10 +740,17 @@ def hands_off_to_skill(
     for sentence in re.split(r"[.!?]+", source_description):
         if explicit_target_re.search(sentence):
             return True
-        if len(wanted) >= _MIN_DISTINCTIVE_NAME_TOKENS and _HANDOFF_SENTENCE_RE.search(sentence):
+        if _HANDOFF_SENTENCE_RE.search(sentence):
             sent_tokens = tokenize(sentence)
-            if contains_run(sent_tokens, wanted) or (
-                len(stem) >= _MIN_DISTINCTIVE_NAME_TOKENS and contains_run(sent_tokens, stem)
+            if backtick_target_re.search(sentence) or (
+                len(wanted) >= _MIN_DISTINCTIVE_NAME_TOKENS
+                and (
+                    contains_run(sent_tokens, wanted)
+                    or (
+                        len(stem) >= _MIN_DISTINCTIVE_NAME_TOKENS
+                        and contains_run(sent_tokens, stem)
+                    )
+                )
             ):
                 return True
     return False
@@ -1109,7 +1117,9 @@ def _emit_mutual_handoff_pair_issues(
         (pair.s1, pair.s2, pair.s1_to_s2),
         (pair.s2, pair.s1, pair.s2_to_s1),
     ):
-        if subj_hands_to_partner and skill_filter != subject.name:
+        if skill_filter is not None and subject.name != skill_filter:
+            continue
+        if subj_hands_to_partner and skill_filter is None:
             continue
         if subj_hands_to_partner:
             msg = (
@@ -1231,8 +1241,12 @@ def _lint_paths(
         file_report = lint_file(file_path, config=cfg)
         skill_name = file_report.skill_name or file_path.parent.name
 
+        is_plugin_or_hidden_mirror = "plugins" in file_path.parts or any(
+            part.startswith(".") for part in file_path.parts
+        )
         if (
             file_digest
+            and is_plugin_or_hidden_mirror
             and skill_name in content_hash_by_name
             and content_hash_by_name[skill_name] == file_digest
         ):

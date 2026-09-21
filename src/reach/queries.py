@@ -89,7 +89,7 @@ class QuerySet(BaseModel):
     @classmethod
     def _default_missing_query_ids(cls, data: object) -> object:
         """Assign sequential default IDs (`q-001`, ...) to query entries that omit `id`."""
-        if isinstance(data, dict) and isinstance(data.get("queries"), list):
+        if isinstance(data, dict) and isinstance(data.get("queries"), (list, tuple)):
             normalized_queries = [
                 {**q, "id": f"q-{idx:03d}"}
                 if isinstance(q, dict) and not str(q.get("id") or "").strip()

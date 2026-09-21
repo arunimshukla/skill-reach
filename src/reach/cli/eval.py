@@ -327,7 +327,12 @@ def _filter_queries_by_targets(
     scratch: Path | None,
 ) -> RunConfig:
     """Filter an existing query set on disk to only queries matching --skill targets."""
-    if not targets or settings.study.queries is None or not settings.study.queries.is_file():
+    if (
+        not targets
+        or scratch is None
+        or settings.study.queries is None
+        or not settings.study.queries.is_file()
+    ):
         return settings
     from reach.queries import load_query_set
 
@@ -338,9 +343,14 @@ def _filter_queries_by_targets(
         for q in query_set.queries
         if q.expected_skill in target_set or q.truth_label in target_set
     )
+    if not filtered_queries:
+        msg = (
+            f"no queries in {settings.study.queries} match --skill "
+            f"{', '.join(repr(t) for t in targets)}"
+        )
+        raise ValueError(msg)
     filtered_qs = query_set.model_copy(update={"queries": filtered_queries})
-    dest_dir = scratch if scratch is not None else Path(tempfile.mkdtemp(prefix="reach-filter-"))
-    filtered_path = dest_dir / "filtered-queries.json"
+    filtered_path = scratch / "filtered-queries.json"
     save_query_set(filtered_qs, filtered_path)
     return settings.with_overrides(study={"queries": filtered_path})
 

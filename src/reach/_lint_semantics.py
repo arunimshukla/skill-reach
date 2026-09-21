@@ -29,20 +29,25 @@ if TYPE_CHECKING:
     from reach.models import Skill
 
 __all__ = [
+    "KEBAB_NAME_RE",
     "RESERVED_TOOL_NAMES",
-    "_KEBAB_NAME",
     "SkillLintSemantics",
-    "_detect_unbounded_attractor",
-    "_has_domain_specificity",
+    "detect_unbounded_attractor",
     "extract_corpus_semantics",
     "extract_skill_references",
 ]
 
-#: Universal quantifiers and generic meta-role nouns used only when a description
-#: lacks any concrete technical/domain specificity.
-_BROAD_SCOPE_MARKER_RE: Final = re.compile(
-    r"\b(?:any|all|every|everything|universal|general[- ]purpose|all[- ]in[- ]one|"
-    r"assistant|helper|command|commands|terminal|workflow|workflows)\b",
+#: Unconditional greedy scope phrases that flag unbounded attractors at any length
+#: when a description lacks concrete technical/domain specificity.
+_STRONG_ATTRACTOR_RE: Final = re.compile(
+    r"\b(?:(?P<any_kw>any)\s+(?:[a-z]+\s+)?(?:task|tasks|problem|problems|request|requests|"
+    r"feature|features|bugfix)|general[- ]purpose|all[- ]in[- ]one|"
+    r"universal\s+(?:assistant|helper|tool|skill)|everything|"
+    r"manage\s+files\s+and\s+run\s+commands|run\s+commands\s+in\s+the\s+terminal)\b",
+    re.IGNORECASE,
+)
+_SHORT_BROAD_MARKER_RE: Final = re.compile(
+    r"\b(?:any|all|every|universal|assistant|helper)\b",
     re.IGNORECASE,
 )
 _TECHNICAL_TOKEN_RE: Final = re.compile(r"`[^\n`]+`|\.[a-z0-9]{2,4}\b|[a-z0-9]+/[a-z0-9]+|\b\d+\b")
@@ -107,8 +112,6 @@ _HANDOFF_CANDIDATE_PREFILTER_RE: Final = re.compile(
 
 def _has_domain_specificity(description: str) -> bool:
     """Return True if description contains concrete technical anchors or domain specification."""
-    if len(description) >= _MIN_SPECIFIC_DESCRIPTION_CHARS:
-        return True
     if _TECHNICAL_TOKEN_RE.search(description):
         return True
     for sentence in re.split(r"[.!?]+", description):
@@ -126,15 +129,20 @@ def _has_domain_specificity(description: str) -> bool:
     return False
 
 
-def _detect_unbounded_attractor(description: str) -> str | None:
+def detect_unbounded_attractor(description: str) -> str | None:
     """Return the broad-scope marker if a description lacks domain specificity, else None."""
     if _has_domain_specificity(description):
         return None
-    match = _BROAD_SCOPE_MARKER_RE.search(description)
-    return match.group(0) if match else None
+    if strong := _STRONG_ATTRACTOR_RE.search(description):
+        return strong.group("any_kw") or strong.group(0)
+    if len(description) < _MIN_SPECIFIC_DESCRIPTION_CHARS and (
+        short := _SHORT_BROAD_MARKER_RE.search(description)
+    ):
+        return short.group(0)
+    return None
 
 
-_KEBAB_NAME: Final = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
+KEBAB_NAME_RE: Final = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
 RESERVED_TOOL_NAMES: Final[frozenset[str]] = frozenset(
     {t.lower() for t in DEFAULT_DENIED_TOOLS}
     | {
@@ -156,7 +164,7 @@ def _add_if_valid_ref(found: set[str], token: str, self_lower: str | None) -> No
         cleaned
         and "-" in cleaned
         and cleaned != self_lower
-        and _KEBAB_NAME.match(cleaned)
+        and KEBAB_NAME_RE.match(cleaned)
         and cleaned not in RESERVED_TOOL_NAMES
     ):
         found.add(cleaned)
@@ -227,6 +235,6 @@ def extract_corpus_semantics(
         results[skill.name] = SkillLintSemantics(
             skill=skill.name,
             handoff_targets=extract_skill_references(skill.description, self_name=skill.name),
-            unbounded_attractor_phrase=_detect_unbounded_attractor(skill.description),
+            unbounded_attractor_phrase=detect_unbounded_attractor(skill.description),
         )
     return results
