@@ -465,15 +465,18 @@ class LintSettings(BaseModel):
         rules: dict[str, Any] = {}
 
         if isinstance(lint_section, Mapping):
-            raw_max_desc = lint_section.get("max_description_length")
-            if isinstance(raw_max_desc, int):
-                max_desc = raw_max_desc
-            raw_max_name = lint_section.get("max_name_length")
-            if isinstance(raw_max_name, int):
-                max_name = raw_max_name
-            raw_min_desc = lint_section.get("min_description_length")
-            if isinstance(raw_min_desc, int):
-                min_desc = raw_min_desc
+            int_vals = {
+                k: v
+                for k in (
+                    "max_description_length",
+                    "max_name_length",
+                    "min_description_length",
+                )
+                if isinstance(v := lint_section.get(k), int)
+            }
+            max_desc = int_vals.get("max_description_length", max_desc)
+            max_name = int_vals.get("max_name_length", max_name)
+            min_desc = int_vals.get("min_description_length", min_desc)
             raw_sim = lint_section.get("similarity_threshold")
             if isinstance(raw_sim, (int, float)):
                 sim_threshold = float(raw_sim)

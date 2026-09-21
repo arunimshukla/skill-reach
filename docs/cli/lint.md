@@ -108,5 +108,5 @@ reach lint ./skills --format json
 | `unresolved-declared-dependency` | Warning          | Declared dependency skill in `metadata` or `allowed-tools` is missing from resident catalog. |
 | `lockfile-drift`                 | Warning          | Local SKILL.md content digest does not match pinned `computedHash` in `skills-lock.json`.    |
 | `unbounded-attractor`            | Warning          | Description contains overly broad phrases that aggressively attract out-of-scope queries.    |
-| `unknown-skill-reference`        | Error            | Negative routing handoff (`use <other-skill>`) references a skill missing from the catalog.  |
+| `unknown-skill-reference`        | Warning          | Negative routing handoff (`use <other-skill>`) references a skill missing from the catalog.  |
 | `missing-mutual-handoff`         | Warning          | High-similarity or one-way competing neighbor lacks reciprocal `Don't use for...` handoff.   |

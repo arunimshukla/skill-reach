@@ -37,6 +37,10 @@ if TYPE_CHECKING:
         "Universal assistant for your workflows.",
         "All-in-one helper for software engineering.",
         "Handle any request given by the user.",
+        (
+            "Use this general-purpose assistant when implementing any feature or bugfix "
+            "across the workspace before writing implementation code."
+        ),
     ],
 )
 def test_unbounded_attractor_flags_greedy_descriptions(tmp_path: Path, greedy_desc: str) -> None:

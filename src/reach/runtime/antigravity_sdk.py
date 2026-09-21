@@ -534,8 +534,8 @@ class AntigravitySdkRuntime(_AntigravitySdkConfigMixin, AntigravityRuntime):
             async with Agent(config) as agent:
                 response = await agent.chat(query_text)
                 data = await response.structured_output()
-                text_fn = getattr(response, "text", None)
-                raw_text = await text_fn() if callable(text_fn) else None
+                text_fn: Any = getattr(response, "text", None)
+                raw_text = await text_fn() if text_fn is not None else None
                 text_out = str(raw_text).strip() if isinstance(raw_text, str) else ""
                 stream_tools = [_tool_name(call.name) async for call in response.tool_calls]
                 observed_tools = tuple(stream_tools or hook_observed_tools)

@@ -83,7 +83,10 @@ def _format_csv(report: LintReport) -> str:
     return buffer.getvalue()
 
 
-def _lint_roots(roots: Sequence[Path], lint_config: LintSettings) -> LintReport:
+def _lint_roots(
+    roots: Sequence[Path],
+    lint_config: LintSettings,
+) -> LintReport:
     """Aggregate lint diagnostic reports across multiple discovered directory roots."""
     aggregated_issues: list[LintIssue] = []
     skills_checked = 0

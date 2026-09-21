@@ -376,11 +376,11 @@ def compose(config: RunConfig, skills: Sequence[Skill] | None = None) -> Composi
     )
 
     if not config.study.catalog or config.study.catalog.strip().lower() == "auto":
-        wanted = query_set.catalog_id
+        wanted = query_set.catalog_id or "all"
     else:
         wanted = config.study.catalog
 
-    if wanted != query_set.catalog_id and not config.study.rescope:
+    if query_set.catalog_id and wanted != query_set.catalog_id and not config.study.rescope:
         msg = (
             f"query set was labeled in {query_set.catalog_id!r} but would be "
             f"probed against {wanted!r}: ground truth derived in one catalog is "

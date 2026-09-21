@@ -23,14 +23,21 @@ from collections import Counter
 from collections.abc import Mapping, Sequence
 from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Final, NamedTuple
 
 import yaml
 from pydantic import BaseModel, ConfigDict
 
+from reach._lint_semantics import (
+    KEBAB_NAME_RE,
+    RESERVED_TOOL_NAMES,
+    SkillLintSemantics,
+    detect_unbounded_attractor,
+    extract_corpus_semantics,
+    extract_skill_references,
+)
 from reach.catalog import _skill_files, find_skill_manifest, parse_frontmatter, split_frontmatter
 from reach.config import LintSettings, resolve_path
-from reach.runtime.claude_code import DEFAULT_DENIED_TOOLS, SKILL_TOOL_NAME
 
 if TYPE_CHECKING:
     from reach.models import Skill
@@ -43,7 +50,9 @@ __all__ = [
     "LintSettings",
     "RuleDefinition",
     "Severity",
+    "SkillLintSemantics",
     "explain_rule",
+    "extract_corpus_semantics",
     "extract_skill_references",
     "find_competing_neighbors",
     "find_unknown_skill_references",
@@ -55,41 +64,13 @@ __all__ = [
 
 #: Minimum skills required for pairwise semantic similarity comparisons.
 MIN_PAIRWISE_SKILLS: Final = 2
-
-
-#: Pattern validating kebab-case naming syntax: lowercase alphanumeric with single hyphens.
-_KEBAB_NAME = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
+#: Minimum corpus size before enforcing BM25 IDF distinctiveness floor on shared triggers.
+_MIN_CORPUS_FOR_IDF_FLOOR: Final = 4
+#: Minimum token length for shared trigger vocabulary reporting.
+_MIN_SHARED_TRIGGER_LENGTH: Final = 3
 
 #: Pattern matching unresolved template placeholders.
 _PLACEHOLDER = re.compile(r"\b(?:TODO|FIXME|XXX)\b|<FILL_IN>|<TODO>|\[TODO\]", re.IGNORECASE)
-
-#: Pattern matching overly broad, unbounded attractor claims that hijack queries.
-_UNBOUNDED_ATTRACTOR = re.compile(
-    r"\b(?:"
-    r"(?:assist|help|handle|support|do|solve)\s+(?:with\s+)?(?:any|all)\b|"
-    r"general[\s-]purpose\b|"
-    r"universal\s+assistant\b|"
-    r"all[\s-]in[\s-]one\b|"
-    r"manage\s+files\s+and\s+run\s+commands\b|"
-    r"for\s+any\s+(?:task|problem|request|query|coding)\b|"
-    r"anything\s+(?:related|coding|code)\b"
-    r")",
-    re.IGNORECASE,
-)
-
-#: Built-in tool primitives and reserved agent commands across supported runtimes.
-RESERVED_TOOL_NAMES = frozenset(
-    {t.lower() for t in DEFAULT_DENIED_TOOLS}
-    | {
-        SKILL_TOOL_NAME.lower(),
-        "ask_question",
-        "finish",
-        "replace_file_content",
-        "run_command",
-        "view_file",
-        "write_to_file",
-    },
-)
 
 
 class Severity(StrEnum):
@@ -275,7 +256,7 @@ RULES: dict[str, RuleDefinition] = {
     ),
     "unknown-skill-reference": RuleDefinition(
         rule="unknown-skill-reference",
-        default_severity=Severity.ERROR,
+        default_severity=Severity.WARN,
         summary="Description hands off to a skill name that does not exist in the catalog",
         explanation=(
             "Negative routing instructions (e.g. 'Don't use for X — use <other-skill>') "
@@ -433,7 +414,7 @@ def _lint_name(
     else:
         name_str = str(declared_name)
         effective_name = name_str
-        if not _KEBAB_NAME.match(name_str) or len(name_str) > config.max_name_length:
+        if not KEBAB_NAME_RE.match(name_str) or len(name_str) > config.max_name_length:
             msg = (
                 f"Skill name {name_str!r} must be lowercase kebab-case "
                 f"(max {config.max_name_length} characters)."
@@ -490,10 +471,10 @@ def _lint_description(
         msg = f"Description contains unresolved template placeholder {match.group(0)!r}."
         _record_issue(issues, "unresolved-placeholder", effective_name, skill_file, msg, config)
 
-    if match := _UNBOUNDED_ATTRACTOR.search(desc_str):
+    if phrase := detect_unbounded_attractor(desc_str):
         msg = (
-            f"Description contains overly broad attractor phrasing {match.group(0)!r} "
-            "which causes distractor hijacking in multi-skill catalogs."
+            f"Description contains overly broad attractor phrasing {phrase!r} "
+            "without concrete domain specificity, which causes distractor hijacking."
         )
         _record_issue(issues, "unbounded-attractor", effective_name, skill_file, msg, config)
 
@@ -626,280 +607,20 @@ def _check_duplicates(
     return issues
 
 
-#: Common hyphenated compound adjectives and technical terms that are not skill identifiers.
-_NON_SKILL_HYPHENATED_TERMS: Final[frozenset[str]] = frozenset(
-    {
-        "all-in-one",
-        "apt-get",
-        "auto-scaling",
-        "built-in",
-        "ci-cd",
-        "client-side",
-        "command-line",
-        "cross-origin",
-        "cross-platform",
-        "cross-project",
-        "cross-region",
-        "day-to-day",
-        "docker-compose",
-        "dry-run",
-        "end-to-end",
-        "event-driven",
-        "fail-fast",
-        "fine-grained",
-        "first-party",
-        "flat-rate",
-        "full-text",
-        "general-purpose",
-        "git-lfs",
-        "high-availability",
-        "high-level",
-        "high-performance",
-        "high-throughput",
-        "huggingface-hub",
-        "in-memory",
-        "in-place",
-        "key-value",
-        "kebab-case",
-        "least-privilege",
-        "long-lived",
-        "long-running",
-        "low-latency",
-        "low-level",
-        "machine-learning",
-        "multi-agent",
-        "multi-channel",
-        "multi-cloud",
-        "multi-cluster",
-        "multi-region",
-        "multi-stage",
-        "multi-step",
-        "multi-tenant",
-        "multi-turn",
-        "near-duplicate",
-        "non-empty",
-        "non-interactive",
-        "non-null",
-        "non-zero",
-        "object-oriented",
-        "on-demand",
-        "on-prem",
-        "on-premises",
-        "one-off",
-        "one-shot",
-        "one-way",
-        "open-source",
-        "out-of-scope",
-        "out-of-the-box",
-        "pay-as-you-go",
-        "pip-compile",
-        "point-in-time",
-        "pre-built",
-        "pre-commit",
-        "pre-configured",
-        "pre-flight",
-        "production-ready",
-        "pull-based",
-        "push-based",
-        "read-only",
-        "read-write",
-        "real-time",
-        "red-green-refactor",
-        "role-based",
-        "root-cause",
-        "round-robin",
-        "rule-based",
-        "run-to-run",
-        "scikit-learn",
-        "self-contained",
-        "self-hosted",
-        "self-managed",
-        "self-repulsion",
-        "self-service",
-        "self-signed",
-        "server-side",
-        "sha-256",
-        "short-form",
-        "short-lived",
-        "side-by-side",
-        "single-node",
-        "single-page",
-        "source-to-image",
-        "split-horizon",
-        "stage-level",
-        "state-of-the-art",
-        "step-by-step",
-        "sub-agent",
-        "sub-agents",
-        "test-driven",
-        "test-first",
-        "third-party",
-        "time-series",
-        "token-based",
-        "top-1",
-        "top-k",
-        "top-level",
-        "two-stage",
-        "type-safe",
-        "utf-8",
-        "user-defined",
-        "user-facing",
-        "well-architected",
-        "well-formed",
-        "well-structured",
-        "write-in",
-        "zero-downtime",
-        "zero-trust",
-    }
-)
-
-#: Generic platform/domain prefixes excluded when extracting distinctive skill name runs.
-_GENERIC_NAME_TOKENS: Final[frozenset[str]] = frozenset(
-    {
-        "agent",
-        "agents",
-        "api",
-        "aws",
-        "azure",
-        "basics",
-        "cli",
-        "cloud",
-        "common",
-        "core",
-        "default",
-        "gcp",
-        "general",
-        "google",
-        "helper",
-        "sdk",
-        "skill",
-        "skills",
-        "tool",
-        "tools",
-    }
-)
-
-_HANDOFF_VERB = r"(?:use|see|prefer|refer\s+to|defer\s+to|delegate\s+to|hand\s+off\s+to)"
-_KEBAB_ID = r"[a-z0-9]+(?:-[a-z0-9]+)+"
-_KEBAB_ID_RE = re.compile(_KEBAB_ID, re.IGNORECASE)
-_ANY_SKILL_ID = r"[a-z0-9]+(?:-[a-z0-9]+)*"
-_KEBAB_LIST = (
-    rf"`?{_KEBAB_ID}`?(?:\s+(?:first|instead|skill))?"
-    rf"(?:\s*(?:,\s*(?:or|and)\b|,|\bor\b|\band\b)\s*(?:use\s+|see\s+|prefer\s+|the\s+)?`?{_KEBAB_ID}`?(?:\s+(?:first|instead|skill))?)*"
-)
-
-_PAREN_HANDOFF_RE = re.compile(
-    rf"\([^)]*?\b{_HANDOFF_VERB}\s+(?:the\s+)?(?P<targets>{_KEBAB_LIST})[^)]*\)",
+_HANDOFF_SENTENCE_RE: Final = re.compile(
+    r"\b(?:don't|do\s+not|not\s+for|not\s+to\s+be\s+used|never\s+use|avoid\s+using|"
+    r"instead|rather\s+than|refer\s+to|defer\s+to|delegate\s+to|hand\s+off\s+to)\b"
+    r"|\b(?:use|see|prefer)\s+(?:the\s+)?(?:`[a-z0-9_-]+`|[a-z0-9]+(?:-[a-z0-9]+)+)",
     re.IGNORECASE,
 )
-
-_QUALIFIED_HANDOFF_RE = re.compile(
-    rf"\b{_HANDOFF_VERB}\s+(?:the\s+)?`?({_ANY_SKILL_ID})`?\s+(?:instead|first|skill)\b",
-    re.IGNORECASE,
-)
-
-_BACKTICK_HANDOFF_RE = re.compile(
-    rf"\b{_HANDOFF_VERB}\s+(?:the\s+)?`({_KEBAB_ID})`",
-    re.IGNORECASE,
-)
-
-_NEGATIVE_CLAUSE_MARKER_RE = re.compile(
-    r"\b(?:don't\s+use|do\s+not\s+use|not\s+for\b|never\s+use|avoid\s+using|"
-    r"instead\s+of\b|rather\s+than\b|for\s+[^.!?;]+,\s*(?:use|prefer|defer\s+to|see)\b)",
-    re.IGNORECASE,
-)
-
-_VERB_TARGET_IN_CLAUSE_RE = re.compile(
-    rf"\b{_HANDOFF_VERB}\s+(?:the\s+)?(?P<targets>{_KEBAB_LIST})",
-    re.IGNORECASE,
-)
-
 
 #: Minimum distinctive token count in a neighbor skill name to detect phrase encroachment.
 _MIN_DISTINCTIVE_NAME_TOKENS: Final = 2
 
-#: Minimum character length for shared trigger terms reported in mutual handoff diagnostics.
-_MIN_SHARED_TRIGGER_LENGTH: Final = 3
 
-
-def _is_valid_skill_ref(
-    candidate: str,
-    self_lower: str | None,
-    require_hyphen: bool = True,
-) -> bool:
-    """Check whether an extracted token is a plausible skill reference rather than prose."""
-    cleaned = candidate.strip().lower()
-    if not cleaned or (self_lower is not None and cleaned == self_lower):
-        return False
-    if require_hyphen and "-" not in cleaned:
-        return False
-    if not _KEBAB_NAME.match(cleaned):
-        return False
-    return cleaned not in _NON_SKILL_HYPHENATED_TERMS and cleaned not in RESERVED_TOOL_NAMES
-
-
-def _add_if_valid_ref(
-    found: set[str],
-    candidate: str | None,
-    self_lower: str | None,
-    *,
-    require_hyphen: bool = True,
-) -> None:
-    """Add candidate to found set if it passes skill reference validation."""
-    if candidate and _is_valid_skill_ref(candidate, self_lower, require_hyphen=require_hyphen):
-        found.add(candidate.lower())
-
-
-def extract_skill_references(
-    description: str,
-    *,
-    self_name: str | None = None,
-) -> tuple[str, ...]:
-    """Extract skill identifiers referenced in routing handoff or disclaimer clauses.
-
-    Args:
-        description: Raw skill description text from SKILL.md frontmatter.
-        self_name: Optional name of the skill itself to exclude self-references.
-
-    Returns:
-        Sorted tuple of unique referenced skill names in kebab-case.
-    """
-    if not description or not description.strip():
-        return ()
-
-    self_lower = self_name.strip().lower() if self_name else None
-    found: set[str] = set()
-
-    for match in _PAREN_HANDOFF_RE.finditer(description):
-        for token in _KEBAB_ID_RE.findall(match.group("targets")):
-            _add_if_valid_ref(found, token, self_lower, require_hyphen=True)
-
-    for match in _QUALIFIED_HANDOFF_RE.finditer(description):
-        qualifier_is_skill = match.group(0).strip().lower().endswith("skill")
-        _add_if_valid_ref(
-            found,
-            match.group(1),
-            self_lower,
-            require_hyphen=not qualifier_is_skill,
-        )
-
-    for match in _BACKTICK_HANDOFF_RE.finditer(description):
-        _add_if_valid_ref(found, match.group(1), self_lower, require_hyphen=True)
-
-    for sentence in re.split(r"[.!?]+", description):
-        if not _NEGATIVE_CLAUSE_MARKER_RE.search(sentence):
-            continue
-        for match in _VERB_TARGET_IN_CLAUSE_RE.finditer(sentence):
-            for token in _KEBAB_ID_RE.findall(match.group("targets")):
-                _add_if_valid_ref(found, token, self_lower, require_hyphen=True)
-
-    return tuple(sorted(found))
-
-
-_HANDOFF_SENTENCE_RE: Final = re.compile(
-    r"\b(?:use|see|prefer|refer|defer|delegate|instead|don't|do\s+not|not\s+for|avoid)\b",
-    re.IGNORECASE,
-)
+def _is_wildcard_prefix_in_description(description: str, ref: str) -> bool:
+    """Return True if ref appears as a wildcard family prefix (ref-*) in description."""
+    return bool(re.search(rf"\b{re.escape(ref)}-\*", description, re.IGNORECASE))
 
 
 def find_unknown_skill_references(
@@ -908,6 +629,7 @@ def find_unknown_skill_references(
     *,
     self_name: str | None = None,
     settings: LintSettings | None = None,
+    extracted_refs: Sequence[str] | frozenset[str] | None = None,
 ) -> tuple[str, ...]:
     """Return referenced skill names in description that are absent from known_skills.
 
@@ -918,8 +640,21 @@ def find_unknown_skill_references(
     if _resolve_severity("unknown-skill-reference", cfg) is None:
         return ()
     known_lower = {name.lower() for name in known_skills}
-    refs = extract_skill_references(description, self_name=self_name)
-    return tuple(ref for ref in refs if ref not in known_lower)
+    refs = (
+        tuple(extracted_refs)
+        if extracted_refs is not None
+        else extract_skill_references(description, self_name=self_name)
+    )
+    unknown: list[str] = []
+    for ref in refs:
+        if ref in known_lower:
+            continue
+        if _is_wildcard_prefix_in_description(description, ref) and any(
+            k.startswith(f"{ref}-") for k in known_lower
+        ):
+            continue
+        unknown.append(ref)
+    return tuple(unknown)
 
 
 def _check_unknown_skill_references(
@@ -927,6 +662,7 @@ def _check_unknown_skill_references(
     names_seen: Mapping[str, int],
     paths_by_name: Mapping[str, Sequence[Path]],
     cfg: LintSettings,
+    semantics_by_name: Mapping[str, SkillLintSemantics] | None = None,
 ) -> list[LintIssue]:
     """Identify routing handoffs in descriptions that point to non-existent skills."""
     if _resolve_severity("unknown-skill-reference", cfg) is None:
@@ -935,11 +671,13 @@ def _check_unknown_skill_references(
     issues: list[LintIssue] = []
     known_names = {name.lower() for name in names_seen}
     for skill in skills:
+        sem = semantics_by_name.get(skill.name) if semantics_by_name is not None else None
         unknown_refs = find_unknown_skill_references(
             skill.description,
             known_names,
             self_name=skill.name,
             settings=cfg,
+            extracted_refs=sem.handoff_targets if sem is not None else None,
         )
         for ref in unknown_refs:
             for skill_path in paths_by_name.get(skill.name, ()):
@@ -973,6 +711,12 @@ def hands_off_to_skill(
     )
     if target_lower in refs:
         return True
+    if any(
+        target_lower.startswith(f"{ref}-")
+        and _is_wildcard_prefix_in_description(source_description, ref)
+        for ref in refs
+    ):
+        return True
 
     from reach.leak import contains_run
     from reach.retrieval import tokenize
@@ -981,22 +725,96 @@ def hands_off_to_skill(
     if not wanted:
         return False
 
+    explicit_target_re = re.compile(
+        rf"\b(?:use|see|prefer|refer\s+to|defer\s+to|delegate\s+to|switch\s+to)\s+(?:the\s+)?"
+        rf"`?{re.escape(target_lower)}`?(?:\s+skill|\s+instead|\s+first|[).,;:]|$)",
+        re.IGNORECASE,
+    )
+    backtick_target_re = re.compile(rf"`{re.escape(target_lower)}`", re.IGNORECASE)
+    stem = (
+        wanted[:-1]
+        if len(wanted) >= _MIN_STEM_TOKENS and wanted[-1] in _META_NAME_SUFFIXES
+        else wanted
+    )
+
     for sentence in re.split(r"[.!?]+", source_description):
-        if _HANDOFF_SENTENCE_RE.search(sentence) and contains_run(tokenize(sentence), wanted):
+        if explicit_target_re.search(sentence):
             return True
+        if _HANDOFF_SENTENCE_RE.search(sentence):
+            sent_tokens = tokenize(sentence)
+            if backtick_target_re.search(sentence) or (
+                len(wanted) >= _MIN_DISTINCTIVE_NAME_TOKENS
+                and (
+                    contains_run(sent_tokens, wanted)
+                    or (
+                        len(stem) >= _MIN_DISTINCTIVE_NAME_TOKENS
+                        and contains_run(sent_tokens, stem)
+                    )
+                )
+            ):
+                return True
     return False
 
 
-def _claims_neighbor_name_phrase(source: Skill, neighbor: Skill) -> bool:
-    """Check whether source description contains neighbor's distinctive multi-token name."""
-    from reach.leak import contains_run
+_META_NAME_SUFFIXES: Final = frozenset({"basics", "guide", "helper", "skill", "skills"})
+_MIN_STEM_TOKENS: Final = 3
+_MIN_CORPUS_FOR_TAXONOMY_DF: Final = 10
+_MAX_PEER_HANDOFF_DEGREE: Final = 3
+_MIN_PAIR_EXCLUSIVE_TRIGGERS: Final = 3
+
+
+def _positive_capability_text(description: str) -> str:
+    """Return sentences from description that are not negative or handoff disclaimers."""
+    return " ".join(
+        sent
+        for sent in re.split(r"[.!?]+", description)
+        if sent.strip() and not _HANDOFF_SENTENCE_RE.search(sent)
+    )
+
+
+def _catalog_taxonomy_tokens(skills: Sequence[Skill]) -> frozenset[str]:
+    """Identify high-frequency catalog taxonomy tokens appearing across many skill names."""
     from reach.retrieval import tokenize
 
-    neighbor_tokens = [t for t in tokenize(neighbor.name) if t not in _GENERIC_NAME_TOKENS]
-    if len(neighbor_tokens) < _MIN_DISTINCTIVE_NAME_TOKENS:
+    if len(skills) < _MIN_CORPUS_FOR_TAXONOMY_DF:
+        return frozenset()
+    name_df: Counter[str] = Counter()
+    for s in skills:
+        for t in set(tokenize(s.name)):
+            name_df[t] += 1
+    cap = max(2, int(len(skills) * 0.05))
+    return frozenset(t for t, cnt in name_df.items() if cnt > cap)
+
+
+def _claims_neighbor_name_phrase(
+    source: Skill,
+    neighbor: Skill,
+    taxonomy_tokens: frozenset[str] = frozenset(),
+) -> bool:
+    """Check whether source positive description claims neighbor's distinctive name phrase."""
+    from reach.leak import FUNCTION_WORDS, contains_run
+    from reach.retrieval import tokenize
+
+    pos_tokens = tokenize(_positive_capability_text(source.description))
+    neighbor_tokens = [t for t in tokenize(neighbor.name) if t not in FUNCTION_WORDS]
+    if (
+        len(neighbor_tokens) >= _MIN_DISTINCTIVE_NAME_TOKENS
+        and "".join(t[0] for t in neighbor_tokens) == source.name.lower()
+        and contains_run(pos_tokens, neighbor_tokens)
+    ):
+        return True
+
+    distinctive = [t for t in neighbor_tokens if t not in taxonomy_tokens]
+    if len(distinctive) < _MIN_DISTINCTIVE_NAME_TOKENS or not contains_run(pos_tokens, distinctive):
         return False
-    source_desc_tokens = tokenize(source.description)
-    return contains_run(source_desc_tokens, neighbor_tokens)
+
+    if not taxonomy_tokens:
+        return True
+    neighbor_pos_set = set(tokenize(_positive_capability_text(neighbor.description)))
+    source_specific = [
+        t for t in tokenize(source.name) if t not in FUNCTION_WORDS and t not in taxonomy_tokens
+    ]
+    return bool(source_specific) and any(t in neighbor_pos_set for t in source_specific)
 
 
 def _max_lexical_ratio(
@@ -1022,12 +840,60 @@ def _max_lexical_ratio(
     return max(r12, r21)
 
 
+def _resolve_refs_by_name(
+    skills: Sequence[Skill],
+    semantics_by_name: Mapping[str, SkillLintSemantics] | None = None,
+) -> dict[str, frozenset[str]]:
+    """Return mapping of skill name to extracted handoff target names."""
+    return {
+        s.name: (
+            frozenset(semantics_by_name[s.name].handoff_targets)
+            if semantics_by_name and s.name in semantics_by_name
+            else frozenset(extract_skill_references(s.description, self_name=s.name))
+        )
+        for s in skills
+    }
+
+
+def _symmetric_dense_sim(
+    s1_name: str,
+    s2_name: str,
+    sim_map: Mapping[tuple[str, str], float] | None,
+) -> float:
+    """Return the maximum symmetric dense cosine similarity between two skills."""
+    if sim_map is None:
+        return 0.0
+    return max(sim_map.get((s1_name, s2_name), 0.0), sim_map.get((s2_name, s1_name), 0.0))
+
+
+def _has_bidirectional_name_claim(
+    s1: Skill,
+    s2: Skill,
+    taxonomy_tokens: frozenset[str],
+) -> bool:
+    """Return True if either skill positively claims the other's multi-token name phrase."""
+    return _claims_neighbor_name_phrase(s1, s2, taxonomy_tokens) or _claims_neighbor_name_phrase(
+        s2, s1, taxonomy_tokens
+    )
+
+
+def _positive_skills_corpus(skills: Sequence[Skill]) -> list[Skill]:
+    """Return skills with negative routing clauses stripped from descriptions for BM25 scoring."""
+    return [
+        s.model_copy(
+            update={"description": _positive_capability_text(s.description) or s.description}
+        )
+        for s in skills
+    ]
+
+
 def find_competing_neighbors(
     modified: set[str],
     skills: Sequence[Skill],
     *,
     settings: LintSettings | None = None,
     dense_similarities: Mapping[tuple[str, str], float] | None = None,
+    semantics_by_name: Mapping[str, SkillLintSemantics] | None = None,
 ) -> set[str]:
     """Identify competing neighbor skills that could be hijacked by modified skills."""
     if not modified or len(skills) < MIN_PAIRWISE_SKILLS:
@@ -1043,12 +909,11 @@ def find_competing_neighbors(
         if dense_similarities is not None
         else _compute_dense_similarities(skills)
     )
-    overlap = rank_corpus(skills)
+    overlap = rank_corpus(_positive_skills_corpus(skills))
     comp_by_name = {c.skill: c for c in overlap.competitions}
     by_name = {s.name: s for s in skills}
-    refs_by_name = {
-        s.name: frozenset(extract_skill_references(s.description, self_name=s.name)) for s in skills
-    }
+    refs_by_name = _resolve_refs_by_name(skills, semantics_by_name)
+    taxonomy_tokens = _catalog_taxonomy_tokens(skills)
     neighbors: set[str] = set()
 
     for mod_name in modified:
@@ -1059,17 +924,13 @@ def find_competing_neighbors(
         for candidate in skills:
             if candidate.name in modified:
                 continue
-            sem_sim = max(
-                sim_map.get((mod_name, candidate.name), 0.0),
-                sim_map.get((candidate.name, mod_name), 0.0),
-            )
+            sem_sim = _symmetric_dense_sim(mod_name, candidate.name, sim_map)
             lex_ratio = _max_lexical_ratio(mod_name, candidate.name, comp_by_name)
             if (
                 lex_ratio >= lex_thresh
                 or sem_sim >= sem_thresh
                 or mod_name in refs_by_name.get(candidate.name, ())
-                or _claims_neighbor_name_phrase(mod_skill, candidate)
-                or _claims_neighbor_name_phrase(candidate, mod_skill)
+                or _has_bidirectional_name_claim(mod_skill, candidate, taxonomy_tokens)
             ):
                 neighbors.add(candidate.name)
 
@@ -1083,18 +944,62 @@ def _shared_trigger_terms(
     limit: int = 3,
 ) -> tuple[str, ...]:
     """Extract top shared high-IDF domain vocabulary terms between two skills."""
-    from reach.leak import FUNCTION_WORDS
+    from reach.leak import BACKGROUND_IDF, FUNCTION_WORDS
     from reach.retrieval import tokenize
 
-    ignored = FUNCTION_WORDS | _GENERIC_NAME_TOKENS | {"and"}
-    t1 = set(tokenize(s1.description)) - ignored
-    t2 = set(tokenize(s2.description)) - ignored
-    shared = [t for t in t1.intersection(t2) if len(t) >= _MIN_SHARED_TRIGGER_LENGTH]
+    shared_name_tokens = set(tokenize(s1.name)) & set(tokenize(s2.name))
+    ignored = FUNCTION_WORDS | shared_name_tokens
+    pos1 = f"{s1.name}\n{_positive_capability_text(s1.description) or s1.description}"
+    pos2 = f"{s2.name}\n{_positive_capability_text(s2.description) or s2.description}"
+    t1 = set(tokenize(pos1)) - ignored
+    t2 = set(tokenize(pos2)) - ignored
+    candidates = [t for t in t1.intersection(t2) if len(t) >= _MIN_SHARED_TRIGGER_LENGTH]
     if scorer is not None:
-        shared.sort(key=lambda term: (-scorer.idf(term), term))
+        if len(scorer.documents) >= _MIN_CORPUS_FOR_IDF_FLOOR:
+            high_idf = [t for t in candidates if scorer.idf(t) > BACKGROUND_IDF]
+            if high_idf:
+                candidates = high_idf
+        candidates.sort(key=lambda term: (-scorer.idf(term), term))
     else:
-        shared.sort()
-    return tuple(shared[:limit])
+        candidates.sort()
+    return tuple(candidates[:limit])
+
+
+class _PairHandoffContext(NamedTuple):
+    """Encapsulate pairwise routing handoff state between two skills."""
+
+    s1: Skill
+    s2: Skill
+    s1_to_s2: bool
+    s2_to_s1: bool
+    shared_terms: tuple[str, ...] = ()
+
+
+def _is_peer_one_way_handoff(
+    pair: _PairHandoffContext,
+    refs_by_name: Mapping[str, frozenset[str]],
+    out_degree: Mapping[str, int],
+    in_degree: Mapping[str, int],
+    *,
+    above_threshold: bool,
+) -> bool:
+    """Return True if either skill has a 1-to-1 peer handoff without reciprocation."""
+    if not above_threshold:
+        return False
+    s1_name, s2_name = pair.s1.name, pair.s2.name
+    s1_direct = s2_name.lower() in refs_by_name[s1_name]
+    s2_direct = s1_name.lower() in refs_by_name[s2_name]
+    return (
+        s1_direct
+        and not pair.s2_to_s1
+        and out_degree[s1_name] < _MAX_PEER_HANDOFF_DEGREE
+        and in_degree[s2_name] < _MAX_PEER_HANDOFF_DEGREE
+    ) or (
+        s2_direct
+        and not pair.s1_to_s2
+        and out_degree[s2_name] < _MAX_PEER_HANDOFF_DEGREE
+        and in_degree[s1_name] < _MAX_PEER_HANDOFF_DEGREE
+    )
 
 
 def _check_missing_mutual_handoffs(
@@ -1103,6 +1008,7 @@ def _check_missing_mutual_handoffs(
     cfg: LintSettings,
     dense_similarities: Mapping[tuple[str, str], float] | None = None,
     skill_filter: str | None = None,
+    semantics_by_name: Mapping[str, SkillLintSemantics] | None = None,
 ) -> list[LintIssue]:
     """Identify overlapping neighbor pairs with one-way or missing reciprocal routing handoffs."""
     if (
@@ -1111,15 +1017,26 @@ def _check_missing_mutual_handoffs(
     ):
         return []
 
+    import math
+
     from reach.overlap import rank_corpus
     from reach.retrieval import Bm25Scorer
 
-    scorer = Bm25Scorer.from_skills(skills)
-    overlap = rank_corpus(skills)
+    pos_skills = _positive_skills_corpus(skills)
+    scorer = Bm25Scorer.from_skills(pos_skills)
+    n_docs = len(scorer.documents)
+    pair_exclusive_idf = math.log(1.0 + max(0.5, n_docs - 2 + 0.5) / 2.5)
+    overlap = rank_corpus(pos_skills)
     comp_by_name = {c.skill: c for c in overlap.competitions}
-    refs_by_name = {
-        s.name: frozenset(extract_skill_references(s.description, self_name=s.name)) for s in skills
-    }
+    full_comp_by_name = {c.skill: c for c in rank_corpus(skills).competitions}
+    refs_by_name = _resolve_refs_by_name(skills, semantics_by_name)
+    taxonomy_tokens = _catalog_taxonomy_tokens(skills)
+
+    in_degree: Counter[str] = Counter()
+    out_degree = {s.name: len(refs_by_name[s.name]) for s in skills}
+    for s in skills:
+        for ref in refs_by_name[s.name]:
+            in_degree[ref] += 1
 
     issues: list[LintIssue] = []
     lex_thresh = cfg.mutual_handoff_lexical_threshold
@@ -1134,64 +1051,97 @@ def _check_missing_mutual_handoffs(
             if s1_to_s2 and s2_to_s1:
                 continue
 
-            max_lex_ratio = _max_lexical_ratio(s1.name, s2.name, comp_by_name)
-            sem_sim = 0.0
-            if dense_similarities is not None:
-                sem_sim = max(
-                    dense_similarities.get((s1.name, s2.name), 0.0),
-                    dense_similarities.get((s2.name, s1.name), 0.0),
-                )
-
-            one_way_handoff = (s1_to_s2 != s2_to_s1) and (
-                max_lex_ratio > 0.0 or sem_sim >= sem_thresh
+            unacknowledged = not s1_to_s2 and not s2_to_s1
+            pos_lex_ratio = _max_lexical_ratio(s1.name, s2.name, comp_by_name)
+            max_lex_ratio = (
+                max(pos_lex_ratio, _max_lexical_ratio(s1.name, s2.name, full_comp_by_name))
+                if unacknowledged
+                else pos_lex_ratio
             )
-            either_has_boundaries = bool(refs_by_name[s1.name] or refs_by_name[s2.name])
-            high_neighbor_contention = (
-                _claims_neighbor_name_phrase(s1, s2)
-                or _claims_neighbor_name_phrase(s2, s1)
-                or (sem_sim >= sem_thresh and max_lex_ratio >= lex_thresh)
-                or (
-                    either_has_boundaries and (max_lex_ratio >= lex_thresh or sem_sim >= sem_thresh)
+            sem_sim = _symmetric_dense_sim(s1.name, s2.name, dense_similarities)
+            shared_terms = _shared_trigger_terms(s1, s2, scorer)
+            pair = _PairHandoffContext(
+                s1=s1,
+                s2=s2,
+                s1_to_s2=s1_to_s2,
+                s2_to_s1=s2_to_s1,
+                shared_terms=shared_terms,
+            )
+            excl_count = sum(1 for t in shared_terms if scorer.idf(t) >= pair_exclusive_idf - 1e-6)
+            has_pair_exclusive_triggers = excl_count >= _MIN_PAIR_EXCLUSIVE_TRIGGERS
+            above_thresh = max_lex_ratio >= lex_thresh or sem_sim >= sem_thresh
+            one_way_handoff = _is_peer_one_way_handoff(
+                pair,
+                refs_by_name,
+                out_degree,
+                in_degree,
+                above_threshold=above_thresh,
+            )
+            high_neighbor_contention = _has_bidirectional_name_claim(s1, s2, taxonomy_tokens) or (
+                unacknowledged
+                and (
+                    (sem_sim >= sem_thresh and max_lex_ratio >= lex_thresh)
+                    or (above_thresh and has_pair_exclusive_triggers)
                 )
             )
 
             if not (one_way_handoff or high_neighbor_contention):
                 continue
 
-            shared_terms = _shared_trigger_terms(s1, s2, scorer)
-            shared_str = (
-                f" (shared triggers: {', '.join(repr(t) for t in shared_terms)})"
-                if shared_terms
-                else ""
+            _emit_mutual_handoff_pair_issues(
+                issues,
+                pair,
+                paths_by_name=paths_by_name,
+                cfg=cfg,
+                skill_filter=skill_filter,
             )
 
-            for subject, partner, subj_hands_to_partner in (
-                (s1, s2, s1_to_s2),
-                (s2, s1, s2_to_s1),
-            ):
-                if subj_hands_to_partner:
-                    msg = (
-                        f"Skill '{subject.name}' hands off to '{partner.name}', but "
-                        f"'{partner.name}' has no reciprocal handoff back to '{subject.name}'"
-                        f"{shared_str}."
-                    )
-                else:
-                    msg = (
-                        f"Skill '{subject.name}' overlaps with '{partner.name}'{shared_str} "
-                        f"but does not include a mutual routing handoff "
-                        f'(e.g. "Don\'t use for ... (use {partner.name})").'
-                    )
-                for skill_path in paths_by_name.get(subject.name, ()):
-                    _record_issue(
-                        issues,
-                        "missing-mutual-handoff",
-                        subject.name,
-                        skill_path,
-                        msg,
-                        cfg,
-                    )
-
     return issues
+
+
+def _emit_mutual_handoff_pair_issues(
+    issues: list[LintIssue],
+    pair: _PairHandoffContext,
+    *,
+    paths_by_name: Mapping[str, Sequence[Path]],
+    cfg: LintSettings,
+    skill_filter: str | None,
+) -> None:
+    """Append missing-mutual-handoff diagnostics for the side(s) lacking reciprocation."""
+    shared_str = (
+        f" (shared triggers: {', '.join(repr(t) for t in pair.shared_terms)})"
+        if pair.shared_terms
+        else ""
+    )
+    for subject, partner, subj_hands_to_partner in (
+        (pair.s1, pair.s2, pair.s1_to_s2),
+        (pair.s2, pair.s1, pair.s2_to_s1),
+    ):
+        if skill_filter is not None and subject.name != skill_filter:
+            continue
+        if subj_hands_to_partner and skill_filter is None:
+            continue
+        if subj_hands_to_partner:
+            msg = (
+                f"Skill '{subject.name}' hands off to '{partner.name}', but "
+                f"'{partner.name}' has no reciprocal handoff back to '{subject.name}'"
+                f"{shared_str}."
+            )
+        else:
+            msg = (
+                f"Skill '{subject.name}' overlaps with '{partner.name}'{shared_str} "
+                f"but does not include a mutual routing handoff "
+                f'(e.g. "Don\'t use for ... (use {partner.name})").'
+            )
+        for skill_path in paths_by_name.get(subject.name, ()):
+            _record_issue(
+                issues,
+                "missing-mutual-handoff",
+                subject.name,
+                skill_path,
+                msg,
+                cfg,
+            )
 
 
 def _compute_dense_similarities(skills: Sequence[Skill]) -> dict[tuple[str, str], float]:
@@ -1276,20 +1226,42 @@ def _lint_paths(
     all_issues: list[LintIssue] = []
     names_seen: Counter[str] = Counter()
     paths_by_name: dict[str, list[Path]] = {}
+    content_hash_by_name: dict[str, str] = {}
     valid_skills: list[Skill] = []
     skills_checked = 0
 
-    for file_path in file_paths:
+    ordered_paths = sorted(file_paths, key=lambda p: (len(p.parts), str(p)))
+    for file_path in ordered_paths:
+        try:
+            raw_bytes = file_path.read_bytes()
+            file_digest = hashlib.sha256(raw_bytes).hexdigest()
+        except OSError:
+            raw_bytes = b""
+            file_digest = ""
+
         file_report = lint_file(file_path, config=cfg)
         skill_name = file_report.skill_name or file_path.parent.name
 
+        is_plugin_or_hidden_mirror = "plugins" in file_path.parts or any(
+            part.startswith(".") for part in file_path.parts
+        )
+        if (
+            file_digest
+            and is_plugin_or_hidden_mirror
+            and skill_name in content_hash_by_name
+            and content_hash_by_name[skill_name] == file_digest
+        ):
+            continue
+
+        content_hash_by_name.setdefault(skill_name, file_digest)
         names_seen[skill_name] += 1
         paths_by_name.setdefault(skill_name, []).append(file_path)
 
         try:
-            parsed = parse_frontmatter(file_path.read_text(encoding="utf-8"), file_path)
-            if parsed is not None and parsed.description:
-                valid_skills.append(parsed)
+            if names_seen[skill_name] == 1:
+                parsed = parse_frontmatter(raw_bytes.decode("utf-8"), file_path)
+                if parsed is not None and parsed.description:
+                    valid_skills.append(parsed)
         except (OSError, yaml.YAMLError, UnicodeDecodeError):
             pass
 
@@ -1305,6 +1277,7 @@ def _lint_paths(
         or _resolve_severity("missing-mutual-handoff", cfg) is not None
     )
     dense_sims = _compute_dense_similarities(valid_skills) if need_dense else {}
+    semantics_by_name = extract_corpus_semantics(valid_skills)
 
     corpus_issues: list[LintIssue] = []
     corpus_issues.extend(_check_duplicates(names_seen, paths_by_name, cfg))
@@ -1318,7 +1291,13 @@ def _lint_paths(
     )
     corpus_issues.extend(_check_declared_dependencies(valid_skills, names_seen, paths_by_name, cfg))
     corpus_issues.extend(
-        _check_unknown_skill_references(valid_skills, names_seen, paths_by_name, cfg)
+        _check_unknown_skill_references(
+            valid_skills,
+            names_seen,
+            paths_by_name,
+            cfg,
+            semantics_by_name=semantics_by_name,
+        )
     )
     corpus_issues.extend(
         _check_missing_mutual_handoffs(
@@ -1327,6 +1306,7 @@ def _lint_paths(
             cfg,
             dense_similarities=dense_sims,
             skill_filter=skill_filter,
+            semantics_by_name=semantics_by_name,
         )
     )
 
@@ -1355,7 +1335,11 @@ def lint_tree(
     """
     resolved_root = resolve_path(root)
     cfg = config if config is not None else LintSettings.from_settings()
-    return _lint_paths(_skill_files(resolved_root), cfg, skill_filter=skill_filter)
+    return _lint_paths(
+        _skill_files(resolved_root),
+        cfg,
+        skill_filter=skill_filter,
+    )
 
 
 def lint_skills(

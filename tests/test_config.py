@@ -1750,7 +1750,7 @@ def test_plan_settings_workers_validation_and_digest_invariance(tmp_path: Path) 
     assert PlanSettings().workers == 1
     assert PlanSettings(workers=8).workers == 8
     with pytest.raises(ValidationError):
-        PlanSettings(workers=0)
+        PlanSettings(workers=int("0"))
 
     toml_path = write_toml(
         tmp_path,
