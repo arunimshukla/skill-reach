@@ -60,7 +60,13 @@ _POSITIVE_HANDOFF_VERB: Final = (
 )
 _KEBAB_ID: Final = r"[a-z0-9]+(?:-[a-z0-9]+)+"
 _KEBAB_ID_RE: Final = re.compile(_KEBAB_ID, re.IGNORECASE)
-_KEBAB_TOKEN: Final = rf"{_KEBAB_ID}(?:-\*)?"
+_WILDCARD_PATTERN: Final = r"[a-z0-9]+(?:-[a-z0-9]+)*-\*"
+_KEBAB_TOKEN: Final = rf"(?:{_KEBAB_ID}|{_WILDCARD_PATTERN})"
+_KEBAB_TOKEN_RE: Final = re.compile(_KEBAB_TOKEN, re.IGNORECASE)
+_TARGET_TOKEN_RE: Final = re.compile(
+    rf"(?P<bt>`?)(?P<token>{_KEBAB_TOKEN})(?P=bt)",
+    re.IGNORECASE,
+)
 
 #: Matches a kebab-case token when backticked or in terminal noun position
 #: (followed by clause punctuation, end-of-string, 'instead', 'first', singular 'skill',
@@ -91,7 +97,7 @@ _PAREN_HANDOFF_RE: Final = re.compile(
 )
 
 _BACKTICK_HANDOFF_RE: Final = re.compile(
-    rf"{_POSITIVE_HANDOFF_VERB}\s+(?:the\s+)?`({_KEBAB_ID})(?:-\*)?`",
+    rf"{_POSITIVE_HANDOFF_VERB}\s+(?:the\s+)?`({_KEBAB_TOKEN})`",
     re.IGNORECASE,
 )
 
@@ -110,7 +116,7 @@ _VERB_TARGET_IN_CLAUSE_RE: Final = re.compile(
 _HANDOFF_CANDIDATE_PREFILTER_RE: Final = re.compile(
     r"\b(?:don't\s+use|do\s+not\s+use|not\s+for\b|never\s+use|avoid\s+using|"
     r"instead\b|rather\s+than\b|see\b|prefer\b|refer\s+to\b|defer\s+to\b|"
-    r"delegate\s+to\b|hand\s+off\s+to\b|use\s+(?:the\s+)?`?[a-z0-9]+-[a-z0-9-]+|"
+    r"delegate\s+to\b|hand\s+off\s+to\b|use\s+(?:the\s+)?`?[a-z0-9]+-[a-z0-9*-]+|"
     r"any\b|all\b|every\b|universal\b|general[- ]purpose\b|all[- ]in[- ]one\b)\b",
     re.IGNORECASE,
 )
@@ -149,6 +155,7 @@ def detect_unbounded_attractor(description: str) -> str | None:
 
 
 KEBAB_NAME_RE: Final = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
+_NON_SKILL_SUFFIXES: Final[tuple[str, ...]] = ("-specific", "-related")
 
 
 def _derive_reserved_tool_names() -> frozenset[str]:
@@ -166,14 +173,23 @@ def _derive_reserved_tool_names() -> frozenset[str]:
 RESERVED_TOOL_NAMES: Final[frozenset[str]] = _derive_reserved_tool_names()
 
 
-def _add_if_valid_ref(found: set[str], token: str, self_lower: str | None) -> None:
+def _add_if_valid_ref(
+    found: set[str],
+    token: str,
+    self_lower: str | None,
+    *,
+    is_explicit_backtick: bool = False,
+) -> None:
     """Add normalized kebab-case reference token if non-empty and not self."""
-    cleaned = token.strip().rstrip("*").rstrip("-").lower()
+    raw_token = token.strip().lower()
+    is_wildcard = raw_token.endswith("-*")
+    cleaned = raw_token.removesuffix("-*")
     if (
         cleaned
-        and "-" in cleaned
+        and ("-" in cleaned or is_wildcard)
         and cleaned != self_lower
         and KEBAB_NAME_RE.match(cleaned)
+        and (is_explicit_backtick or not cleaned.endswith(_NON_SKILL_SUFFIXES))
         and cleaned not in RESERVED_TOOL_NAMES
     ):
         found.add(cleaned)
@@ -207,18 +223,30 @@ def extract_skill_references(
     found: set[str] = set()
 
     for match in _PAREN_HANDOFF_RE.finditer(description):
-        for token in _KEBAB_ID_RE.findall(match.group("targets")):
-            _add_if_valid_ref(found, token, self_lower)
+        targets = match.group("targets")
+        for m in _TARGET_TOKEN_RE.finditer(targets):
+            _add_if_valid_ref(
+                found,
+                m.group("token"),
+                self_lower,
+                is_explicit_backtick=bool(m.group("bt")),
+            )
 
     for match in _BACKTICK_HANDOFF_RE.finditer(description):
-        _add_if_valid_ref(found, match.group(1), self_lower)
+        _add_if_valid_ref(found, match.group(1), self_lower, is_explicit_backtick=True)
 
     for sentence in re.split(r"[.!?]+", description):
         if not _NEGATIVE_CLAUSE_MARKER_RE.search(sentence):
             continue
         for match in _VERB_TARGET_IN_CLAUSE_RE.finditer(sentence):
-            for token in _KEBAB_ID_RE.findall(match.group("targets")):
-                _add_if_valid_ref(found, token, self_lower)
+            targets = match.group("targets")
+            for m in _TARGET_TOKEN_RE.finditer(targets):
+                _add_if_valid_ref(
+                    found,
+                    m.group("token"),
+                    self_lower,
+                    is_explicit_backtick=bool(m.group("bt")),
+                )
 
     return tuple(sorted(found))
 

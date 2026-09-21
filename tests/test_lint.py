@@ -1202,3 +1202,59 @@ def test_acronym_name_claim_and_suffix_subject_guard(tmp_path: Path) -> None:
         path=tmp_path / "pyperf",
     )
     assert not _claims_neighbor_name_phrase(numpy_skill, python_perf, frozenset({"code"}))
+
+
+@pytest.mark.parametrize(
+    ("description", "expected_refs"),
+    [
+        (
+            "Use this skill when writing code or prefer that skill instead.",
+            (),
+        ),
+        (
+            (
+                "Don't use for product-specific or domain-related tasks "
+                "(use web-api-basics instead)."
+            ),
+            ("web-api-basics",),
+        ),
+        (
+            "For language-specific configuration, prefer the framework-related skill first.",
+            (),
+        ),
+    ],
+    ids=[
+        "qualified-this-that-prose",
+        "specific-and-related-in-clause",
+        "specific-and-related-qualified",
+    ],
+)
+def test_extract_skill_references_ignores_this_and_specific_related_suffixes(
+    description: str,
+    expected_refs: tuple[str, ...],
+) -> None:
+    """Verify 'use this skill' and '-specific'/'-related' modifiers are not extracted."""
+    from reach.lint import extract_skill_references
+
+    assert extract_skill_references(description, self_name="my-skill") == expected_refs
+
+
+def test_find_unknown_skill_references_matches_wildcard_prefix_families() -> None:
+    """Verify '-*' skill family references match known_skills sharing that prefix."""
+    from reach.lint import find_unknown_skill_references
+
+    desc = (
+        "Routes general backend queries. Don't use for container orchestration "
+        "(use `k8s-*` or `ci-pipeline-*` instead, or defer to `nonexistent-family-*`)."
+    )
+    known = {"k8s-basics", "k8s-networking", "ci-pipeline-deploy"}
+    unknown = find_unknown_skill_references(desc, known, self_name="backend-router")
+    assert unknown == ("nonexistent-family",)
+
+
+def test_extract_skill_references_preserves_backticked_specific_and_related_skills() -> None:
+    """Ensure explicit backticked references are retained despite suffixes."""
+    from reach.lint import extract_skill_references
+
+    desc = "For database cluster tasks, defer to `service-specific` or prefer `db-related`."
+    assert extract_skill_references(desc) == ("db-related", "service-specific")
