@@ -30,6 +30,8 @@ from pydantic import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from reach.runtime import CatalogFit, SelectionOutcome
 
 __all__ = [
@@ -155,7 +157,9 @@ class Query(BaseModel):
     )
     acceptable_skills: tuple[str, ...] = Field(
         default_factory=tuple,
-        description="Optional secondary skill names considered valid matches for this query.",
+        description=(
+            "Optional neutral router/helper skill names neither rewarded as TP nor penalized as FP."
+        ),
     )
     notes: str = Field(default="", description="Author notes, rationale, or difficulty context.")
 
@@ -183,22 +187,65 @@ class Query(BaseModel):
 
     @property
     def valid_skills(self) -> frozenset[str]:
-        """Return all valid target skill names (expected_skill plus acceptable_skills)."""
+        """Return valid target skill names (strictly expected_skill; acceptable are neutral)."""
         if self.expected_skill is None:
             return frozenset()
-        return frozenset((self.expected_skill, *self.acceptable_skills))
+        return frozenset((self.expected_skill,))
+
+    def scored_invocations(self, invoked_skills: Sequence[str]) -> tuple[str, ...]:
+        """Return invoked skills with neutral acceptable_skills stripped out."""
+        if not self.acceptable_skills:
+            return tuple(invoked_skills)
+        neutral = frozenset(self.acceptable_skills)
+        return tuple(s for s in invoked_skills if s not in neutral)
+
+    def effective_invoked_skill(
+        self,
+        probe_or_skill: ProbeResult | str | None = None,
+        invoked_skills: Sequence[str] = (),
+    ) -> str | None:
+        """Return the first non-neutral invoked skill from a probe or sequence."""
+        if isinstance(probe_or_skill, ProbeResult):
+            raw_seq = (
+                tuple(probe_or_skill.invoked_skills)
+                if probe_or_skill.invoked_skills
+                else (
+                    (probe_or_skill.invoked_skill,)
+                    if probe_or_skill.invoked_skill is not None
+                    else ()
+                )
+            )
+        elif invoked_skills:
+            raw_seq = tuple(invoked_skills)
+        elif probe_or_skill is not None:
+            raw_seq = (probe_or_skill,)
+        else:
+            raw_seq = ()
+
+        scored = self.scored_invocations(raw_seq)
+        return scored[0] if scored else None
 
     def matches_skill(self, invoked: str | None) -> bool:
-        """Check whether an invoked skill satisfies expected_skill or acceptable_skills."""
+        """Check whether an invoked skill satisfies expected_skill."""
         if self.expected_skill is None:
             return invoked is None
         return invoked is not None and invoked in self.valid_skills
 
-    def effective_predicted_label(self, predicted_label: str) -> str:
-        """Normalize an acceptable secondary skill selection to truth_label for scoring."""
-        if self.expected_skill is not None and predicted_label in self.acceptable_skills:
-            return self.truth_label
-        return predicted_label
+    def effective_predicted_label(
+        self,
+        probe_or_label: ProbeResult | str,
+        invoked_skills: Sequence[str] = (),
+    ) -> str:
+        """Return the scored primary prediction label after stripping neutral skills."""
+        if isinstance(probe_or_label, ProbeResult):
+            eff = self.effective_invoked_skill(probe_or_label)
+            return eff if eff is not None else NO_SKILL
+        if invoked_skills:
+            eff = self.effective_invoked_skill(probe_or_label, invoked_skills)
+            return eff if eff is not None else NO_SKILL
+        if probe_or_label in self.acceptable_skills:
+            return NO_SKILL
+        return probe_or_label
 
 
 class Catalog(BaseModel):

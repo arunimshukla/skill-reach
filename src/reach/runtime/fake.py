@@ -29,7 +29,6 @@ from reach.runtime import (
     SelectionOutcome,
     SessionSummary,
     SkillRoot,
-    TrajectoryTracker,
     resolve_options,
 )
 from reach.runtime.generator import BaseTextGenerator
@@ -215,37 +214,20 @@ class FakeRuntime(AgentRuntime[FakeOptions]):
                     return answer
                 return answer.model_copy(update={"observed_catalog": self._resident})
 
-            if isinstance(answer, Sequence) and not isinstance(answer, str):
-                tracker = TrajectoryTracker(
-                    target_skill=target_skill,
-                    max_turns=self.options.max_turns,
-                    early_exit=self.options.early_exit,
-                )
-                for s in answer:
-                    if tracker.observe(s) or len(tracker.invoked_skills) >= self.options.max_turns:
-                        break
-                return SelectionOutcome(
-                    invoked_skills=tuple(tracker.invoked_skills),
-                    early_exit=tracker.early_exit_hit,
-                    turns_taken=tracker.turns_taken,
+            raw_skills = (
+                (answer,)
+                if isinstance(answer, str)
+                else (tuple(s for s in answer if s) if answer else ())
+            )
+            return self.make_tracker(target_skill).apply_to_outcome(
+                SelectionOutcome(
+                    invoked_skills=raw_skills,
+                    turns_taken=len(raw_skills) or 1,
                     observed_catalog=self._resident,
                     observed_tools=("Skill",),
                     cost_usd=self.cost_usd,
                     duration_ms=1,
-                )
-
-            invoked_skills = (answer,) if answer is not None else ()
-            early_exit_hit = bool(
-                self.options.early_exit and answer is not None and answer == target_skill,
-            )
-            return SelectionOutcome(
-                invoked_skills=invoked_skills,
-                early_exit=early_exit_hit,
-                turns_taken=1,
-                observed_catalog=self._resident,
-                observed_tools=("Skill",),
-                cost_usd=self.cost_usd,
-                duration_ms=1,
+                ),
             )
         finally:
             self.post_probe(workdir)

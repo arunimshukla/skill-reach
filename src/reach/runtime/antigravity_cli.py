@@ -471,10 +471,10 @@ class AntigravityCliRuntime(CliAgentRuntime[AntigravityCliOptions], AntigravityR
         timeout_s = self.timeout_s or 200
         timeout_val = options.print_timeout or f"{round(timeout_s)}s"
         command += ["--print-timeout", timeout_val]
-        if self._resident:
+        if options.json_schema:
             command += [
                 "--json-schema",
-                self.selection_json_schema(self._resident),
+                options.json_schema,
             ]
         if self.effective_effort:
             command += ["--effort", self.effective_effort]

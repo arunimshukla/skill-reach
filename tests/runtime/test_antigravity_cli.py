@@ -675,25 +675,29 @@ def test_command_uses_explicit_print_timeout(home_dir: Path) -> None:
     assert cmd[cmd.index("--print-timeout") + 1] == "45s"
 
 
-def test_command_carries_the_schema_naming_the_resident_catalog(
+def test_command_omits_schema_by_default_even_with_resident_skills(
     runtime: AntigravityCliRuntime,
 ) -> None:
-    """Verify build_command passes JSON schema matching resident catalog."""
+    """Verify build_command omits --json-schema by default to preserve organic selection."""
+    runtime._resident = ("a", "b")
+    command = runtime.build_command("q")
+    assert "--json-schema" not in command
+
+
+def test_command_includes_explicit_json_schema_when_configured(
+    home_dir: Path,
+) -> None:
+    """Verify build_command passes --json-schema when explicitly configured in options."""
+    explicit_schema = AntigravityCliRuntime.selection_json_schema(("a", "b"))
+    runtime = AntigravityCliRuntime(
+        options=AntigravityCliOptions(home_dir=home_dir, json_schema=explicit_schema),
+    )
     runtime._resident = ("a", "b")
     command = runtime.build_command("q")
     schema = json.loads(command[command.index("--json-schema") + 1])
     branches = schema["properties"]["selected_skill"]["anyOf"]
     enum = next(b["enum"] for b in branches if "enum" in b)
     assert sorted(enum) == ["a", "b"]
-
-
-def test_command_omits_schema_when_no_resident_skills(
-    runtime: AntigravityCliRuntime,
-) -> None:
-    """Verify build_command omits JSON schema when resident catalog is empty."""
-    runtime._resident = ()
-    command = runtime.build_command("q")
-    assert "--json-schema" not in command
 
 
 def test_effort_is_omitted_when_unset(runtime: AntigravityCliRuntime) -> None:
@@ -1524,12 +1528,12 @@ def test_antigravity_cli_registers_atexit_for_temp_home(
         (3, True),
     ],
 )
-def test_antigravity_cli_enforces_schema_in_both_single_and_multi_turn(
+def test_antigravity_cli_omits_forced_schema_in_both_single_and_multi_turn(
     max_turns: int,
     early_exit: bool,
     home_dir: Path,
 ) -> None:
-    """Verify AntigravityCliRuntime configures catalog response schema regardless of turn mode."""
+    """Verify AntigravityCliRuntime omits forced --json-schema in both single and multi-turn."""
     rt = AntigravityCliRuntime(
         options=AntigravityCliOptions(
             home_dir=home_dir,
@@ -1539,12 +1543,8 @@ def test_antigravity_cli_enforces_schema_in_both_single_and_multi_turn(
     )
     rt._resident = ("skill-a", "skill-b")
     cmd = rt.build_command("query")
-    assert "--json-schema" in cmd
+    assert "--json-schema" not in cmd
     assert "--disable-slash-commands" in cmd
-    schema = json.loads(cmd[cmd.index("--json-schema") + 1])
-    branches = schema["properties"]["selected_skill"]["anyOf"]
-    enum = next(b["enum"] for b in branches if "enum" in b)
-    assert sorted(enum) == ["skill-a", "skill-b"]
 
 
 def test_antigravity_cli_generator_normalized_model_delegates_to_normalize_agy_model() -> None:

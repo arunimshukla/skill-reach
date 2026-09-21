@@ -108,24 +108,32 @@ def test_tool_name_passes_a_custom_tool_name_through() -> None:
     assert _tool_name("my_mcp_tool") == "my_mcp_tool"
 
 
-def test_select_config_builds_for_a_singleton_resident_catalog(
+def test_select_config_omits_response_schema_by_default_and_respects_explicit_json_schema(
     runtime: AntigravitySdkRuntime,
     tmp_path: Path,
 ) -> None:
-    """Verify _select_config constructs valid JSON response schema for singleton catalog."""
+    """Verify _select_config omits response_schema by default and applies explicit json_schema."""
     runtime._resident = ("gke-basics",)
     config = runtime._select_config(tmp_path / "work")
-    assert isinstance(config.response_schema, str)
-    schema = json.loads(config.response_schema)
+    assert config.response_schema is None
+
+    explicit_schema = runtime.selection_json_schema(runtime._resident)
+    rt_explicit = AntigravitySdkRuntime(
+        options=AntigravitySdkOptions(model="test-model", json_schema=explicit_schema),
+    )
+    rt_explicit._resident = ("gke-basics",)
+    cfg_explicit = rt_explicit._select_config(tmp_path / "work")
+    assert isinstance(cfg_explicit.response_schema, str)
+    schema = json.loads(cfg_explicit.response_schema)
     selected = schema["properties"]["selected_skill"]
     assert {"const": "gke-basics", "type": "string"} in selected["anyOf"]
 
 
-def test_select_config_enables_only_finish(
+def test_select_config_enables_multi_turn_tools_across_all_turn_budgets(
     runtime: AntigravitySdkRuntime,
     tmp_path: Path,
 ) -> None:
-    """Verify _select_config enables multi-turn tools by default and FINISH when max_turns=1."""
+    """Verify _select_config enables MULTI_TURN_SELECTION_TOOLS for max_turns=3 and max_turns=1."""
     from reach.runtime.antigravity_sdk import MULTI_TURN_SELECTION_TOOLS
 
     runtime._resident = ("a", "b")
@@ -140,18 +148,17 @@ def test_select_config_enables_only_finish(
     )
     single_turn_rt._resident = ("a", "b")
     single_cfg = single_turn_rt._select_config(tmp_path / "work")
-    assert single_cfg.capabilities.enabled_tools == [ag_types.BuiltinTools.FINISH]
+    assert single_cfg.capabilities.enabled_tools == list(MULTI_TURN_SELECTION_TOOLS)
+    assert single_cfg.budget_config is not None
+    assert single_cfg.budget_config.max_model_calls == 1
 
 
-def test_select_config_names_the_resident_catalog_in_the_schema(
+def test_selection_schema_names_the_resident_catalog(
     runtime: AntigravitySdkRuntime,
-    tmp_path: Path,
 ) -> None:
-    """Verify generated response schema contains enum of resident skill names."""
+    """Verify selection_json_schema helper contains enum of resident skill names."""
     runtime._resident = ("gke-basics", "gcs-lifecycle-rules")
-    config = runtime._select_config(tmp_path / "work")
-    assert isinstance(config.response_schema, str)
-    schema = json.loads(config.response_schema)
+    schema = json.loads(runtime.selection_json_schema(runtime._resident))
     selected = schema["properties"]["selected_skill"]
     enum_values = next(branch["enum"] for branch in selected["anyOf"] if "enum" in branch)
     assert sorted(enum_values) == ["gcs-lifecycle-rules", "gke-basics"]
@@ -668,12 +675,12 @@ def test_generator_build_env_sanitizes_blocked_env_vars(
         (3, True),
     ],
 )
-def test_antigravity_sdk_enforces_schema_in_both_single_and_multi_turn(
+def test_antigravity_sdk_omits_forced_schema_in_both_single_and_multi_turn(
     max_turns: int,
     early_exit: bool,
     tmp_path: Path,
 ) -> None:
-    """Verify AntigravitySdkRuntime configures catalog response schema regardless of turn mode."""
+    """Verify AntigravitySdkRuntime omits forced response_schema in both single and multi-turn."""
     rt = AntigravitySdkRuntime(
         options=AntigravitySdkOptions(
             model="test-model",
@@ -684,7 +691,30 @@ def test_antigravity_sdk_enforces_schema_in_both_single_and_multi_turn(
     )
     rt._resident = ("skill-a", "skill-b")
     config = rt._select_config(tmp_path)
-    assert config.response_schema is not None
+    assert config.response_schema is None
+
+
+def test_select_organic_text_abstention_vs_empty_rate_limit(
+    monkeypatch: pytest.MonkeyPatch,
+    runtime: AntigravitySdkRuntime,
+    tmp_path: Path,
+) -> None:
+    """Verify non-empty text response without view_file is an abstention, not an error."""
+    runtime._resident = ("gke-basics",)
+    _fake_agent(
+        monkeypatch,
+        _FakeResponse(
+            structured=None,
+            text="You can create a regional bucket with gcloud storage buckets create.",
+            tool_calls=[],
+        ),
+    )
+    abstention = runtime.select("how do I create a bucket?", tmp_path / "work")
+    assert abstention.error is None
+    assert abstention.invoked_skills == ()
+    assert abstention.reasoning == (
+        "You can create a regional bucket with gcloud storage buckets create.",
+    )
 
 
 def test_build_model_spec_plain_and_effort() -> None:
@@ -730,7 +760,15 @@ def test_select_async_hook_intercepts_target_skill_early_exit(
     hook_fn = instances[0].config.hooks[0]
 
     async def invoke_hook() -> None:
-        # Test invoking the registered hook with matching target skill
+        # Test non-matching skill on Turn 1 (allowed to continue)
+        tool_call_other = ag_types.ToolCall(
+            name="view_file",
+            args={"path": "/workspace/.agents/skills/cloud-run-basics/SKILL.md"},
+        )
+        result_other = await hook_fn(tool_call_other)
+        assert result_other.allow is True
+
+        # Test invoking the registered hook with matching target skill on Turn 2 (early-exit deny)
         tool_call_match = ag_types.ToolCall(
             name="view_file",
             args={"path": "/workspace/.agents/skills/gke-basics/SKILL.md"},
@@ -738,13 +776,9 @@ def test_select_async_hook_intercepts_target_skill_early_exit(
         result_match = await hook_fn(tool_call_match)
         assert result_match.allow is False
 
-        # Test non-matching skill
-        tool_call_other = ag_types.ToolCall(
-            name="view_file",
-            args={"path": "/workspace/.agents/skills/cloud-run-basics/SKILL.md"},
-        )
-        result_other = await hook_fn(tool_call_other)
-        assert result_other.allow is True
+        # Verify post-exit lock: any subsequent tool call after early_exit_hit remains denied
+        result_after_exit = await hook_fn(tool_call_other)
+        assert result_after_exit.allow is False
 
     asyncio.run(invoke_hook())
 
@@ -1003,8 +1037,10 @@ def test_select_async_hook_records_skill_when_early_exit_false_and_allows_view_f
     ("max_turns", "early_exit", "allowed_tools", "expect_multi_turn"),
     [
         pytest.param(3, True, (), True, id="default-early-exit-uses-multi-turn-selection-tools"),
-        pytest.param(1, True, (), False, id="single-turn-early-exit-uses-selection-tools"),
-        pytest.param(1, False, (), False, id="single-turn-uses-selection-tools"),
+        pytest.param(
+            1, True, (), True, id="single-turn-early-exit-uses-multi-turn-selection-tools"
+        ),
+        pytest.param(1, False, (), True, id="single-turn-uses-multi-turn-selection-tools"),
         pytest.param(
             3, False, (), True, id="multi-turn-trajectory-uses-multi-turn-selection-tools"
         ),
@@ -1460,3 +1496,21 @@ def test_select_preserves_observed_catalog_on_timeout_and_exception(
     exc_outcome = rt.select("q", tmp_path / "work")
     assert exc_outcome.error == "connection reset"
     assert exc_outcome.observed_catalog == ("gke-basics", "cloud-run-basics")
+
+
+def test_trajectory_tracker_enforces_max_turns_when_early_exit_disabled() -> None:
+    """Verify TrajectoryTracker.apply_to_outcome truncates at max_turns when early_exit=False."""
+    from reach.runtime import SelectionOutcome, TrajectoryTracker
+
+    tracker = TrajectoryTracker(target_skill="s1", max_turns=2, early_exit=False)
+    assert tracker.observe("s1") is False
+    assert tracker.observe("s2") is False
+    assert tracker.observe("s3") is False
+    assert tracker.early_exit_hit is False
+
+    normalized = tracker.apply_to_outcome(
+        SelectionOutcome(invoked_skills=("s1", "s2", "s3"), turns_taken=3),
+    )
+    assert normalized.invoked_skills == ("s1", "s2")
+    assert normalized.turns_taken == 2
+    assert normalized.early_exit is False
