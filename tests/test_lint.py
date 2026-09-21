@@ -1089,19 +1089,16 @@ def test_extract_corpus_semantics_deterministic_pre_filter(tmp_path: Path) -> No
         Skill(
             name="skill-a",
             description="Do not use for specialized tasks; use target-one instead.",
-            body="Body A",
             path=tmp_path / "a" / "SKILL.md",
         ),
         Skill(
             name="skill-b",
             description="Assist with any task. For specialized tasks, defer to target-two.",
-            body="Body B",
             path=tmp_path / "b" / "SKILL.md",
         ),
         Skill(
             name="skill-plain",
             description="Profiles CPU and memory bottlenecks in Python scripts.",
-            body="Body Plain",
             path=tmp_path / "plain" / "SKILL.md",
         ),
     ]
@@ -1132,37 +1129,31 @@ def test_shared_trigger_terms_uses_corpus_idf_without_stopword_list(tmp_path: Pa
         Skill(
             name="k8s-deploy",
             description="Guide for project workflow deploying kubernetes helm charts.",
-            body="",
             path=tmp_path / "1",
         ),
         Skill(
             name="k8s-debug",
             description="Guide for project workflow debugging kubernetes helm releases.",
-            body="",
             path=tmp_path / "2",
         ),
         Skill(
             name="doc-1",
             description="Guide for project workflow documentation and release notes.",
-            body="",
             path=tmp_path / "3",
         ),
         Skill(
             name="doc-2",
             description="Guide for project workflow testing and continuous integration.",
-            body="",
             path=tmp_path / "4",
         ),
         Skill(
             name="doc-3",
             description="Guide for project workflow formatting and static analysis.",
-            body="",
             path=tmp_path / "5",
         ),
         Skill(
             name="doc-4",
             description="Guide for project workflow packaging and publishing artifacts.",
-            body="",
             path=tmp_path / "6",
         ),
     ]
@@ -1187,13 +1178,11 @@ def test_acronym_name_claim_and_suffix_subject_guard(tmp_path: Path) -> None:
     tdd = Skill(
         name="tdd",
         description="Test-driven development. Use when building features test-first.",
-        body="",
         path=tmp_path / "tdd",
     )
     full = Skill(
         name="test-driven-development",
         description="Use when implementing any feature before writing implementation code.",
-        body="",
         path=tmp_path / "test-driven-development",
     )
     assert _claims_neighbor_name_phrase(tdd, full, frozenset({"use"}))
@@ -1203,7 +1192,6 @@ def test_acronym_name_claim_and_suffix_subject_guard(tmp_path: Path) -> None:
         description=(
             "Best practices for NumPy array programming and performance optimization in Python."
         ),
-        body="",
         path=tmp_path / "numpy",
     )
     python_perf = Skill(
@@ -1211,7 +1199,6 @@ def test_acronym_name_claim_and_suffix_subject_guard(tmp_path: Path) -> None:
         description=(
             "Profile and optimize Python code using cProfile and performance best practices."
         ),
-        body="",
         path=tmp_path / "pyperf",
     )
     assert not _claims_neighbor_name_phrase(numpy_skill, python_perf, frozenset({"code"}))

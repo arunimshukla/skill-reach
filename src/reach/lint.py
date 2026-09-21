@@ -1236,6 +1236,7 @@ def _lint_paths(
             raw_bytes = file_path.read_bytes()
             file_digest = hashlib.sha256(raw_bytes).hexdigest()
         except OSError:
+            raw_bytes = b""
             file_digest = ""
 
         file_report = lint_file(file_path, config=cfg)

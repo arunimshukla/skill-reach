@@ -304,7 +304,7 @@ def _adjust_eval_catalog_mode(
                 study_overrides["rescope"] = True
             return settings.with_overrides(
                 catalog={"mode": CatalogMode.ALL},
-                study=study_overrides or None,
+                study=study_overrides,
             )
         if study_overrides:
             return settings.with_overrides(study=study_overrides)
