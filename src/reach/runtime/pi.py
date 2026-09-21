@@ -38,6 +38,7 @@ from reach.runtime._env import (
 )
 from reach.runtime._fs import (
     ensure_private_directory,
+    extract_tool_path,
     probe_slot_dir,
     resolve_skill_from_path,
 )
@@ -93,8 +94,7 @@ def _extract_pi_tool_call(
     if t_name == "read":
         args = item.get("arguments")
         if isinstance(args, dict):
-            r_path = str(args.get("path", ""))
-            skill = resolve_skill_from_path(r_path, resident)
+            skill = resolve_skill_from_path(extract_tool_path(args), resident)
     return t_name, skill
 
 

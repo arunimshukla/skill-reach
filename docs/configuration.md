@@ -319,6 +319,7 @@ Controls probe replication and network resilience.
 | `retries`   | Integer | `2`     | Number of times to retry a probe if an agent throws a transient API or network error. |
 | `backoff_s` | Float   | `5.0`   | Initial backoff time in seconds between retries.                                      |
 | `pause_s`   | Float   | `0.0`   | Delay between consecutive probes to respect provider rate limits.                     |
+| `workers`   | Integer | `1`     | Number of concurrent worker threads executing probes in parallel.                     |
 
 ### `[runtime]`
 

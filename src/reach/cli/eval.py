@@ -479,7 +479,6 @@ def _probe_and_record(
     no_resume: bool,
     append_across_arms: bool,
     allow_truncation: bool,
-    concurrency: int,
     verbose: bool,
     reasoning: bool = False,
 ) -> int:
@@ -502,7 +501,7 @@ def _probe_and_record(
         bank=bank,
         verbose=verbose,
         reasoning=reasoning,
-        workers=concurrency,
+        workers=settings.plan.workers,
     )
     if (
         quick is not None
@@ -617,13 +616,6 @@ def _eval(
             "measuring it with the descriptions it will really show",
         ),
     ] = False,
-    concurrency: Annotated[
-        int,
-        Parameter(
-            name=["--concurrency", "-j"],
-            help="Number of concurrent probes to run (defaults to 1 for sequential execution)",
-        ),
-    ] = 1,
     auto: Annotated[
         bool,
         SWITCH,
@@ -731,7 +723,6 @@ def _eval(
             no_resume=no_resume,
             append_across_arms=append_across_arms,
             allow_truncation=allow_truncation,
-            concurrency=concurrency,
             verbose=verbose,
             reasoning=reasoning,
         )

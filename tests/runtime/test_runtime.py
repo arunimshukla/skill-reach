@@ -1141,16 +1141,39 @@ def test_cli_agent_reports_subprocess_failure(
 
 
 def test_resolve_skill_from_path_variations() -> None:
-    """Verify resolve_skill_from_path handles paths, casing, None, and edge cases."""
-    residents = ("cloud-deploy", "pizza-calculator")
+    """Verify resolve_skill_from_path handles paths, bare skill dirs, casing, and edge cases."""
+    residents = ["cloud-deploy", "pizza-calculator"]
     assert resolve_skill_from_path("/path/to/cloud-deploy/SKILL.md", residents) == "cloud-deploy"
     assert resolve_skill_from_path("cloud-deploy/skill.md", residents) == "cloud-deploy"
+    assert (
+        resolve_skill_from_path("/path/to/.agents/skills/cloud-deploy", residents) == "cloud-deploy"
+    )
+    assert (
+        resolve_skill_from_path("/path/to/.agents/skills/CLOUD-DEPLOY/", residents)
+        == "cloud-deploy"
+    )
+    assert (
+        resolve_skill_from_path(
+            "/path/to/.agents/skills/cloud-deploy/references/guide.md", residents
+        )
+        == "cloud-deploy"
+    )
+    assert (
+        resolve_skill_from_path("/path/to/.agents/skills/cloud-deploy/scripts/run.sh", residents)
+        == "cloud-deploy"
+    )
+    assert (
+        resolve_skill_from_path("/path/to/.agents/skills/cloud-deploy/references", residents)
+        == "cloud-deploy"
+    )
     assert resolve_skill_from_path("PIZZA-CALCULATOR.MD", residents) == "pizza-calculator"
     assert (
         resolve_skill_from_path(Path("/skills/pizza-calculator.md"), residents)
         == "pizza-calculator"
     )
     assert resolve_skill_from_path("/other/README.md", residents) is None
+    assert resolve_skill_from_path("/other/non-resident-dir", residents) is None
+    assert resolve_skill_from_path("/path/to/cloud-deploy/scripts/run.py", residents) is None
     assert resolve_skill_from_path("", residents) is None
     assert resolve_skill_from_path(None, residents) is None
     assert resolve_skill_from_path(cast("Any", 123), residents) is None

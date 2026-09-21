@@ -12,6 +12,7 @@ Data structures representing evaluation outcomes, confusion matrices, and serial
         - artifact_path
         - ConfusionPair
         - ContestedSkill
+        - filter_query_set
         - NotHeadline
         - QueryRecord
         - read_artifact

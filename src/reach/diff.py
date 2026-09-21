@@ -16,15 +16,31 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from enum import StrEnum
 from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field, computed_field
 
-from reach.artifact import ARTIFACT_SUFFIX, Artifact, read_artifact
+from reach.artifact import (
+    ARTIFACT_SUFFIX,
+    Artifact,
+    _cross_check,
+    filter_query_set,
+    read_artifact,
+)
+from reach.catalog import corpus_digest
 from reach.config import DiffSettings, RunConfig, reanchor
-from reach.models import QueryKind
-from reach.run import ConfigSidecar, compose, load_results, read_sidecar, sidecar_path
+from reach.models import Provenance, QueryKind
+from reach.queries import load_query_set, query_set_digest
+from reach.run import (
+    Composition,
+    ConfigSidecar,
+    compose,
+    load_results,
+    read_sidecar,
+    sidecar_path,
+)
 from reach.uncertainty import (
     DEFAULT_CONFIDENCE,
     Interval,
@@ -80,6 +96,7 @@ class Arm(BaseModel):
 
     label: str
     artifact: Artifact
+    source_queries_digest: str = ""
 
     @property
     def resident(self) -> tuple[str, ...]:
@@ -364,18 +381,53 @@ def _resolve_arm_config(
     return reanchored
 
 
+def _try_read_unsliced_artifact(path: Path) -> Artifact | None:
+    """Read an already-assembled Artifact JSON when path is not a sidecar-backed JSONL run."""
+    if path.name.endswith(ARTIFACT_SUFFIX):
+        return read_artifact(path)
+    if path.suffix == ".json" and not (
+        path.with_name(f"{path.name}.config.json").exists()
+        or path.with_suffix(".config.json").exists()
+    ):
+        try:
+            return read_artifact(path)
+        except (OSError, ValueError):
+            return None
+    return None
+
+
+def _resolve_sibling_jsonl(path: Path) -> Path | None:
+    """Locate sibling raw .jsonl results file (with sidecar) for an .artifact.json path."""
+    candidates: list[Path] = []
+    if path.name.endswith(ARTIFACT_SUFFIX):
+        base = path.with_name(path.name[: -len(ARTIFACT_SUFFIX)])
+        candidates.extend((base, base.with_suffix(".jsonl")))
+    elif path.suffix == ".json":
+        candidates.append(path.with_suffix(".jsonl"))
+    for candidate in candidates:
+        if candidate.is_file() and sidecar_path(candidate).exists():
+            return candidate
+    return None
+
+
 def load_arm(
     results_path: Path | str,
     *,
     queries_root: Path | str | None = None,
     corpus: Path | str | None = None,
     label: str | None = None,
+    queries: Path | str | None = None,
+    filter_skill: Sequence[str] = (),
+    filter_id: Sequence[str] = (),
 ) -> Arm:
     """Load results and reconstruct the Artifact model for an experimental arm."""
     path = Path(results_path).expanduser()
     if not path.exists():
         msg = f"{path} does not exist"
         raise FileNotFoundError(msg)
+
+    subset_qs = load_query_set(queries) if queries is not None else None
+    slicing = bool(subset_qs is not None or filter_skill or filter_id)
 
     resolved_label = (
         label
@@ -384,27 +436,79 @@ def load_arm(
             path.name[: -len(ARTIFACT_SUFFIX)] if path.name.endswith(ARTIFACT_SUFFIX) else path.stem
         )
     )
-    if path.name.endswith(ARTIFACT_SUFFIX):
-        return Arm(label=resolved_label, artifact=read_artifact(path))
+    if not slicing and (unsliced := _try_read_unsliced_artifact(path)) is not None:
+        return Arm(
+            label=resolved_label,
+            artifact=unsliced,
+            source_queries_digest=unsliced.digests.queries_digest,
+        )
 
-    if path.suffix == ".json" and not (
-        path.with_name(f"{path.name}.config.json").exists()
-        or path.with_suffix(".config.json").exists()
-    ):
-        try:
-            return Arm(label=resolved_label, artifact=read_artifact(path))
-        except (OSError, ValueError):
-            pass
+    if slicing and not sidecar_path(path).exists():
+        sibling = _resolve_sibling_jsonl(path)
+        if sibling is None:
+            msg = (
+                f"{path} has no sibling .jsonl results and .config.json sidecar; "
+                "query sub-slicing requires raw probe results to recompute exact scores"
+            )
+            raise ValueError(msg)
+        path = sibling
 
     recorded = _read_valid_sidecar(path)
     config = _resolve_arm_config(path, recorded.config, queries_root, corpus)
     composed = compose(config)
+    raw_results = load_results(path)
+
+    if not slicing:
+        return Arm(
+            label=resolved_label,
+            artifact=Artifact.assemble(
+                composed,
+                raw_results,
+            ),
+        )
+
+    expected_q_digest = query_set_digest(composed.query_set)
+    _cross_check(
+        raw_results,
+        Provenance(
+            config_fingerprint=config.fingerprint,
+            condition_digest=config.condition,
+            corpus_digest=corpus_digest(composed.skills),
+            queries_digest=expected_q_digest,
+            tag=config.study.tag,
+        ),
+    )
+
+    sliced_qs = filter_query_set(
+        composed.query_set,
+        subset=subset_qs,
+        filter_skill=filter_skill,
+        filter_id=filter_id,
+    )
+    sliced_digest = query_set_digest(sliced_qs)
+    kept_ids = {q.id for q in sliced_qs.queries}
+    sliced_results = [
+        row.model_copy(update={"queries_digest": sliced_digest})
+        for row in raw_results
+        if row.query_id in kept_ids
+    ]
+    if not sliced_results:
+        msg = f"{path} has no probe results matching the requested query slice"
+        raise ValueError(msg)
+
+    sliced_composition = Composition(
+        config=config,
+        query_set=sliced_qs,
+        catalog=composed.catalog,
+        skills=composed.skills,
+    )
     return Arm(
         label=resolved_label,
         artifact=Artifact.assemble(
-            composed,
-            load_results(path),
+            sliced_composition,
+            sliced_results,
         ),
+        source_queries_digest=expected_q_digest,
     )
 
 
@@ -646,6 +750,21 @@ def pairing_walls(control: Arm, treatment: Arm) -> tuple[Wall, ...]:
                 ),
             ),
         )
+    elif (
+        control.source_queries_digest
+        and treatment.source_queries_digest
+        and control.source_queries_digest != treatment.source_queries_digest
+    ):
+        walls.append(
+            Wall(
+                where=PAIRING,
+                reason=(
+                    f"refusing to compare {control.label} with {treatment.label}: "
+                    f"their recorded source query set digests differ "
+                    f"({control.source_queries_digest} and {treatment.source_queries_digest})."
+                ),
+            ),
+        )
     return tuple(walls)
 
 
@@ -699,14 +818,29 @@ def _survey_arm(
     path: Path,
     *,
     label: str | None = None,
-    **loading: Path | str | None,
+    queries_root: Path | str | None = None,
+    corpus: Path | str | None = None,
+    queries: Path | str | None = None,
+    filter_skill: Sequence[str] = (),
+    filter_id: Sequence[str] = (),
 ) -> tuple[
     Arm | None,
     Wall | None,
 ]:
     """Attempt loading an arm, returning either the loaded Arm or a Wall error."""
     try:
-        return load_arm(path, label=label, **loading), None
+        return (
+            load_arm(
+                path,
+                label=label,
+                queries_root=queries_root,
+                corpus=corpus,
+                queries=queries,
+                filter_skill=filter_skill,
+                filter_id=filter_id,
+            ),
+            None,
+        )
     except (ValueError, LookupError, OSError) as error:
         return None, Wall(where=where, path=path, reason=str(error))
 
@@ -721,6 +855,9 @@ def survey_runs(
     treatment_corpus: Path | str | None = None,
     control_label: str | None = None,
     treatment_label: str | None = None,
+    queries: Path | str | None = None,
+    filter_skill: Sequence[str] = (),
+    filter_id: Sequence[str] = (),
 ) -> Survey:
     """Survey and validate two run paths against all comparative requirements."""
     factor = VaryFactor(factor)
@@ -740,6 +877,9 @@ def survey_runs(
         queries_root=queries_root,
         corpus=control_corpus,
         label=control_label,
+        queries=queries,
+        filter_skill=filter_skill,
+        filter_id=filter_id,
     )
     treatment, treatment_wall = _survey_arm(
         TREATMENT,
@@ -747,6 +887,9 @@ def survey_runs(
         queries_root=queries_root,
         corpus=treatment_corpus,
         label=treatment_label,
+        queries=queries,
+        filter_skill=filter_skill,
+        filter_id=filter_id,
     )
     walls = [wall for wall in (control_wall, treatment_wall) if wall is not None]
 
@@ -784,6 +927,9 @@ def diff_runs(
     treatment_corpus: Path | str | None = None,
     control_label: str | None = None,
     treatment_label: str | None = None,
+    queries: Path | str | None = None,
+    filter_skill: Sequence[str] = (),
+    filter_id: Sequence[str] = (),
     confidence: float = DEFAULT_CONFIDENCE,
     noise_inflation: float = NOISE_INFLATION,
 ) -> Comparison:
@@ -798,12 +944,18 @@ def diff_runs(
             queries_root=queries_root,
             corpus=control_corpus,
             label=control_label,
+            queries=queries,
+            filter_skill=filter_skill,
+            filter_id=filter_id,
         ),
         load_arm(
             right,
             queries_root=queries_root,
             corpus=treatment_corpus,
             label=treatment_label,
+            queries=queries,
+            filter_skill=filter_skill,
+            filter_id=filter_id,
         ),
         factor,
         confidence=confidence,

@@ -67,6 +67,8 @@ from reach.runtime._env import (
 )
 from reach.runtime._fs import (
     ensure_private_directory,
+    extract_tool_path,
+    normalize_skill_tool_args,
     resolve_skill_from_path,
     safe_cleanup_isolated_dir,
 )
@@ -509,12 +511,19 @@ class AntigravitySdkRuntime(_AntigravitySdkConfigMixin, AntigravityRuntime):
                 if tracker.early_exit and tracker.early_exit_hit:
                     return ag_types.HookResult(allow=False)
                 args = getattr(call, "args", None) or getattr(call, "arguments", {}) or {}
-                if (path := args.get("path") or args.get("AbsolutePath")) and (
-                    skill := resolve_skill_from_path(path, self._resident)
+                skill: str | None = None
+                if (
+                    isinstance(args, Mapping)
+                    and (path := extract_tool_path(args))
+                    and (skill := resolve_skill_from_path(path, self._resident))
                 ):
                     should_stop = tracker.observe(skill)
                     if self.options.early_exit and should_stop:
                         return ag_types.HookResult(allow=False)
+                if isinstance(args, Mapping) and (
+                    modified_args := normalize_skill_tool_args(args, skill)
+                ):
+                    return ag_types.HookResult(allow=True, modified_args=modified_args)
                 return ag_types.HookResult(allow=True)
 
             hooks_list.append(_on_tool_call)

@@ -607,6 +607,7 @@ class PlanSettings(BaseModel):
     retries: int = Field(default=2, ge=0)
     backoff_s: float = Field(default=5.0, ge=0)
     pause_s: float = Field(default=0.0, ge=0)
+    workers: int = Field(default=1, ge=1)
 
 
 class StudySettings(BaseModel):
@@ -722,6 +723,14 @@ class RunConfig(BaseModel):
     query: QuerySettings = Field(default_factory=QuerySettings)
     optimize: OptimizeSettings = Field(default_factory=OptimizeSettings)
     registry: RegistrySettings = Field(default_factory=RegistrySettings)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _strip_registry_tables(cls, data: object) -> object:
+        """Strip top-level agent and model registry tables merged by load_config()."""
+        if isinstance(data, Mapping) and ("agents" in data or "models" in data):
+            return {k: v for k, v in data.items() if k not in {"agents", "models"}}
+        return data
 
     def require_queries(self, hint: str = "") -> Path:
         """Forward queries path requirement to study settings."""
@@ -900,27 +909,23 @@ class Digests(NamedTuple):
 
 def digest_material(material: dict[str, Any]) -> Digests:
     """Compute fingerprint, arm, and condition digests from raw config material."""
-    fingerprint = deepcopy(material)
-    fingerprint.pop("lint", None)
-    fingerprint.pop("check", None)
-    fingerprint.pop("discovery", None)
+    base = deepcopy(material)
+    for key in ("lint", "check", "discovery"):
+        base.pop(key, None)
+    if "plan" in base:
+        base["plan"].pop("workers", None)
+
+    fingerprint = deepcopy(base)
     fingerprint["study"] = {
         k: v
         for k, v in fingerprint.get("study", {}).items()
         if k not in {"out", "workdir", "skills", "queries", "tag", "trusted"}
     }
 
-    arm = deepcopy(material)
+    arm = deepcopy(base)
     arm.pop("study", None)
-    arm.pop("lint", None)
-    arm.pop("check", None)
-    arm.pop("discovery", None)
 
-    condition = deepcopy(material)
-    condition.pop("study", None)
-    condition.pop("lint", None)
-    condition.pop("check", None)
-    condition.pop("discovery", None)
+    condition = deepcopy(arm)
     if "plan" in condition:
         condition["plan"].pop("attempts", None)
 

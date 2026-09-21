@@ -73,7 +73,7 @@ reach eval ./skills/cloud-deploy --agent claude-code
 Speed up evaluation with concurrent probe execution:
 
 ```bash
-reach eval cloud-deploy --concurrency 4
+reach eval cloud-deploy --workers 4
 ```
 
 ///
@@ -133,7 +133,7 @@ reach eval cloud-deploy --concurrency 4
 | `--retries`                        | Integer | `2`                      | Retry attempts for failed model invocations.                                                   |
 | `--backoff`                        | Float   | `5.0`                    | Initial backoff time in seconds before the first retry.                                        |
 | `--pause`                          | Float   | `0.0`                    | Seconds to pause between probes to respect rate limits.                                        |
-| `--concurrency`, `-j`              | Integer | `1`                      | Number of concurrent probes to run.                                                            |
+| `--workers`, `-j`                  | Integer | `1`                      | Number of concurrent probes to run.                                                            |
 | `--auto`                           | Flag    | `false`                  | Automatically draft queries for all skills and probe the catalog in one step.                  |
 | `--reasoning`                      | Flag    | `false`                  | Display model reasoning / thought traces directly beneath misrouted collision rows.            |
 | `--no-resume`                      | Flag    | `false`                  | Re-probe everything, ignoring results already in output.                                       |
