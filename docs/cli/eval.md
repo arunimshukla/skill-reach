@@ -86,11 +86,12 @@ reach eval cloud-deploy --workers 4
 
 | Option       | Type          | Description                                                                          |
 | :----------- | :------------ | :----------------------------------------------------------------------------------- |
-| `[TARGET]`   | String / Path | One skill to evaluate, by name or directory (requests a quick run).                  |
-| `--query`    | String        | Probe this exact question rather than drafting one (repeatable).                     |
-| `--expected` | String        | The skill every `--query` should reach; defaults to the skill named.                 |
-| `--skills`   | Path          | Root directory containing skills or a catalog tree.                                  |
-| `--queries`  | Path          | Labeled evaluation queries JSON file. If omitted, queries are automatically drafted. |
+| `[TARGET]`   | String / Path | One skill to evaluate, by name or directory (requests a quick run).                                                               |
+| `--skill`    | String        | Filter evaluation queries or auto-drafting to specific skill name(s) (repeatable).                                                |
+| `--query`    | String        | Probe this exact question rather than drafting one (repeatable).                                                                  |
+| `--expected` | String        | The skill every `--query` should reach; defaults to the skill named.                                                              |
+| `--skills`   | Path          | Root directory containing skills or a catalog tree.                                                                               |
+| `--queries`  | Path          | Labeled evaluation queries file (`.json`, `.yaml`/`.yml`, `.jsonl`, or `.csv`). If omitted, queries are automatically drafted.    |
 | `--workdir`  | Path          | Temporary workspace to install the competitive catalog into.                         |
 | `--catalog`  | String        | Catalog identifier; defaults to the query set's catalog ID.                          |
 | `--partial`  | Flag          | Allow a query set that targets only a subset of the catalog's skills.                |

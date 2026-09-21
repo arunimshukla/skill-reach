@@ -8,6 +8,7 @@ Static validation engine for skill manifests, frontmatter schemas, naming conven
       show_root_heading: false
       members:
         - explain_rule
+        - extract_corpus_semantics
         - extract_skill_references
         - find_competing_neighbors
         - find_unknown_skill_references
@@ -21,3 +22,4 @@ Static validation engine for skill manifests, frontmatter schemas, naming conven
         - RuleDefinition
         - RULES
         - Severity
+        - SkillLintSemantics

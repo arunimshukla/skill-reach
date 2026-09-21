@@ -496,7 +496,10 @@ class StudyFlags(Flags):
 
     skills: Annotated[
         Path | None,
-        Parameter(help="Root of the skill directory"),
+        Parameter(
+            name=["--skills", "-s"],
+            help="Root of the skill directory",
+        ),
     ] = None
     queries: Annotated[Path | None, Parameter(help="Labeled query set (JSON)")] = None
     workdir: Annotated[

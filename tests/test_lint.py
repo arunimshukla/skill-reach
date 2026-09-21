@@ -610,45 +610,45 @@ def test_missing_description_in_lint_tree_does_not_crash(
     [
         (
             (
-                "Monitors BigQuery slot utilization and INFORMATION_SCHEMA.JOBS_TIMELINE. "
+                "Monitors database connection pools and query execution history. "
                 "Don't use for root-cause diagnosis when cause is unknown "
-                "(use `bigquery-troubleshooting` first), or for writing or optimizing "
-                "business logic SQL (use `bigquery-optimization`)."
+                "(use `db-troubleshooting` first), or for rewriting slow "
+                "application queries (use `db-optimization`)."
             ),
-            "bigquery-observability",
-            ("bigquery-optimization", "bigquery-troubleshooting"),
+            "db-observability",
+            ("db-optimization", "db-troubleshooting"),
         ),
         (
             (
-                "Analyzes Google Cloud BigQuery slot consumption and query costs using "
-                "INFORMATION_SCHEMA. Don't use for generic BigQuery administration "
-                "(use `bigquery-basics`), BigQuery ML (use `bigquery-ai-ml`), or "
-                "DataFrame operations (use `bigquery-bigframes`)."
+                "Analyzes SQL query execution plans and index scan costs. "
+                "Don't use for routine database administration "
+                "(use `db-basics`), vector search indexing (use `db-vector-search`), or "
+                "ORM schema migrations (use `db-migrations`)."
             ),
-            "bigquery-slot-cost-optimizer",
-            ("bigquery-ai-ml", "bigquery-basics", "bigquery-bigframes"),
+            "db-cost-optimizer",
+            ("db-basics", "db-migrations", "db-vector-search"),
         ),
         (
             (
-                "Diagnoses GKE storage issues and Cloud Storage FUSE OOM. "
-                "Don't use for initial storage provisioning or choosing storage types "
-                "(use `gke-storage`)."
+                "Diagnoses Kubernetes volume mount failures and object storage FUSE OOM. "
+                "Don't use for initial storage class provisioning or choosing volume types "
+                "(use `k8s-storage`)."
             ),
-            "gke-storage-troubleshooting",
-            ("gke-storage",),
+            "k8s-storage-troubleshooting",
+            ("k8s-storage",),
         ),
         (
-            "For slot consumption and query cost tuning, use bigquery-slot-cost-optimizer instead.",
-            "bigquery-observability",
-            ("bigquery-slot-cost-optimizer",),
+            "For query plan tuning and index cost analysis, use db-cost-optimizer instead.",
+            "db-observability",
+            ("db-cost-optimizer",),
         ),
         (
             (
                 "Use on-demand pricing, real-time utf-8 streaming, and command-line flags. "
-                "Use `gcloud storage` over legacy `gsutil` and do not use "
-                "bigquery-observability for SQL."
+                "Use `docker compose` over legacy scripts and do not use "
+                "db-observability for SQL."
             ),
-            "bigquery-observability",
+            "db-observability",
             (),
         ),
     ],
@@ -668,30 +668,30 @@ def test_unknown_skill_reference_flags_dangling_boundary_targets(
     write_skill: Callable[..., Path],
     tmp_path: Path,
 ) -> None:
-    """Verify unknown-skill-reference errors when description hands off to missing skills."""
+    """Verify unknown-skill-reference warns when description hands off to missing skills."""
     write_skill(
-        name="bigquery-observability",
+        name="db-observability",
         description=(
-            "Monitors and analyzes Google Cloud BigQuery operational telemetry, job execution "
-            "history, and slot utilization using INFORMATION_SCHEMA.JOBS_TIMELINE. "
+            "Monitors and analyzes database operational telemetry, query execution "
+            "history, and connection pool utilization. "
             "Don't use for root-cause diagnosis or symptom troubleshooting when the cause is "
-            "unknown (use `bigquery-troubleshooting` first), or for writing or optimizing "
-            "business logic SQL (use `bigquery-optimization`)."
+            "unknown (use `db-troubleshooting` first), or for writing or optimizing "
+            "business logic SQL (use `db-optimization`)."
         ),
     )
     write_skill(
-        name="bigquery-basics",
-        description="Manages BigQuery datasets, tables, and standard administrative operations.",
+        name="db-basics",
+        description="Manages database schemas, tables, and standard administrative operations.",
     )
 
     report = lint_tree(tmp_path)
     unknown_issues = [i for i in report.issues if i.rule == "unknown-skill-reference"]
     assert len(unknown_issues) == 2
-    assert all(i.severity == Severity.ERROR for i in unknown_issues)
-    assert all(i.skill == "bigquery-observability" for i in unknown_issues)
+    assert all(i.severity == Severity.WARN for i in unknown_issues)
+    assert all(i.skill == "db-observability" for i in unknown_issues)
     messages = " ".join(i.message for i in unknown_issues)
-    assert "bigquery-troubleshooting" in messages
-    assert "bigquery-optimization" in messages
+    assert "db-troubleshooting" in messages
+    assert "db-optimization" in messages
 
 
 def test_unknown_skill_reference_passes_when_targets_exist_in_catalog(
@@ -700,17 +700,17 @@ def test_unknown_skill_reference_passes_when_targets_exist_in_catalog(
 ) -> None:
     """Verify unknown-skill-reference does not fire when referenced handoff skills exist."""
     write_skill(
-        name="bigquery-observability",
+        name="db-observability",
         description=(
-            "Monitors BigQuery telemetry. Don't use for root-cause troubleshooting "
-            "(use `bigquery-troubleshooting` first)."
+            "Monitors database telemetry. Don't use for root-cause troubleshooting "
+            "(use `db-troubleshooting` first)."
         ),
     )
     write_skill(
-        name="bigquery-troubleshooting",
+        name="db-troubleshooting",
         description=(
-            "Troubleshoots BigQuery errors. Don't use for routine telemetry monitoring "
-            "(use `bigquery-observability`)."
+            "Troubleshoots database errors. Don't use for routine telemetry monitoring "
+            "(use `db-observability`)."
         ),
     )
 
@@ -719,96 +719,94 @@ def test_unknown_skill_reference_passes_when_targets_exist_in_catalog(
     assert len(unknown_issues) == 0
 
 
-def test_missing_mutual_handoff_flags_bigquery_slot_cost_optimizer_and_observability(
+def test_missing_mutual_handoff_flags_overlapping_database_skills(
     write_skill: Callable[..., Path],
     tmp_path: Path,
 ) -> None:
-    """Verify missing-mutual-handoff catches unguarded overlap between BigQuery neighbors."""
+    """Verify missing-mutual-handoff catches unguarded overlap between database neighbors."""
     write_skill(
-        name="bigquery-slot-cost-optimizer",
+        name="db-cost-optimizer",
         description=(
-            "Analyzes Google Cloud BigQuery slot consumption, query costs, and execution "
-            "bottlenecks using INFORMATION_SCHEMA. Use when diagnosing slow BigQuery queries, "
-            "slot starvation, high on-demand query costs, or join performance issues. "
-            "Don't use for generic BigQuery administration (use `bigquery-basics`)."
+            "Analyzes PostgreSQL worker utilization, query execution bottlenecks, and "
+            "pg_stat_statements telemetry. Use when diagnosing slow SQL queries, "
+            "worker starvation, high query costs, or join performance bottlenecks. "
+            "Don't use for generic database administration (use `db-basics`)."
         ),
     )
     write_skill(
-        name="bigquery-observability",
+        name="db-observability",
         description=(
-            "Monitors Google Cloud BigQuery operational telemetry, slot utilization, and "
-            "reservation performance using INFORMATION_SCHEMA. Use when investigating slot "
-            "usage trends, job concurrency, or capacity planning. "
-            "Don't use for generic BigQuery administration (use `bigquery-basics`)."
+            "Monitors PostgreSQL operational telemetry, worker utilization, and query "
+            "execution bottlenecks using pg_stat_statements. Use when investigating worker "
+            "usage trends, query concurrency, or capacity planning. "
+            "Don't use for generic database administration (use `db-basics`)."
         ),
     )
     write_skill(
-        name="bigquery-basics",
+        name="db-basics",
         description=(
-            "Creates and administers BigQuery datasets and tables. "
-            "Don't use for slot cost optimization (use `bigquery-slot-cost-optimizer`) "
-            "or operational telemetry (use `bigquery-observability`)."
+            "Creates and administers PostgreSQL schemas and tables. "
+            "Don't use for query cost optimization (use `db-cost-optimizer`) "
+            "or operational telemetry (use `db-observability`)."
         ),
     )
 
     report = lint_tree(tmp_path)
     mutual_issues = [i for i in report.issues if i.rule == "missing-mutual-handoff"]
     flagged_skills = {i.skill for i in mutual_issues}
-    assert "bigquery-slot-cost-optimizer" in flagged_skills
-    assert "bigquery-observability" in flagged_skills
-    optimizer_msg = next(
-        i.message for i in mutual_issues if i.skill == "bigquery-slot-cost-optimizer"
-    )
-    assert "bigquery-observability" in optimizer_msg
+    assert "db-cost-optimizer" in flagged_skills
+    assert "db-observability" in flagged_skills
+    optimizer_msg = next(i.message for i in mutual_issues if i.skill == "db-cost-optimizer")
+    assert "db-observability" in optimizer_msg
 
 
-def test_missing_mutual_handoff_flags_gke_storage_troubleshooting_and_storage_fuse(
+def test_missing_mutual_handoff_flags_k8s_storage_troubleshooting_and_object_storage_fuse(
     write_skill: Callable[..., Path],
     tmp_path: Path,
 ) -> None:
-    """Verify missing-mutual-handoff catches gke-storage-troubleshooting vs storage-fuse."""
+    """Verify missing-mutual-handoff catches k8s-storage-troubleshooting vs object-storage-fuse."""
     write_skill(
-        name="gke-storage-troubleshooting",
+        name="k8s-storage-troubleshooting",
         description=(
-            "Diagnoses and resolves Google Kubernetes Engine (GKE) storage issues including "
+            "Diagnoses and resolves Kubernetes storage issues including "
             "PVC Pending states, PersistentVolume mount failures, CSI driver errors, volume "
-            "expansion failures, and Cloud Storage FUSE OOM. Use when pods fail to mount "
-            "volumes or GKE storage workloads crash. Don't use for initial storage "
-            "provisioning or choosing storage types (use `gke-storage`)."
+            "expansion failures, and Object Storage FUSE OOM. Use when pods fail to mount "
+            "volumes or Kubernetes storage workloads crash. Don't use for initial storage "
+            "provisioning or choosing storage types (use `k8s-storage`)."
         ),
     )
     write_skill(
-        name="google-cloud-storage-fuse",
+        name="object-storage-fuse",
         description=(
-            "Configures, mounts, and tunes Cloud Storage FUSE (gcsfuse) on Google Cloud VMs "
-            "and GKE clusters for high-throughput AI/ML training, caching, and file system "
+            "Configures, mounts, and tunes Object Storage FUSE (s3fs/fuse) on Linux VMs "
+            "and Kubernetes clusters for high-throughput training, caching, and file system "
             "performance."
         ),
     )
     write_skill(
-        name="gke-storage",
+        name="k8s-storage",
         description=(
-            "Provisions and configures GKE storage classes and volumes. "
+            "Provisions and configures Kubernetes storage classes and volumes. "
             "Don't use for troubleshooting volume mount failures "
-            "(use `gke-storage-troubleshooting`)."
+            "(use `k8s-storage-troubleshooting`)."
         ),
     )
 
     report = lint_tree(tmp_path)
     mutual_issues = [i for i in report.issues if i.rule == "missing-mutual-handoff"]
-    gke_issues = [
+    k8s_issues = [
         i
         for i in mutual_issues
-        if i.skill == "gke-storage-troubleshooting" and "google-cloud-storage-fuse" in i.message
+        if i.skill == "k8s-storage-troubleshooting" and "object-storage-fuse" in i.message
     ]
     fuse_issues = [
         i
         for i in mutual_issues
-        if i.skill == "google-cloud-storage-fuse" and "gke-storage-troubleshooting" in i.message
+        if i.skill == "object-storage-fuse" and "k8s-storage-troubleshooting" in i.message
     ]
-    assert len(gke_issues) == 1
+    assert len(k8s_issues) == 1
     assert len(fuse_issues) == 1
-    assert gke_issues[0].severity == Severity.WARN
+    assert k8s_issues[0].severity == Severity.WARN
 
 
 def test_missing_mutual_handoff_resolves_when_reciprocal_handoffs_added(
@@ -817,19 +815,19 @@ def test_missing_mutual_handoff_resolves_when_reciprocal_handoffs_added(
 ) -> None:
     """Verify missing-mutual-handoff passes cleanly once both neighbors hand off to each other."""
     write_skill(
-        name="gke-storage-troubleshooting",
+        name="k8s-storage-troubleshooting",
         description=(
-            "Diagnoses and resolves GKE storage issues and Cloud Storage FUSE OOM. "
-            "Don't use for Cloud Storage FUSE performance tuning or mount configuration "
-            "(use `google-cloud-storage-fuse`)."
+            "Diagnoses and resolves Kubernetes storage issues and Object Storage FUSE OOM. "
+            "Don't use for Object Storage FUSE performance tuning or mount configuration "
+            "(use `object-storage-fuse`)."
         ),
     )
     write_skill(
-        name="google-cloud-storage-fuse",
+        name="object-storage-fuse",
         description=(
-            "Configures, mounts, and tunes Cloud Storage FUSE on GKE clusters. "
+            "Configures, mounts, and tunes Object Storage FUSE on Kubernetes clusters. "
             "Don't use for diagnosing PVC Pending or CSI crash troubleshooting "
-            "(use `gke-storage-troubleshooting`)."
+            "(use `k8s-storage-troubleshooting`)."
         ),
     )
 
@@ -843,20 +841,20 @@ def test_extract_skill_references_multi_target_list_with_oxford_comma() -> None:
     from reach.lint import extract_skill_references
 
     desc = (
-        "Analyzes BigQuery slot consumption and query costs. "
-        "Don't use for generic BigQuery administration, ML, or DataFrames "
-        "(use `bigquery-basics`, `bigquery-ai-ml`, or `bigquery-bigframes`). "
-        "Do not use for streaming ingestion — use pubsub-streaming, dataflow-pipelines and "
-        "bigquery-storage-write."
+        "Analyzes SQL query execution plans and index costs. "
+        "Don't use for generic database administration, vector search, or DataFrames "
+        "(use `db-basics`, `db-vector-search`, or `db-dataframes`). "
+        "Do not use for streaming ingestion — use kafka-streaming, flink-pipelines and "
+        "db-bulk-writer."
     )
-    refs = extract_skill_references(desc, self_name="bigquery-slot-cost-optimizer")
+    refs = extract_skill_references(desc, self_name="db-cost-optimizer")
     assert refs == (
-        "bigquery-ai-ml",
-        "bigquery-basics",
-        "bigquery-bigframes",
-        "bigquery-storage-write",
-        "dataflow-pipelines",
-        "pubsub-streaming",
+        "db-basics",
+        "db-bulk-writer",
+        "db-dataframes",
+        "db-vector-search",
+        "flink-pipelines",
+        "kafka-streaming",
     )
 
 
@@ -866,15 +864,354 @@ def test_missing_mutual_handoff_fires_when_neither_skill_has_existing_boundaries
 ) -> None:
     """Verify missing-mutual-handoff fires on unbounded pairs with phrase encroachment."""
     write_skill(
-        name="gke-storage-troubleshooting",
-        description="Diagnoses and resolves GKE storage issues and Cloud Storage FUSE OOM.",
+        name="k8s-storage-troubleshooting",
+        description="Diagnoses and resolves Kubernetes storage issues and Object Storage FUSE OOM.",
     )
     write_skill(
-        name="google-cloud-storage-fuse",
-        description="Configures, mounts, and tunes Cloud Storage FUSE on GKE clusters.",
+        name="object-storage-fuse",
+        description="Configures, mounts, and tunes Object Storage FUSE on Kubernetes clusters.",
     )
 
     report = lint_tree(tmp_path)
     mutual_issues = [i for i in report.issues if i.rule == "missing-mutual-handoff"]
     skills_flagged = {i.skill for i in mutual_issues}
-    assert skills_flagged == {"gke-storage-troubleshooting", "google-cloud-storage-fuse"}
+    assert skills_flagged == {"k8s-storage-troubleshooting", "object-storage-fuse"}
+
+
+@pytest.mark.parametrize(
+    ("description", "self_name", "expected"),
+    [
+        (
+            (
+                "Plans, executes, and validates Kubernetes cluster upgrades "
+                "and maintenance operations. Handles node pool upgrade strategies (surge, "
+                "blue-green) and workload-specific concerns. Use this skill whenever the user "
+                "mentions cluster upgrades or node pool maintenance. Don't use for cluster "
+                "creation, general networking/routing setup, or security policy configurations "
+                "(use k8s-basics or relevant cluster skills instead)."
+            ),
+            "k8s-upgrades",
+            ("k8s-basics",),
+        ),
+        (
+            (
+                "Use this skill to manage compliance evaluations, rules, "
+                "scanned resources, and validation results because no service-specific public "
+                "CLI or MCP server is available."
+            ),
+            "compliance-manager-basics",
+            (),
+        ),
+        (
+            (
+                "Interactively discovers requirements and designs holistic, multi-service system "
+                "architectures. Don't use for single-service tasks (use "
+                "service-specific skills), initial onboarding or authentication (use "
+                "platform-recipe-*), architecture pillar reviews or audits (use "
+                "platform-waf-*), or workloads covered by specialized solution skills."
+            ),
+            "platform-solution-architecture",
+            ("platform-recipe", "platform-waf"),
+        ),
+        (
+            (
+                "Analyzes the downstream impact (blast radius) when a database table or view is "
+                "broken or modified. Don't use for: - General SQL querying or data analysis "
+                "(use database-related tools instead)."
+            ),
+            "lineage-asset-impact-analysis",
+            (),
+        ),
+        (
+            "Audits RBAC policies. Do not use for org-level, role-based, or read-only skills.",
+            "rbac-audit",
+            (),
+        ),
+        (
+            (
+                "Guides initial onboarding for the Webhook Ingestion API. Don't use for "
+                "writing payload ingestion code (use the webhook-api-audience-ingestion "
+                "or webhook-api-event-ingestion skills instead)."
+            ),
+            "webhook-api-setup",
+            (
+                "webhook-api-audience-ingestion",
+                "webhook-api-event-ingestion",
+            ),
+        ),
+    ],
+)
+def test_extract_skill_references_ignores_determiners_and_category_adjectives(
+    description: str,
+    self_name: str,
+    expected: tuple[str, ...],
+) -> None:
+    """Verify Pattern A (determiners) and Pattern B (-specific/-related + skills) are ignored."""
+    from reach.lint import extract_skill_references
+
+    assert extract_skill_references(description, self_name=self_name) == expected
+
+
+def test_unknown_skill_reference_allows_valid_wildcard_prefix_families_and_flags_missing(
+    write_skill: Callable[..., Path],
+    tmp_path: Path,
+) -> None:
+    """Verify Pattern C wildcard handoffs (foo-*) pass when prefix family exists."""
+    from reach.lint import find_unknown_skill_references, hands_off_to_skill
+
+    desc_valid = (
+        "Designs multi-service system architectures. Don't use for step-by-step "
+        "onboarding recipes (use platform-recipe-*) or architecture pillar reviews "
+        "(use `platform-waf-*`)."
+    )
+    known = (
+        "platform-solution-architecture",
+        "platform-recipe-auth",
+        "platform-waf-security",
+    )
+    assert (
+        find_unknown_skill_references(
+            desc_valid,
+            known,
+            self_name="platform-solution-architecture",
+        )
+        == ()
+    )
+    assert hands_off_to_skill(desc_valid, "platform-recipe-auth")
+    assert hands_off_to_skill(desc_valid, "platform-waf-security")
+
+    desc_invalid = "Designs architectures. Don't use for missing family (use nonexistent-family-*)."
+    assert find_unknown_skill_references(
+        desc_invalid,
+        known,
+        self_name="platform-solution-architecture",
+    ) == ("nonexistent-family",)
+
+    write_skill(
+        name="platform-solution-architecture",
+        description=desc_valid,
+    )
+    write_skill(
+        name="platform-recipe-auth",
+        description="Configures service authentication and OAuth credentials.",
+    )
+    write_skill(
+        name="platform-waf-security",
+        description="Reviews architecture security pillar.",
+    )
+    report = lint_tree(tmp_path)
+    unknown_issues = [i for i in report.issues if i.rule == "unknown-skill-reference"]
+    assert unknown_issues == []
+
+
+@pytest.mark.parametrize(
+    ("description", "target_name", "expected"),
+    [
+        pytest.param(
+            (
+                "Manage social media queues. Use when the user asks to "
+                "publish across connected social accounts."
+            ),
+            "social",
+            False,
+            id="positive-use-sentence-does-not-handoff-to-social",
+        ),
+        pytest.param(
+            (
+                "ALWAYS use this skill when asked to draft social media "
+                "content for microblogging platforms."
+            ),
+            "social",
+            False,
+            id="always-use-sentence-does-not-handoff-to-social",
+        ),
+        pytest.param(
+            (
+                "Use when asked to audit a codebase or generate handoff "
+                "plans for another agent to implement."
+            ),
+            "handoff",
+            False,
+            id="positive-use-sentence-does-not-handoff-to-handoff",
+        ),
+        pytest.param(
+            (
+                "Use when asked to audit a codebase or generate handoff "
+                "plans for another agent to implement."
+            ),
+            "implement",
+            False,
+            id="positive-use-sentence-does-not-handoff-to-implement",
+        ),
+        pytest.param(
+            "Use for notebook and source management, grounded chat and research.",
+            "research",
+            False,
+            id="positive-use-sentence-does-not-handoff-to-research",
+        ),
+        pytest.param(
+            "Do not use for the generic OpenAI API or unrelated content creation.",
+            "openai-api",
+            True,
+            id="negative-clause-disclaims-multi-word-skill",
+        ),
+        pytest.param(
+            "Don't use for quick red-green-refactor loops (use tdd).",
+            "tdd",
+            True,
+            id="explicit-parenthetical-single-word-skill-handoff",
+        ),
+        pytest.param(
+            "For broader social listening, see `social` instead.",
+            "social",
+            True,
+            id="explicit-backtick-single-word-skill-handoff",
+        ),
+    ],
+)
+def test_hands_off_to_skill_single_word_and_multi_word_boundaries(
+    description: str,
+    target_name: str,
+    expected: bool,
+) -> None:
+    """Verify positive 'Use when...' sentences do not falsely hand off to single-word skills."""
+    from reach.lint import hands_off_to_skill
+
+    assert hands_off_to_skill(description, target_name) is expected
+
+
+def test_extract_corpus_semantics_deterministic_pre_filter(tmp_path: Path) -> None:
+    """Verify extract_corpus_semantics pre-filters and extracts deterministic semantics."""
+    from reach.lint import SkillLintSemantics, extract_corpus_semantics
+    from reach.models import Skill
+
+    skills = [
+        Skill(
+            name="skill-a",
+            description="Do not use for specialized tasks; use target-one instead.",
+            body="Body A",
+            path=tmp_path / "a" / "SKILL.md",
+        ),
+        Skill(
+            name="skill-b",
+            description="Assist with any task. For specialized tasks, defer to target-two.",
+            body="Body B",
+            path=tmp_path / "b" / "SKILL.md",
+        ),
+        Skill(
+            name="skill-plain",
+            description="Profiles CPU and memory bottlenecks in Python scripts.",
+            body="Body Plain",
+            path=tmp_path / "plain" / "SKILL.md",
+        ),
+    ]
+
+    semantics = extract_corpus_semantics(skills)
+    assert "skill-plain" not in semantics
+    assert semantics["skill-a"] == SkillLintSemantics(
+        skill="skill-a",
+        handoff_targets=("target-one",),
+        unbounded_attractor_phrase=None,
+    )
+    assert semantics["skill-b"] == SkillLintSemantics(
+        skill="skill-b",
+        handoff_targets=("target-two",),
+        unbounded_attractor_phrase="any",
+    )
+
+
+def test_shared_trigger_terms_uses_corpus_idf_without_stopword_list(tmp_path: Path) -> None:
+    """Verify _shared_trigger_terms filters ubiquitous terms via BM25 IDF > BACKGROUND_IDF."""
+    from reach.lint import _shared_trigger_terms
+    from reach.models import Skill
+    from reach.retrieval import Bm25Scorer
+
+    # Create a 6-skill corpus where 'workflow', 'guide', 'project' appear across almost all skills
+    # (low IDF <= BACKGROUND_IDF), while 'kubernetes' and 'helm' appear only in 2 competing skills.
+    skills = [
+        Skill(
+            name="k8s-deploy",
+            description="Guide for project workflow deploying kubernetes helm charts.",
+            body="",
+            path=tmp_path / "1",
+        ),
+        Skill(
+            name="k8s-debug",
+            description="Guide for project workflow debugging kubernetes helm releases.",
+            body="",
+            path=tmp_path / "2",
+        ),
+        Skill(
+            name="doc-1",
+            description="Guide for project workflow documentation and release notes.",
+            body="",
+            path=tmp_path / "3",
+        ),
+        Skill(
+            name="doc-2",
+            description="Guide for project workflow testing and continuous integration.",
+            body="",
+            path=tmp_path / "4",
+        ),
+        Skill(
+            name="doc-3",
+            description="Guide for project workflow formatting and static analysis.",
+            body="",
+            path=tmp_path / "5",
+        ),
+        Skill(
+            name="doc-4",
+            description="Guide for project workflow packaging and publishing artifacts.",
+            body="",
+            path=tmp_path / "6",
+        ),
+    ]
+    scorer = Bm25Scorer.from_skills(skills)
+    shared = _shared_trigger_terms(
+        skills[0],
+        skills[1],
+        scorer=scorer,
+    )
+    assert "kubernetes" in shared
+    assert "helm" in shared
+    assert "guide" not in shared
+    assert "project" not in shared
+    assert "workflow" not in shared
+
+
+def test_acronym_name_claim_and_suffix_subject_guard(tmp_path: Path) -> None:
+    """Verify acronym name claims (tdd <-> test-driven-development) and suffix subject guard."""
+    from reach.lint import _claims_neighbor_name_phrase
+    from reach.models import Skill
+
+    tdd = Skill(
+        name="tdd",
+        description="Test-driven development. Use when building features test-first.",
+        body="",
+        path=tmp_path / "tdd",
+    )
+    full = Skill(
+        name="test-driven-development",
+        description="Use when implementing any feature before writing implementation code.",
+        body="",
+        path=tmp_path / "test-driven-development",
+    )
+    assert _claims_neighbor_name_phrase(tdd, full, frozenset({"use"}))
+
+    numpy_skill = Skill(
+        name="numpy-best-practices",
+        description=(
+            "Best practices for NumPy array programming and performance optimization in Python."
+        ),
+        body="",
+        path=tmp_path / "numpy",
+    )
+    python_perf = Skill(
+        name="python-performance-optimization",
+        description=(
+            "Profile and optimize Python code using cProfile and performance best practices."
+        ),
+        body="",
+        path=tmp_path / "pyperf",
+    )
+    assert not _claims_neighbor_name_phrase(numpy_skill, python_perf, frozenset({"code"}))

@@ -137,9 +137,10 @@ reach query queries.csv -o .reach/queries.json --catalog all
 reach query external.csv -o .reach/queries.json --text-column prompt --expected-skill-column tool
 ```
 
-`reach eval` also natively accepts `.jsonl` and `.csv` files via `--queries`, so conversion is purely optional:
+`reach eval` also natively accepts `.yaml`/`.yml`, `.jsonl`, and `.csv` files via `--queries`, so conversion is purely optional:
 
 ```bash
+reach eval --queries queries.yaml
 reach eval --queries queries.jsonl
 reach eval --queries queries.csv
 ```
@@ -148,13 +149,13 @@ reach eval --queries queries.csv
 
 ## Query Schema (`Query`)
 
-Each entry in a `.reach/queries.json` (or `.jsonl` / `.csv` dataset) conforms to the [`Query`](../api/models.md) model:
+Each entry in a `.reach/queries.json` (or `.yaml` / `.jsonl` / `.csv` dataset) conforms to the [`Query`](../api/models.md) model (when hand-authoring JSON or YAML files, top-level `catalog_id` defaults to `"all"` and missing query `id`s are numbered automatically):
 
-| Field               | Type                | Default | Description                                                                                                                                               |
-| :------------------ | :------------------ | :------ | :-------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `id`                | `str`               | —       | Unique identifier for the evaluation query.                                                                                                               |
-| `text`              | `str`               | —       | Realistic user prompt text presented to the agent runtime.                                                                                                |
-| `kind`              | `QueryKind \| None` | `None`  | Structural category (`implicit`, `contextual`, `neighbor_negative`, or `out_of_scope`).                                                                   |
-| `expected_skill`    | `str \| None`       | `None`  | Ground-truth target skill expected to be invoked, or `None` for out-of-scope queries.                                                                     |
-| `acceptable_skills` | `tuple[str, ...]`   | `()`    | Optional neutral helper or router skills (e.g. `finding-google-skills`) that consume turns at runtime but are neither rewarded as TP nor penalized as FP. |
-| `notes`             | `str`               | `""`    | Author notes, rationale, or difficulty context.                                                                                                           |
+| Field               | Type                | Default      | Description                                                                                                                                               |
+| :------------------ | :------------------ | :----------- | :-------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `id`                | `str`               | Auto (`q-N`) | Unique identifier for the evaluation query (numbered automatically as `q-001`, `q-002`, ... when omitted).                                                |
+| `text`              | `str`               | —            | Realistic user prompt text presented to the agent runtime.                                                                                                |
+| `kind`              | `QueryKind \| None` | `None`       | Structural category (`implicit`, `contextual`, `neighbor_negative`, or `out_of_scope`).                                                                   |
+| `expected_skill`    | `str \| None`       | `None`       | Ground-truth target skill expected to be invoked, or `None` for out-of-scope queries.                                                                     |
+| `acceptable_skills` | `tuple[str, ...]`   | `()`         | Optional neutral helper or router skills (e.g. `finding-google-skills`) that consume turns at runtime but are neither rewarded as TP nor penalized as FP. |
+| `notes`             | `str`               | `""`         | Author notes, rationale, or difficulty context.                                                                                                           |

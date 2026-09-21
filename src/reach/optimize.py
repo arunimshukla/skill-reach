@@ -171,17 +171,6 @@ class _CandidateProbeTally(BaseModel):
                 ) / len(paired_pos_ids)
         return round(self.recall - effective_baseline_recall, 4)
 
-    def as_legacy_tuple(self) -> tuple[int, int, int, int, tuple[str, ...], tuple[str, ...]]:
-        """Return the 6-element tuple shape for callers unpacking _run_candidate_probes."""
-        return (
-            self.triggers,
-            self.positive_queries,
-            self.correct_count,
-            self.misroutes,
-            self.failed_queries,
-            self.misrouted_queries,
-        )
-
 
 class OptimizationCandidate(BaseModel):
     """Represent a generated description rewrite and its empirical performance."""
@@ -372,18 +361,6 @@ class _CandidateEvalCache(BaseModel):
     def put_test(self, candidate: OptimizationCandidate) -> None:
         """Store holdout test evaluation for a candidate description."""
         self.entries[(candidate.description.strip(), True)] = candidate
-
-    def __contains__(self, key: tuple[str, bool]) -> bool:
-        """Support legacy `(norm, is_test) in cache` membership checks."""
-        return (key[0].strip(), key[1]) in self.entries
-
-    def __getitem__(self, key: tuple[str, bool]) -> OptimizationCandidate:
-        """Support legacy `cache[(norm, is_test)]` indexing."""
-        return self.entries[(key[0].strip(), key[1])]
-
-    def __setitem__(self, key: tuple[str, bool], value: OptimizationCandidate) -> None:
-        """Support legacy `cache[(norm, is_test)] = value` assignment."""
-        self.entries[(key[0].strip(), key[1])] = value
 
 
 class _SkillFrontmatterPatch(BaseModel):
@@ -1238,7 +1215,7 @@ def _evaluate_all_candidates(
     skills_corpus: Sequence[Skill] | None = None,
     baseline_hits_by_id: dict[str, bool] | None = None,
     baseline_misroute: float = 0.0,
-    eval_cache: _CandidateEvalCache | dict[tuple[str, bool], OptimizationCandidate] | None = None,
+    eval_cache: _CandidateEvalCache | None = None,
     *,
     baseline: _BaselineEvaluation | None = None,
 ) -> tuple[list[OptimizationCandidate], int]:
@@ -1249,11 +1226,7 @@ def _evaluate_all_candidates(
         baseline_misroute = baseline.misroute_rate
         baseline_hits_by_id = baseline.hits_by_id
 
-    cache = (
-        eval_cache
-        if isinstance(eval_cache, _CandidateEvalCache)
-        else (_CandidateEvalCache(entries=eval_cache) if eval_cache is not None else None)
-    )
+    cache = eval_cache
     unique_candidates = _deduplicate_candidates_pre_eval(candidates)
     target_norm = target_skill.description.strip()
 
