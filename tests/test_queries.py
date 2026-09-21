@@ -21,6 +21,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 import pytest
+from pydantic import ValidationError
 
 from reach.models import NO_SKILL, Query, QueryKind
 from reach.queries import (
@@ -307,7 +308,7 @@ def test_query_accepts_query_alias_and_serializes_to_canonical_text(tmp_path: Pa
 @pytest.mark.parametrize("bad_alias", ["prompt", "question", "utterance"])
 def test_query_rejects_unauthorized_aliases(bad_alias: str) -> None:
     """Verify unauthorized field aliases are strictly rejected by Query schema."""
-    with pytest.raises(Exception, match=r"text|Field required"):
+    with pytest.raises(ValidationError, match=r"text|Field required"):
         Query.model_validate(
             {"id": "q1", bad_alias: "deploy container service", "expected_skill": "s1"}
         )

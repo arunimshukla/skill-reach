@@ -1250,3 +1250,11 @@ def test_find_unknown_skill_references_matches_wildcard_prefix_families() -> Non
     known = {"k8s-basics", "k8s-networking", "ci-pipeline-deploy"}
     unknown = find_unknown_skill_references(desc, known, self_name="backend-router")
     assert unknown == ("nonexistent-family",)
+
+
+def test_extract_skill_references_preserves_backticked_specific_and_related_skills() -> None:
+    """Ensure explicit backticked references are retained despite suffixes."""
+    from reach.lint import extract_skill_references
+
+    desc = "For database cluster tasks, defer to `service-specific` or prefer `db-related`."
+    assert extract_skill_references(desc) == ("db-related", "service-specific")
