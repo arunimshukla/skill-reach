@@ -82,6 +82,7 @@ __all__ = [
     "antigravity_agents",
     "build_runtime",
     "build_text_generator",
+    "builtin_tool_names",
     "cli_agents",
     "find_agent_for_model",
     "known_agents",
@@ -980,6 +981,18 @@ class AntigravityRuntime(AgentRuntime):
             "find_by_name",
         }
     )
+    ANTIGRAVITY_BUILTIN_TOOLS: frozenset[str] = ANTIGRAVITY_SELECTION_TOOLS | frozenset(
+        {
+            "ask_question",
+            "finish",
+            "multi_replace_file_content",
+            "read_url_content",
+            "replace_file_content",
+            "run_command",
+            "search_web",
+            "write_to_file",
+        }
+    )
 
     @property
     def selection_tools(self) -> frozenset[str]:
@@ -1037,6 +1050,18 @@ class AntigravityRuntime(AgentRuntime):
         schema_dict = cls.selection_schema(resident).model_json_schema()
         schema_dict["required"] = ["selected_skill", "reasoning"]
         return json.dumps(schema_dict)
+
+
+def builtin_tool_names() -> frozenset[str]:
+    """Return canonical built-in tool primitives across all supported agent harnesses."""
+    from reach.runtime.claude_code import DEFAULT_DENIED_TOOLS, SKILL_TOOL_NAME
+
+    return (
+        frozenset(DEFAULT_DENIED_TOOLS)
+        | {SKILL_TOOL_NAME}
+        | AntigravityRuntime.ANTIGRAVITY_BUILTIN_TOOLS
+        | {"load_skill"}
+    )
 
 
 def options_model(agent: str) -> type[BaseModel] | None:

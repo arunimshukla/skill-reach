@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING, Final
 
 from pydantic import BaseModel, ConfigDict
 
-from reach.runtime.claude_code import DEFAULT_DENIED_TOOLS, SKILL_TOOL_NAME
+from reach.runtime import builtin_tool_names
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -149,18 +149,21 @@ def detect_unbounded_attractor(description: str) -> str | None:
 
 
 KEBAB_NAME_RE: Final = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
-RESERVED_TOOL_NAMES: Final[frozenset[str]] = frozenset(
-    {t.lower() for t in DEFAULT_DENIED_TOOLS}
-    | {
-        SKILL_TOOL_NAME.lower(),
-        "ask_question",
-        "finish",
-        "replace_file_content",
-        "run_command",
-        "view_file",
-        "write_to_file",
-    }
-)
+
+
+def _derive_reserved_tool_names() -> frozenset[str]:
+    """Derive lowercase, kebab-case, and flat reserved tool names from runtime primitives."""
+    names: set[str] = set()
+    for raw in builtin_tool_names():
+        kebab = re.sub(r"(?<!^)(?=[A-Z])", "-", raw).replace("_", "-").lower()
+        flat = raw.lower().replace("_", "").replace("-", "")
+        names.add(raw.lower())
+        names.add(kebab)
+        names.add(flat)
+    return frozenset(names)
+
+
+RESERVED_TOOL_NAMES: Final[frozenset[str]] = _derive_reserved_tool_names()
 
 
 def _add_if_valid_ref(found: set[str], token: str, self_lower: str | None) -> None:
