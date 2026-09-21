@@ -290,14 +290,33 @@ def test_a_run_probes_every_query_and_reports(make_config, answering_runtime) ->
 def test_workers_reaches_conduct_without_changing_the_fingerprint(
     make_config,
     answering_runtime,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Verify concurrency worker setting does not alter configuration fingerprint."""
-    config = make_config(plan={"attempts": 2})
-    fingerprint_before = config.fingerprint
-    report = conduct(config, answering_runtime, workers=3).report
+    """Verify workers in PlanSettings reaches ProbeHarness without altering fingerprint."""
+    import reach.run as run_mod
+
+    observed_workers: list[int] = []
+    orig_harness = run_mod.ProbeHarness
+
+    def spy_harness(*args, **kwargs):
+        observed_workers.append(kwargs.get("workers", 1))
+        return orig_harness(*args, **kwargs)
+
+    monkeypatch.setattr(run_mod, "ProbeHarness", spy_harness)
+
+    config_default = make_config(plan={"attempts": 2})
+    config_parallel = make_config(plan={"attempts": 2, "workers": 4})
+    assert config_parallel.fingerprint == config_default.fingerprint
+    assert config_parallel.arm == config_default.arm
+    assert config_parallel.condition == config_default.condition
+
+    report = conduct(config_parallel, answering_runtime).report
+    assert observed_workers[-1] == 4
     assert report.probes == 4
     assert report.scores.top1_accuracy == pytest.approx(1.0)
-    assert config.fingerprint == fingerprint_before
+
+    conduct(config_parallel, answering_runtime, workers=2)
+    assert observed_workers[-1] == 2
 
 
 def test_a_run_labels_every_query_with_its_lexical_difficulty(

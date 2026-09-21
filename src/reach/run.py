@@ -715,15 +715,16 @@ def conduct(
     append_across_arms: bool = False,
     allow_truncation: bool = False,
     composed: Composition | None = None,
-    workers: int = 1,
+    workers: int | None = None,
     outcome_cache: dict[_ProbeOutcomeCacheKey, Any] | None = None,
 ) -> RunOutcome:
     """Execute an evaluation run end-to-end and return the full RunOutcome."""
     resolved_runtime = runtime or build_runtime(config.runtime)
     composition = composed if composed is not None else compose(config)
+    resolved_workers = workers if workers is not None else config.plan.workers
     harness = ProbeHarness(
         resolved_runtime,
-        workers=workers,
+        workers=resolved_workers,
         retries=config.plan.retries,
         backoff_s=config.plan.backoff_s,
         pause_s=config.plan.pause_s,
@@ -750,7 +751,7 @@ def evaluate(
     append_across_arms: bool = False,
     allow_truncation: bool = False,
     composed: Composition | None = None,
-    workers: int = 1,
+    workers: int | None = None,
 ) -> RunOutcome:
     """Execute an evaluation run, resolving or drafting queries, and probing skills.
 

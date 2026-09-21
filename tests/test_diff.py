@@ -1087,3 +1087,134 @@ def test_query_lines_reports_hidden_separated_when_exceeding_queries_shown(
     )
     rendered = render_diff(over_comparison, "text")
     assert expected_line in rendered
+
+
+def test_sub_slicing_combined_run_via_queries_subset_and_filters(
+    arm,
+    edited_corpus: Path,
+    tmp_path: Path,
+) -> None:
+    """Verify survey_runs and load_arm slice combined runs without rewriting jsonl digests."""
+    control = arm("control", HALF)
+    treatment = arm("treatment", HITS, study={"skills": edited_corpus})
+
+    subset_file = save_query_set(
+        QuerySet(
+            catalog_id="neighborhood:gcs-lifecycle-rules",
+            queries=(
+                Query(
+                    id="q-retention",
+                    text="Hold audit logs for seven years under bucket lock.",
+                    kind=QueryKind.IMPLICIT,
+                    expected_skill="gcs-retention-policy",
+                ),
+            ),
+            provenance=QuerySetProvenance(origin=Origin.AUTHORED),
+        ),
+        tmp_path / "subset_retention.json",
+    )
+
+    # 1. Slice via subset QuerySet file on unfiltered .jsonl runs
+    surveyed = survey_runs(control, treatment, "description", queries=subset_file)
+    assert surveyed.comparable
+    comparison = surveyed.cross()
+    assert comparison.shared_queries == 1
+    assert comparison.headline.control == pytest.approx(0.0)
+    assert comparison.headline.treatment == pytest.approx(1.0)
+
+    # 2. Slice via filter_skill and filter_id globs
+    by_skill = survey_runs(
+        control,
+        treatment,
+        "description",
+        filter_skill=("gcs-retention-*",),
+    ).cross()
+    assert by_skill.shared_queries == 1
+    assert by_skill.headline.control == pytest.approx(0.0)
+    assert by_skill.headline.treatment == pytest.approx(1.0)
+
+    by_id = survey_runs(
+        control,
+        treatment,
+        "description",
+        filter_id=("*-lifecycle",),
+    ).cross()
+    assert by_id.shared_queries == 1
+    assert by_id.headline.control == pytest.approx(1.0)
+    assert by_id.headline.treatment == pytest.approx(1.0)
+
+    # 3. Slice a pre-filtered .jsonl whose rows still carry the full-run queries_digest
+    filtered_control = tmp_path / "filtered_control.jsonl"
+    filtered_treatment = tmp_path / "filtered_treatment.jsonl"
+    for src, dst in ((control, filtered_control), (treatment, filtered_treatment)):
+        rows = [
+            line for line in src.read_text(encoding="utf-8").splitlines() if '"q-retention"' in line
+        ]
+        dst.write_text("\n".join(rows) + "\n", encoding="utf-8")
+        shutil.copy2(f"{src}.config.json", f"{dst}.config.json")
+
+    pre_filtered_cmp = survey_runs(
+        filtered_control,
+        filtered_treatment,
+        "description",
+        queries=subset_file,
+    ).cross()
+    assert pre_filtered_cmp.shared_queries == 1
+    assert pre_filtered_cmp.headline.control == pytest.approx(0.0)
+    assert pre_filtered_cmp.headline.treatment == pytest.approx(1.0)
+
+    # 4. Slicing via .artifact.json path automatically resolves sibling .jsonl + sidecar
+    from reach.artifact import write_artifact
+
+    control_artifact = Path(f"{control}.artifact.json")
+    treatment_artifact = Path(f"{treatment}.artifact.json")
+    write_artifact(load_arm(control).artifact, control_artifact)
+    write_artifact(load_arm(treatment).artifact, treatment_artifact)
+    artifact_cmp = survey_runs(
+        control_artifact,
+        treatment_artifact,
+        "description",
+        queries=subset_file,
+    ).cross()
+    assert artifact_cmp.shared_queries == 1
+    assert artifact_cmp.headline.control == pytest.approx(0.0)
+    assert artifact_cmp.headline.treatment == pytest.approx(1.0)
+
+    # 5. Sad path: subset with altered ground-truth label fails validation
+    bad_subset = save_query_set(
+        QuerySet(
+            catalog_id="neighborhood:gcs-lifecycle-rules",
+            queries=(
+                Query(
+                    id="q-retention",
+                    text="Hold audit logs for seven years under bucket lock.",
+                    kind=QueryKind.IMPLICIT,
+                    expected_skill="gcs-lifecycle-rules",
+                ),
+            ),
+            provenance=QuerySetProvenance(origin=Origin.AUTHORED),
+        ),
+        tmp_path / "bad_subset.json",
+    )
+    bad_survey = survey_runs(control, treatment, "description", queries=bad_subset)
+    assert not bad_survey.comparable
+    assert any("ground truth mismatch" in w.reason for w in bad_survey.walls)
+
+    # 6. Sad path: .jsonl rows with a corrupted queries_digest fail _cross_check
+    corrupted_control = tmp_path / "corrupted_control.jsonl"
+    corrupted_control.write_text(
+        control.read_text(encoding="utf-8").replace(
+            load_arm(control).artifact.digests.queries_digest,
+            "000000000000",
+        ),
+        encoding="utf-8",
+    )
+    shutil.copy2(f"{control}.config.json", f"{corrupted_control}.config.json")
+    corrupted_survey = survey_runs(
+        corrupted_control,
+        treatment,
+        "description",
+        queries=subset_file,
+    )
+    assert not corrupted_survey.comparable
+    assert any("queries_digest" in w.reason for w in corrupted_survey.walls)

@@ -1741,3 +1741,58 @@ def test_resolve_discovery_candidates_elevates_antigravity(tmp_path: Path) -> No
 
     candidates = resolve_discovery_candidates(tmp_path, agent="antigravity-cli")
     assert tmp_path / ".agents" / "skills" in candidates
+
+
+def test_plan_settings_workers_validation_and_digest_invariance(tmp_path: Path) -> None:
+    """Verify PlanSettings.workers validates >= 1 and does not change config digests."""
+    from reach.config import PlanSettings
+
+    assert PlanSettings().workers == 1
+    assert PlanSettings(workers=8).workers == 8
+    with pytest.raises(ValidationError):
+        PlanSettings(workers=0)
+
+    toml_path = write_toml(
+        tmp_path,
+        """
+        [plan]
+        attempts = 3
+        workers = 8
+        """,
+    )
+    cfg_8 = RunConfig.from_toml(toml_path)
+    assert cfg_8.plan.workers == 8
+
+    cfg_1 = cfg_8.with_overrides(plan={"workers": 1})
+    assert cfg_1.plan.workers == 1
+    assert cfg_8.fingerprint == cfg_1.fingerprint
+    assert cfg_8.arm == cfg_1.arm
+    assert cfg_8.condition == cfg_1.condition
+
+
+def test_run_config_validates_load_config_output_while_forbidding_unknown_keys(
+    tmp_path: Path,
+) -> None:
+    """Verify RunConfig.model_validate accepts load_config() dicts containing agents/models."""
+    from reach.config import load_config
+
+    loaded_default = load_config()
+    assert "agents" in loaded_default
+    assert "models" in loaded_default
+    cfg_default = RunConfig.model_validate(loaded_default)
+    assert isinstance(cfg_default, RunConfig)
+
+    custom_toml = write_toml(
+        tmp_path,
+        """
+        [plan]
+        attempts = 2
+        workers = 4
+        """,
+    )
+    cfg_custom = RunConfig.model_validate(load_config(custom_toml))
+    assert cfg_custom.plan.attempts == 2
+    assert cfg_custom.plan.workers == 4
+
+    with pytest.raises(ValidationError):
+        RunConfig.model_validate({**loaded_default, "unknown_section": {}})

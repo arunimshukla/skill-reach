@@ -195,14 +195,14 @@ def _sweep(
             help="Proportion of distractor skills selected as nearest rivals",
         ),
     ] = 0.5,
-    concurrency: Annotated[
-        int,
+    workers: Annotated[
+        int | None,
         POSITIVE_INT,
         Parameter(
-            name=["--concurrency", "-j"],
+            name=["--workers", "-j"],
             help="Number of concurrent probe execution workers",
         ),
-    ] = 1,
+    ] = None,
     attempts: Annotated[
         int | None,
         POSITIVE_INT,
@@ -327,7 +327,7 @@ def _sweep(
             runtime=driver,
             rivals_share=rivals_share,
             noise_floor=noise_floor,
-            workers=concurrency,
+            workers=workers if workers is not None else effective_config.plan.workers,
             attempts=attempts,
             early_stop=early_stop,
         )

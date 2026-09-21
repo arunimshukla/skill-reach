@@ -1514,3 +1514,123 @@ def test_trajectory_tracker_enforces_max_turns_when_early_exit_disabled() -> Non
     assert normalized.invoked_skills == ("s1", "s2")
     assert normalized.turns_taken == 2
     assert normalized.early_exit is False
+
+
+def test_select_async_hook_rewrites_skill_directory_to_skill_md_for_multi_turn_recovery(
+    monkeypatch: pytest.MonkeyPatch,
+    runtime: AntigravitySdkRuntime,
+    tmp_path: Path,
+) -> None:
+    """Verify pre-tool hook rewrites skill directory paths to SKILL.md."""
+    skills_root = tmp_path / "work" / ".agents" / "skills"
+    distractor_dir = skills_root / "agent-platform-endpoint-management"
+    target_dir = skills_root / "agent-platform-deploy"
+    distractor_dir.mkdir(parents=True)
+    target_dir.mkdir(parents=True)
+    (distractor_dir / "SKILL.md").write_text("---\nname: agent-platform-endpoint-management\n---\n")
+    (target_dir / "SKILL.md").write_text("---\nname: agent-platform-deploy\n---\n")
+
+    runtime._resident = ("agent-platform-endpoint-management", "agent-platform-deploy")
+
+    def agent_with_directory_tool_calls(config: Any) -> _FakeAgent:
+        agent = _FakeAgent(config)
+        hook_fn = config.hooks[0]
+
+        class _HookRunnerResponse(_FakeResponse):
+            async def structured_output(self) -> object:
+                # Turn 1: Model calls view_file on distractor directory (without /SKILL.md)
+                call_turn1 = ag_types.ToolCall(
+                    name="view_file",
+                    args={"AbsolutePath": str(distractor_dir)},
+                )
+                res_turn1 = await hook_fn(call_turn1)
+                assert res_turn1.allow is True
+                expected_md = str(distractor_dir / "SKILL.md")
+                assert res_turn1.modified_args == {"AbsolutePath": expected_md}
+                assert call_turn1.args["AbsolutePath"] == expected_md
+
+                # Turn 2: Model recovers and calls view_file on target skill directory
+                call_turn2 = ag_types.ToolCall(
+                    name="view_file",
+                    args={"AbsolutePath": str(target_dir)},
+                )
+                res_turn2 = await hook_fn(call_turn2)
+                assert res_turn2.allow is False
+                return {"selected_skill": "agent-platform-deploy"}
+
+        agent.response = _HookRunnerResponse(
+            tool_calls=[
+                ag_types.ToolCall(name="view_file", args={"AbsolutePath": str(distractor_dir)}),
+                ag_types.ToolCall(name="view_file", args={"AbsolutePath": str(target_dir)}),
+            ],
+        )
+        return agent
+
+    monkeypatch.setattr("reach.runtime.antigravity_sdk.Agent", agent_with_directory_tool_calls)
+    outcome = runtime.select(
+        "deploy my model to an endpoint",
+        tmp_path / "work",
+        target_skill="agent-platform-deploy",
+    )
+    assert outcome.invoked_skills == (
+        "agent-platform-endpoint-management",
+        "agent-platform-deploy",
+    )
+    assert outcome.turns_taken == 2
+    assert outcome.early_exit is True
+
+    # Verify list_dir(DirectoryPath=...) also attributes the skill without rewriting DirectoryPath
+    def agent_with_list_dir_call(config: Any) -> _FakeAgent:
+        agent = _FakeAgent(config)
+        hook_fn = config.hooks[0]
+
+        class _DirRunnerResponse(_FakeResponse):
+            async def structured_output(self) -> object:
+                call_dir = ag_types.ToolCall(
+                    name="list_dir",
+                    args={"DirectoryPath": str(target_dir)},
+                )
+                res_dir = await hook_fn(call_dir)
+                assert res_dir.allow is False
+                assert res_dir.modified_args is None
+                assert call_dir.args == {"DirectoryPath": str(target_dir)}
+                return {"selected_skill": "agent-platform-deploy"}
+
+        agent.response = _DirRunnerResponse(
+            tool_calls=[
+                ag_types.ToolCall(name="list_dir", args={"DirectoryPath": str(target_dir)}),
+            ],
+        )
+        return agent
+
+    monkeypatch.setattr("reach.runtime.antigravity_sdk.Agent", agent_with_list_dir_call)
+    dir_outcome = runtime.select(
+        "Deploy to GKE",
+        tmp_path / "work",
+        target_skill="agent-platform-deploy",
+    )
+    assert dir_outcome.invoked_skills == ("agent-platform-deploy",)
+    assert dir_outcome.early_exit is True
+
+    from reach.metrics import classification_report
+    from reach.models import Catalog, CatalogMode, ProbeResult, Query
+
+    query = Query(
+        id="q-1",
+        text="deploy my model to an endpoint",
+        expected_skill="agent-platform-deploy",
+    )
+    result = ProbeResult.from_outcome(
+        outcome=outcome,
+        query=query,
+        catalog=Catalog(
+            id="all",
+            mode=CatalogMode.ALL,
+            skills=("agent-platform-endpoint-management", "agent-platform-deploy"),
+        ),
+        runtime_name=runtime.name,
+        model=runtime.model,
+    )
+    report = classification_report([result], [query])
+    assert report.entrypoint_hits == 0
+    assert report.trajectory_hits == 1

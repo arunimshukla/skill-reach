@@ -269,6 +269,38 @@ class RegistryFlags(Flags):
 
 
 @FLAT
+class SliceFlags(Flags):
+    """CLI parameter flags configuring post-run query and skill sub-slicing."""
+
+    queries: Annotated[
+        Path | None,
+        Parameter(
+            name=["--queries", "-q"],
+            help="Subset query set file used to slice recorded evaluation runs",
+        ),
+    ] = None
+    filter_skill: Annotated[
+        tuple[str, ...],
+        Parameter(
+            name="--filter-skill",
+            help="Glob pattern(s) matching target skill names to slice recorded runs",
+        ),
+    ] = ()
+    filter_id: Annotated[
+        tuple[str, ...],
+        Parameter(
+            name="--filter-id",
+            help="Glob pattern(s) matching query IDs to slice recorded runs",
+        ),
+    ] = ()
+
+    @property
+    def active(self) -> bool:
+        """Return True if any sub-slicing flag was supplied."""
+        return bool(self.queries is not None or self.filter_skill or self.filter_id)
+
+
+@FLAT
 class RuleOverrideFlags(Flags):
     """CLI parameter flags configuring static lint rule severity overrides."""
 
@@ -446,6 +478,15 @@ class PlanFlags(Flags):
         NON_NEGATIVE,
         Field(default=None, ge=0.0, serialization_alias="pause_s"),
         Parameter(help="Seconds between probes"),
+    ] = None
+    workers: Annotated[
+        int | None,
+        POSITIVE_INT,
+        Field(default=None, ge=1),
+        Parameter(
+            name=["--workers", "-j"],
+            help="Number of concurrent probes to run (defaults to 1 for sequential execution)",
+        ),
     ] = None
 
 

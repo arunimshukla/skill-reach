@@ -231,18 +231,6 @@ def _extract_init_model(event: dict[str, Any]) -> str | None:
     return named if isinstance(named, str) and named else None
 
 
-_TOOL_PATH_KEYS = ("AbsolutePath", "DirectoryPath", "SearchDirectory", "SearchPath")
-
-
-def _extract_param_path(params: dict[str, Any]) -> str | None:
-    """Extract first non-empty filesystem path from recognized tool parameters."""
-    for key in _TOOL_PATH_KEYS:
-        val = params.get(key)
-        if isinstance(val, str) and val:
-            return val
-    return None
-
-
 def _extract_tool_attempt(event: dict[str, Any]) -> ToolCallInfo | None:
     """Extract tool attempt and target path from a step_update event if present."""
     if not isinstance(event, dict):

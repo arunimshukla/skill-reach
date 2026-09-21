@@ -722,24 +722,25 @@ def test_json_output_is_machine_readable(base_argv: list[str], capsys) -> None:
     assert payload["provenance"]["runtime"] == "fake"
 
 
-def test_concurrency_runs_probes_without_changing_the_recorded_configuration(
+def test_workers_runs_probes_without_changing_the_recorded_configuration(
     base_argv: list[str],
     tmp_path: Path,
 ) -> None:
-    """Verify --concurrency alters worker count without modifying fingerprints."""
+    """Verify --workers alters worker count in plan settings without modifying fingerprints."""
     sequential_out = tmp_path / "sequential.jsonl"
     concurrent_out = tmp_path / "concurrent.jsonl"
     assert main([*base_argv, "--out", str(sequential_out)]) == 0
-    assert main([*base_argv, "--out", str(concurrent_out), "--concurrency", "3"]) == 0
+    assert main([*base_argv, "--out", str(concurrent_out), "--workers", "3"]) == 0
     sequential_sidecar = json.loads(Path(f"{sequential_out}.config.json").read_text())
     concurrent_sidecar = json.loads(Path(f"{concurrent_out}.config.json").read_text())
+    assert concurrent_sidecar["config"]["plan"]["workers"] == 3
     assert sequential_sidecar["fingerprint"] == concurrent_sidecar["fingerprint"]
     assert sequential_sidecar["arm"] == concurrent_sidecar["arm"]
     assert sequential_sidecar["condition"] == concurrent_sidecar["condition"]
 
 
-def test_the_short_concurrency_flag_is_accepted(base_argv: list[str]) -> None:
-    """Verify -j flag is parsed as concurrency alias."""
+def test_the_short_workers_flag_is_accepted(base_argv: list[str]) -> None:
+    """Verify -j flag is parsed as workers alias."""
     assert main([*base_argv, "-j", "2"]) == 0
 
 
@@ -2332,3 +2333,83 @@ def test_build_drafter_runtime_selects_agent_default_model_for_non_gemini() -> N
     drafter_inherited = _build_drafter_runtime(cfg_inherited, GenerateFlags())
     assert drafter_inherited.name == "claude-code"
     assert "claude" in drafter_inherited.model
+
+
+def test_cli_diff_and_view_with_slicing_flags(
+    make_config,
+    record_arm,
+    skill_repo: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Verify reach diff and reach view support --queries, --filter-skill, and --filter-id."""
+    import shutil
+
+    edited = tmp_path / "skills-edited"
+    shutil.copytree(skill_repo, edited)
+    card = edited / "storage" / "gcs-retention-policy" / "SKILL.md"
+    card.write_text(
+        card.read_text(encoding="utf-8").replace(
+            "Configures retention and bucket lock.",
+            "Holds audit logs for a fixed period under bucket lock.",
+        ),
+        encoding="utf-8",
+    )
+
+    control = record_arm(
+        "control",
+        make_config(catalog={"size": 3, "rivals": 2}, plan={"attempts": 5}),
+        {"q-lifecycle": ("gcs-lifecycle-rules",) * 5, "q-retention": (None,) * 5},
+    )
+    treatment = record_arm(
+        "treatment",
+        make_config(
+            catalog={"size": 3, "rivals": 2},
+            plan={"attempts": 5},
+            study={"skills": edited},
+        ),
+        {
+            "q-lifecycle": ("gcs-lifecycle-rules",) * 5,
+            "q-retention": ("gcs-retention-policy",) * 5,
+        },
+    )
+
+    # 1. reach diff with --filter-skill
+    assert (
+        main(
+            [
+                "diff",
+                str(control),
+                str(treatment),
+                "--vary",
+                "description",
+                "--filter-skill",
+                "gcs-retention-*",
+                "--format",
+                "json",
+            ]
+        )
+        == 0
+    )
+    diff_json = capsys.readouterr().out
+    assert '"shared_queries": 1' in diff_json
+    assert '"q-retention"' in diff_json
+    assert '"q-lifecycle"' not in diff_json
+
+    # 2. reach view with --filter-id on a .jsonl file (with sidecar)
+    assert (
+        main(
+            [
+                "view",
+                str(treatment),
+                "--filter-id",
+                "*-retention",
+                "--format",
+                "json",
+            ]
+        )
+        == 0
+    )
+    view_json = capsys.readouterr().out
+    assert '"q-retention"' in view_json
+    assert '"q-lifecycle"' not in view_json

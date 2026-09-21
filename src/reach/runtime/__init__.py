@@ -190,9 +190,10 @@ class ToolCallInfo(BaseModel):
 
     @property
     def target_path(self) -> str | None:
-        """Extract path across AbsolutePath or path parameters."""
-        path = self.parameters.get("AbsolutePath") or self.parameters.get("path")
-        return str(path) if path else None
+        """Extract first non-empty filesystem path from recognized tool parameters."""
+        from reach.runtime._fs import extract_tool_path
+
+        return extract_tool_path(self.parameters)
 
     @property
     def path(self) -> str | None:
