@@ -95,11 +95,14 @@ Output:
 
 ## Options
 
-| Option           | Type   | Default            | Description                                                                                                                                             |
-| :--------------- | :----- | :----------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `ARTIFACT`       | Path   | `.reach/eval.json` | Path to the evaluation artifact JSON file. If omitted, defaults to `.reach/eval.json`.                                                                  |
-| `--out`, `-o`    | Path   | -                  | Destination path to write the rendered report (defaults to stdout).                                                                                     |
-| `--open`, `-O`   | Flag   | `false`            | Open the rendered HTML report directly in the default web browser.                                                                                      |
-| `--show-queries` | Flag   | `false`            | Display individual scored query records below the summary scorecard.                                                                                    |
-| `--format`       | Choice | `text`             | Output format: `text` (terminal table), `html` (standalone interactive HTML), `json` (raw artifact JSON), `jsonl` (scored query records as JSON lines). |
-| `--verbose`      | Flag   | `false`            | Display full hexadecimal hash digests alongside badges.                                                                                                 |
+| Option            | Type   | Default            | Description                                                                                                                                             |
+| :---------------- | :----- | :----------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `ARTIFACT`        | Path   | `.reach/eval.json` | Path to the evaluation artifact JSON file. If omitted, defaults to `.reach/eval.json`.                                                                  |
+| `--out`, `-o`     | Path   | -                  | Destination path to write the rendered report (defaults to stdout).                                                                                     |
+| `--open`, `-O`    | Flag   | `false`            | Open the rendered HTML report directly in the default web browser.                                                                                      |
+| `--show-queries`  | Flag   | `false`            | Display individual scored query records below the summary scorecard.                                                                                    |
+| `--queries`, `-q` | Path   | -                  | Subset query set file used to slice the recorded evaluation run.                                                                                        |
+| `--filter-skill`  | String | `()`               | Glob pattern(s) matching target skill names to slice the recorded run.                                                                                  |
+| `--filter-id`     | String | `()`               | Glob pattern(s) matching query IDs to slice the recorded run.                                                                                           |
+| `--format`        | Choice | `text`             | Output format: `text` (terminal table), `html` (standalone interactive HTML), `json` (raw artifact JSON), `jsonl` (scored query records as JSON lines). |
+| `--verbose`       | Flag   | `false`            | Display full hexadecimal hash digests alongside badges.                                                                                                 |

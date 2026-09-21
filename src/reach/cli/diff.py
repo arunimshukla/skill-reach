@@ -22,7 +22,7 @@ from typing import Annotated
 from cyclopts import Parameter
 
 from .app import LOOP, app
-from .flags import NON_NEGATIVE, RATE, ConfigFlag, Factor, Format
+from .flags import NON_NEGATIVE, RATE, ConfigFlag, Factor, Format, SliceFlags
 
 
 @app.command(name="diff", group=LOOP)
@@ -74,6 +74,7 @@ def _diff(
             help="Custom display label for the treatment arm (defaults to filename)",
         ),
     ] = None,
+    slice_flags: SliceFlags | None = None,
     confidence: Annotated[
         float | None,
         RATE,
@@ -99,6 +100,7 @@ def _diff(
     from reach.diff import survey_runs
     from reach.views.diff import render_diff, render_survey
 
+    eff_slice = slice_flags or SliceFlags()
     run_config = RunConfig.from_toml(config) if config is not None else None
     eff_settings = RunConfig.resolve(
         DiffSettings,
@@ -116,6 +118,9 @@ def _diff(
         treatment_corpus=treatment_corpus,
         control_label=control_label,
         treatment_label=treatment_label,
+        queries=eff_slice.queries,
+        filter_skill=eff_slice.filter_skill,
+        filter_id=eff_slice.filter_id,
     )
     if not surveyed.comparable:
         raise ValueError(render_survey(surveyed))

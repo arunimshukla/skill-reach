@@ -19,6 +19,7 @@ from __future__ import annotations
 import math
 import statistics
 from collections import Counter
+from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import TYPE_CHECKING, Self
 
@@ -81,6 +82,7 @@ __all__ = [
     "SkillScore",
     "Spread",
     "artifact_path",
+    "filter_query_set",
     "read_artifact",
     "write_artifact",
 ]
@@ -567,6 +569,68 @@ class Artifact(BaseModel):
             digests=digests,
             cross_check=cross_check,
         ).assemble()
+
+
+def _query_matches_skill(query: Query, pattern: str) -> bool:
+    """Return True if query truth label or expected skill matches glob pattern."""
+    return fnmatchcase(query.truth_label, pattern) or (
+        query.expected_skill is not None and fnmatchcase(query.expected_skill, pattern)
+    )
+
+
+def _resolve_subset_queries(query_set: QuerySet, subset: QuerySet | None) -> list[Query]:
+    """Validate and extract subset queries against the parent QuerySet."""
+    if subset is None:
+        return list(query_set.queries)
+    by_id = {q.id: q for q in query_set.queries}
+    missing = sorted(q.id for q in subset.queries if q.id not in by_id)
+    if missing:
+        msg = f"subset queries not present in query set: {missing}"
+        raise ValueError(msg)
+    for sq in subset.queries:
+        full_q = by_id[sq.id]
+        if sq.truth_label != full_q.truth_label or frozenset(sq.acceptable_skills) != frozenset(
+            full_q.acceptable_skills
+        ):
+            msg = (
+                f"ground truth mismatch for query {sq.id!r}: query set expected "
+                f"{full_q.truth_label!r}, subset expected {sq.truth_label!r}"
+            )
+            raise ValueError(msg)
+    return [by_id[sq.id] for sq in subset.queries]
+
+
+def filter_query_set(
+    query_set: QuerySet,
+    *,
+    subset: QuerySet | None = None,
+    filter_skill: Sequence[str] = (),
+    filter_id: Sequence[str] = (),
+) -> QuerySet:
+    """Filter a QuerySet to a subset QuerySet and/or skill and query ID globs."""
+    if subset is None and not filter_skill and not filter_id:
+        return query_set
+
+    queries = _resolve_subset_queries(query_set, subset)
+
+    for pat in filter_skill:
+        if not any(_query_matches_skill(q, pat) for q in queries):
+            msg = f"query slice matched 0 queries for filter_skill pattern {pat!r}"
+            raise ValueError(msg)
+    if filter_skill:
+        queries = [q for q in queries if any(_query_matches_skill(q, pat) for pat in filter_skill)]
+
+    for pat in filter_id:
+        if not any(fnmatchcase(q.id, pat) for q in queries):
+            msg = f"query slice matched 0 queries for filter_id pattern {pat!r}"
+            raise ValueError(msg)
+    if filter_id:
+        queries = [q for q in queries if any(fnmatchcase(q.id, pat) for pat in filter_id)]
+    if not queries:
+        msg = "query slice matched 0 queries"
+        raise ValueError(msg)
+
+    return query_set.model_copy(update={"queries": tuple(queries)})
 
 
 def artifact_path(results_path: Path) -> Path:

@@ -65,6 +65,9 @@ reach diff --vary description runs/v1.jsonl runs/v2.jsonl --confidence 0.95 --no
 | `--treatment-corpus` | Path   | -                         | Corpus the treatment arm was probed against, if it moved.                            |
 | `--control-label`    | String | Filename                  | Custom display label for the control arm.                                            |
 | `--treatment-label`  | String | Filename                  | Custom display label for the treatment arm.                                          |
+| `--queries`, `-q`    | Path   | -                         | Subset query set file used to slice both arms before comparing.                      |
+| `--filter-skill`     | String | `()`                      | Glob pattern(s) matching target skill names to slice both arms before comparing.     |
+| `--filter-id`        | String | `()`                      | Glob pattern(s) matching query IDs to slice both arms before comparing.              |
 | `--confidence`       | Float  | `from reach.toml` (0.95)  | Confidence level used to estimate the noise floor.                                   |
 | `--noise-inflation`  | Float  | `from reach.toml` (1.265) | Multiplier to inflate estimated noise floor for over-dispersion.                     |
 | `--format`           | Choice | `text`                    | How to render comparison: `text`, `csv`, `json`, `jsonl`.                            |

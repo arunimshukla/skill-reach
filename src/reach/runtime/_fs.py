@@ -22,7 +22,7 @@ import shutil
 import threading
 from collections.abc import Iterable, Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from reach.catalog import resident_skills
 from reach.config import resolve_path
@@ -153,31 +153,85 @@ def install_skills(
     return tuple(catalog.skills)
 
 
+def _clean_path(val: object) -> Path | None:
+    """Parse a string or Path into a cleaned Path, or return None if invalid."""
+    if not val or not isinstance(val, (str, Path)):
+        return None
+    cleaned = val.strip() if isinstance(val, str) else val
+    if not cleaned:
+        return None
+    try:
+        return Path(cleaned)
+    except (ValueError, TypeError, OSError):
+        return None
+
+
+TOOL_PATH_KEYS: tuple[str, ...] = (
+    "path",
+    "AbsolutePath",
+    "DirectoryPath",
+    "SearchDirectory",
+    "SearchPath",
+    "file",
+    "path_str",
+)
+
+
+def extract_tool_path(args: Mapping[str, Any]) -> str | None:
+    """Extract the first non-empty filesystem path string from recognized tool arguments."""
+    for key in TOOL_PATH_KEYS:
+        val = args.get(key)
+        if isinstance(val, (str, Path)):
+            cleaned = str(val).strip()
+            if cleaned:
+                return cleaned
+    return None
+
+
 def resolve_skill_from_path(
     path_str: str | Path | None,
     resident: Iterable[str],
 ) -> str | None:
-    """Extract matching resident skill name from markdown file path if present."""
-    if not path_str or not isinstance(path_str, (str, Path)):
-        return None
-    if isinstance(path_str, str) and not path_str.strip():
-        return None
-
-    try:
-        p = Path(path_str.strip() if isinstance(path_str, str) else path_str)
-    except (ValueError, TypeError, OSError):
+    """Extract matching resident skill name from file, skill directory, or nested reference path."""
+    p = _clean_path(path_str)
+    if p is None:
         return None
 
     resident_lookup = {r.lower(): r for r in resident}
-
+    candidates: list[str] = []
     if p.name.lower() == "skill.md":
-        candidate = p.parent.name.lower()
-        if candidate in resident_lookup:
-            return resident_lookup[candidate]
+        candidates.append(p.parent.name.lower())
+
+    lower_parts = [part.lower() for part in p.parts]
+    for idx, part in enumerate(lower_parts[:-1]):
+        if part == "skills":
+            candidates.append(lower_parts[idx + 1])
 
     if p.suffix.lower() == ".md":
-        candidate = p.stem.lower()
+        candidates.append(p.stem.lower())
+    elif not p.suffix and ((p / "SKILL.md").is_file() or (p / "skill.md").is_file()):
+        candidates.append(p.name.lower())
+
+    for candidate in candidates:
         if candidate in resident_lookup:
             return resident_lookup[candidate]
+    return None
 
+
+def normalize_skill_tool_args(
+    args: Mapping[str, Any],
+    skill: str | None = None,
+) -> dict[str, Any] | None:
+    """Rewrite skill directory path arguments in tool args to point at SKILL.md."""
+    for key in ("AbsolutePath", "path"):
+        p = _clean_path(args.get(key))
+        if p is None or p.name.lower() == "skill.md" or p.suffix.lower() == ".md":
+            continue
+        if p.is_dir():
+            for candidate_name in ("SKILL.md", "skill.md"):
+                candidate_file = p / candidate_name
+                if candidate_file.is_file():
+                    return {key: str(candidate_file)}
+        if skill is not None and not p.suffix and p.name.lower() == skill.lower():
+            return {key: str(p / "SKILL.md")}
     return None

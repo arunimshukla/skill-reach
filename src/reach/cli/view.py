@@ -28,7 +28,7 @@ from reach.view import render_view
 from reach.views import Console, build_console, print_query_records, print_scorecard, print_wrote
 
 from .app import LOOP, app
-from .flags import SWITCH, Verbose
+from .flags import SWITCH, SliceFlags, Verbose
 
 
 def _handle_browser_view(
@@ -137,6 +137,7 @@ def _view(
             "'jsonl' (scored query records as JSON lines)",
         ),
     ] = "text",
+    slice_flags: SliceFlags | None = None,
     open_browser: Annotated[
         bool,
         SWITCH,
@@ -148,6 +149,10 @@ def _view(
     verbose: Verbose = False,
 ) -> int:
     """Read back a recorded run and render what it measured."""
+    from reach.diff import load_arm
+    from reach.run import sidecar_path
+
+    eff_slice = slice_flags or SliceFlags()
     target_artifact = artifact or Path(".reach/eval.json")
     if artifact is None and not target_artifact.is_file():
         alt_artifact = Path(".reach/queries.json.artifact.json")
@@ -161,15 +166,23 @@ def _view(
         raise ValueError(msg)
 
     console = build_console()
-    try:
-        recorded = read_artifact(target_artifact)
-    except PydanticValidationError as error:
-        msg = (
-            f"Cannot read artifact at {target_artifact}: expected an evaluation artifact "
-            f"JSON file (written by `reach eval` as <results>{ARTIFACT_SUFFIX}), "
-            f"not raw result rows ({error.error_count()} validation errors)."
-        )
-        raise ValueError(msg) from error
+    if eff_slice.active or sidecar_path(target_artifact).exists():
+        recorded = load_arm(
+            target_artifact,
+            queries=eff_slice.queries,
+            filter_skill=eff_slice.filter_skill,
+            filter_id=eff_slice.filter_id,
+        ).artifact
+    else:
+        try:
+            recorded = read_artifact(target_artifact)
+        except PydanticValidationError as error:
+            msg = (
+                f"Cannot read artifact at {target_artifact}: expected an evaluation artifact "
+                f"JSON file (written by `reach eval` as <results>{ARTIFACT_SUFFIX}), "
+                f"not raw result rows ({error.error_count()} validation errors)."
+            )
+            raise ValueError(msg) from error
 
     if open_browser:
         return _handle_browser_view(console, recorded, out)

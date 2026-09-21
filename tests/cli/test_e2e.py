@@ -592,7 +592,7 @@ def test_eval_formal_execution_with_flags(
             "--rescope",
             "--attempts",
             "1",
-            "--concurrency",
+            "--workers",
             "2",
             "--tag",
             "e2e-synthetic-test",

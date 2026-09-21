@@ -37,6 +37,7 @@ from reach.runtime._env import (
 )
 from reach.runtime._fs import (
     ensure_private_directory,
+    extract_tool_path,
     resolve_skill_from_path,
 )
 from reach.runtime._subprocess import (
@@ -85,8 +86,7 @@ def resolve_skill_from_tool_call(
             return resident_lookup[primary_name.lower()]
 
     # Fallback: check file path arguments (e.g. read or developer tools)
-    path_val = args.get("path") or args.get("file") or args.get("path_str")
-    return resolve_skill_from_path(path_val, resident)
+    return resolve_skill_from_path(extract_tool_path(args), resident)
 
 
 def _parse_jsonl_messages(text: str) -> dict[str, Any] | None:
