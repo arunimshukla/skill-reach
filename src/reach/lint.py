@@ -796,7 +796,6 @@ def _claims_neighbor_name_phrase(
     from reach.retrieval import tokenize
 
     pos_tokens = tokenize(_positive_capability_text(source.description))
-    pos_set = set(pos_tokens)
     neighbor_tokens = [t for t in tokenize(neighbor.name) if t not in FUNCTION_WORDS]
     if (
         len(neighbor_tokens) >= _MIN_DISTINCTIVE_NAME_TOKENS
@@ -804,11 +803,6 @@ def _claims_neighbor_name_phrase(
         and contains_run(pos_tokens, neighbor_tokens)
     ):
         return True
-
-    shared_prefix_tokens = set(tokenize(source.name)) & set(neighbor_tokens)
-    unshared_neighbor_tokens = [t for t in neighbor_tokens if t not in shared_prefix_tokens]
-    if not all(t in pos_set for t in unshared_neighbor_tokens):
-        return False
 
     distinctive = [t for t in neighbor_tokens if t not in taxonomy_tokens]
     if len(distinctive) < _MIN_DISTINCTIVE_NAME_TOKENS or not contains_run(pos_tokens, distinctive):
@@ -1034,6 +1028,7 @@ def _check_missing_mutual_handoffs(
     pair_exclusive_idf = math.log(1.0 + max(0.5, n_docs - 2 + 0.5) / 2.5)
     overlap = rank_corpus(pos_skills)
     comp_by_name = {c.skill: c for c in overlap.competitions}
+    full_comp_by_name = {c.skill: c for c in rank_corpus(skills).competitions}
     refs_by_name = _resolve_refs_by_name(skills, semantics_by_name)
     taxonomy_tokens = _catalog_taxonomy_tokens(skills)
 
@@ -1056,7 +1051,13 @@ def _check_missing_mutual_handoffs(
             if s1_to_s2 and s2_to_s1:
                 continue
 
-            max_lex_ratio = _max_lexical_ratio(s1.name, s2.name, comp_by_name)
+            unacknowledged = not s1_to_s2 and not s2_to_s1
+            pos_lex_ratio = _max_lexical_ratio(s1.name, s2.name, comp_by_name)
+            max_lex_ratio = (
+                max(pos_lex_ratio, _max_lexical_ratio(s1.name, s2.name, full_comp_by_name))
+                if unacknowledged
+                else pos_lex_ratio
+            )
             sem_sim = _symmetric_dense_sim(s1.name, s2.name, dense_similarities)
             shared_terms = _shared_trigger_terms(s1, s2, scorer)
             pair = _PairHandoffContext(
@@ -1076,7 +1077,6 @@ def _check_missing_mutual_handoffs(
                 in_degree,
                 above_threshold=above_thresh,
             )
-            unacknowledged = not s1_to_s2 and not s2_to_s1
             high_neighbor_contention = _has_bidirectional_name_claim(s1, s2, taxonomy_tokens) or (
                 unacknowledged
                 and (

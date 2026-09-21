@@ -73,14 +73,20 @@ _TERMINAL_KEBAB_COORDINATE: Final = (
     rf"(?:`{_KEBAB_TOKEN}`"
     rf"|{_KEBAB_TOKEN}(?=\s*(?:instead\b|first\b|skills?\b|[).,;:]|$|\s+(?:or|and)\b)))"
 )
-_TERMINAL_LIST: Final = (
+_TERMINAL_LIST_SINGULAR: Final = (
     rf"{_TERMINAL_KEBAB}(?:\s+(?:first|instead|skill\b(?!s)))?"
+    rf"(?:\s*(?:,\s*(?:or|and)\b|,|\bor\b|\band\b)\s*"
+    rf"(?:use\s+|see\s+|prefer\s+|the\s+)?{_TERMINAL_KEBAB}(?:\s+(?:first|instead|skill\b(?!s)))?)*"
+)
+_TERMINAL_LIST_WITH_THE: Final = (
+    rf"the\s+{_TERMINAL_KEBAB_COORDINATE}(?:\s+(?:first|instead|skills?\b))?"
     rf"(?:\s*(?:,\s*(?:or|and)\b|,|\bor\b|\band\b)\s*"
     rf"(?:use\s+|see\s+|prefer\s+|the\s+)?{_TERMINAL_KEBAB_COORDINATE}(?:\s+(?:first|instead|skills?\b))?)*"
 )
+_TERMINAL_LIST: Final = rf"(?:{_TERMINAL_LIST_WITH_THE}|{_TERMINAL_LIST_SINGULAR})"
 
 _PAREN_HANDOFF_RE: Final = re.compile(
-    rf"\([^)]*?{_POSITIVE_HANDOFF_VERB}\s+(?:the\s+)?(?P<targets>{_TERMINAL_LIST})[^)]*\)",
+    rf"\([^)]*?{_POSITIVE_HANDOFF_VERB}\s+(?P<targets>{_TERMINAL_LIST})[^)]*\)",
     re.IGNORECASE,
 )
 
@@ -97,7 +103,7 @@ _NEGATIVE_CLAUSE_MARKER_RE: Final = re.compile(
 )
 
 _VERB_TARGET_IN_CLAUSE_RE: Final = re.compile(
-    rf"{_POSITIVE_HANDOFF_VERB}\s+(?:the\s+)?(?P<targets>{_TERMINAL_LIST})",
+    rf"{_POSITIVE_HANDOFF_VERB}\s+(?P<targets>{_TERMINAL_LIST})",
     re.IGNORECASE,
 )
 
