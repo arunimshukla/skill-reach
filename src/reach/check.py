@@ -246,17 +246,31 @@ def _load_catalog_skills(resolved_paths: Sequence[Path]) -> list[Skill]:
     return deduplicate_skills(loaded_skills)
 
 
+def _competing_neighbors_for_modified(
+    modified: set[str],
+    skills: Sequence[Skill],
+) -> set[str]:
+    """Identify competing neighbor skills that could be hijacked by modified skills."""
+    from reach.lint import find_competing_neighbors
+
+    return find_competing_neighbors(modified, skills)
+
+
 def _filter_check_queries(
     queries_path: Path | str,
     modified: set[str],
     changed: bool,
     budget: int,
+    skills: Sequence[Skill] = (),
 ) -> tuple[list[Query], bool]:
-    """Load, filter by modified skills if requested, and slice by budget."""
+    """Load, filter by modified skills and competing neighbors if requested, and slice by budget."""
     query_set = load_query_set(queries_path)
     all_queries = list(query_set.queries)
     if changed:
-        all_queries = [q for q in all_queries if (q.expected_skill in modified)]
+        primary = [q for q in all_queries if q.expected_skill in modified]
+        neighbors = _competing_neighbors_for_modified(modified, skills)
+        guardrails = [q for q in all_queries if q.expected_skill in neighbors]
+        all_queries = primary + guardrails
     total_queries = len(all_queries)
     budget_exhausted = total_queries > budget
     return all_queries[:budget], budget_exhausted
@@ -627,7 +641,8 @@ def run_check(  # noqa: PLR0913
         msg = f"No skill paths specified and no skills found {scope_msg}."
         raise ValueError(msg)
 
-    available = {s.name for s in _load_catalog_skills(resolved_paths)} if changed else set()
+    catalog_skills = _load_catalog_skills(resolved_paths) if changed else []
+    available = {s.name for s in catalog_skills} if changed else set()
     lint_report, modified, early_outcome = _apply_changed_scope(
         lint_report, changed, check_settings.since, check_settings.budget, available
     )
@@ -648,6 +663,7 @@ def run_check(  # noqa: PLR0913
         modified,
         changed,
         check_settings.budget,
+        skills=catalog_skills,
     )
 
     empty_outcome = _check_empty_queries_exit(lint_report, queries_to_run, check_settings.budget)

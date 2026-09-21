@@ -603,3 +603,279 @@ def test_missing_description_in_lint_tree_does_not_crash(
     assert any(
         i.rule == "missing-description" and i.severity == Severity.ERROR for i in report.issues
     )
+
+
+@pytest.mark.parametrize(
+    ("description", "self_name", "expected"),
+    [
+        (
+            (
+                "Monitors BigQuery slot utilization and INFORMATION_SCHEMA.JOBS_TIMELINE. "
+                "Don't use for root-cause diagnosis when cause is unknown "
+                "(use `bigquery-troubleshooting` first), or for writing or optimizing "
+                "business logic SQL (use `bigquery-optimization`)."
+            ),
+            "bigquery-observability",
+            ("bigquery-optimization", "bigquery-troubleshooting"),
+        ),
+        (
+            (
+                "Analyzes Google Cloud BigQuery slot consumption and query costs using "
+                "INFORMATION_SCHEMA. Don't use for generic BigQuery administration "
+                "(use `bigquery-basics`), BigQuery ML (use `bigquery-ai-ml`), or "
+                "DataFrame operations (use `bigquery-bigframes`)."
+            ),
+            "bigquery-slot-cost-optimizer",
+            ("bigquery-ai-ml", "bigquery-basics", "bigquery-bigframes"),
+        ),
+        (
+            (
+                "Diagnoses GKE storage issues and Cloud Storage FUSE OOM. "
+                "Don't use for initial storage provisioning or choosing storage types "
+                "(use `gke-storage`)."
+            ),
+            "gke-storage-troubleshooting",
+            ("gke-storage",),
+        ),
+        (
+            "For slot consumption and query cost tuning, use bigquery-slot-cost-optimizer instead.",
+            "bigquery-observability",
+            ("bigquery-slot-cost-optimizer",),
+        ),
+        (
+            (
+                "Use on-demand pricing, real-time utf-8 streaming, and command-line flags. "
+                "Use `gcloud storage` over legacy `gsutil` and do not use "
+                "bigquery-observability for SQL."
+            ),
+            "bigquery-observability",
+            (),
+        ),
+    ],
+)
+def test_extract_skill_references_parses_handoffs_and_ignores_non_skills(
+    description: str,
+    self_name: str,
+    expected: tuple[str, ...],
+) -> None:
+    """Verify extract_skill_references extracts skill handoffs while ignoring prose/CLI terms."""
+    from reach.lint import extract_skill_references
+
+    assert extract_skill_references(description, self_name=self_name) == expected
+
+
+def test_unknown_skill_reference_flags_dangling_boundary_targets(
+    write_skill: Callable[..., Path],
+    tmp_path: Path,
+) -> None:
+    """Verify unknown-skill-reference errors when description hands off to missing skills."""
+    write_skill(
+        name="bigquery-observability",
+        description=(
+            "Monitors and analyzes Google Cloud BigQuery operational telemetry, job execution "
+            "history, and slot utilization using INFORMATION_SCHEMA.JOBS_TIMELINE. "
+            "Don't use for root-cause diagnosis or symptom troubleshooting when the cause is "
+            "unknown (use `bigquery-troubleshooting` first), or for writing or optimizing "
+            "business logic SQL (use `bigquery-optimization`)."
+        ),
+    )
+    write_skill(
+        name="bigquery-basics",
+        description="Manages BigQuery datasets, tables, and standard administrative operations.",
+    )
+
+    report = lint_tree(tmp_path)
+    unknown_issues = [i for i in report.issues if i.rule == "unknown-skill-reference"]
+    assert len(unknown_issues) == 2
+    assert all(i.severity == Severity.ERROR for i in unknown_issues)
+    assert all(i.skill == "bigquery-observability" for i in unknown_issues)
+    messages = " ".join(i.message for i in unknown_issues)
+    assert "bigquery-troubleshooting" in messages
+    assert "bigquery-optimization" in messages
+
+
+def test_unknown_skill_reference_passes_when_targets_exist_in_catalog(
+    write_skill: Callable[..., Path],
+    tmp_path: Path,
+) -> None:
+    """Verify unknown-skill-reference does not fire when referenced handoff skills exist."""
+    write_skill(
+        name="bigquery-observability",
+        description=(
+            "Monitors BigQuery telemetry. Don't use for root-cause troubleshooting "
+            "(use `bigquery-troubleshooting` first)."
+        ),
+    )
+    write_skill(
+        name="bigquery-troubleshooting",
+        description=(
+            "Troubleshoots BigQuery errors. Don't use for routine telemetry monitoring "
+            "(use `bigquery-observability`)."
+        ),
+    )
+
+    report = lint_tree(tmp_path)
+    unknown_issues = [i for i in report.issues if i.rule == "unknown-skill-reference"]
+    assert len(unknown_issues) == 0
+
+
+def test_missing_mutual_handoff_flags_bigquery_slot_cost_optimizer_and_observability(
+    write_skill: Callable[..., Path],
+    tmp_path: Path,
+) -> None:
+    """Verify missing-mutual-handoff catches unguarded overlap between BigQuery neighbors."""
+    write_skill(
+        name="bigquery-slot-cost-optimizer",
+        description=(
+            "Analyzes Google Cloud BigQuery slot consumption, query costs, and execution "
+            "bottlenecks using INFORMATION_SCHEMA. Use when diagnosing slow BigQuery queries, "
+            "slot starvation, high on-demand query costs, or join performance issues. "
+            "Don't use for generic BigQuery administration (use `bigquery-basics`)."
+        ),
+    )
+    write_skill(
+        name="bigquery-observability",
+        description=(
+            "Monitors Google Cloud BigQuery operational telemetry, slot utilization, and "
+            "reservation performance using INFORMATION_SCHEMA. Use when investigating slot "
+            "usage trends, job concurrency, or capacity planning. "
+            "Don't use for generic BigQuery administration (use `bigquery-basics`)."
+        ),
+    )
+    write_skill(
+        name="bigquery-basics",
+        description=(
+            "Creates and administers BigQuery datasets and tables. "
+            "Don't use for slot cost optimization (use `bigquery-slot-cost-optimizer`) "
+            "or operational telemetry (use `bigquery-observability`)."
+        ),
+    )
+
+    report = lint_tree(tmp_path)
+    mutual_issues = [i for i in report.issues if i.rule == "missing-mutual-handoff"]
+    flagged_skills = {i.skill for i in mutual_issues}
+    assert "bigquery-slot-cost-optimizer" in flagged_skills
+    assert "bigquery-observability" in flagged_skills
+    optimizer_msg = next(
+        i.message for i in mutual_issues if i.skill == "bigquery-slot-cost-optimizer"
+    )
+    assert "bigquery-observability" in optimizer_msg
+
+
+def test_missing_mutual_handoff_flags_gke_storage_troubleshooting_and_storage_fuse(
+    write_skill: Callable[..., Path],
+    tmp_path: Path,
+) -> None:
+    """Verify missing-mutual-handoff catches gke-storage-troubleshooting vs storage-fuse."""
+    write_skill(
+        name="gke-storage-troubleshooting",
+        description=(
+            "Diagnoses and resolves Google Kubernetes Engine (GKE) storage issues including "
+            "PVC Pending states, PersistentVolume mount failures, CSI driver errors, volume "
+            "expansion failures, and Cloud Storage FUSE OOM. Use when pods fail to mount "
+            "volumes or GKE storage workloads crash. Don't use for initial storage "
+            "provisioning or choosing storage types (use `gke-storage`)."
+        ),
+    )
+    write_skill(
+        name="google-cloud-storage-fuse",
+        description=(
+            "Configures, mounts, and tunes Cloud Storage FUSE (gcsfuse) on Google Cloud VMs "
+            "and GKE clusters for high-throughput AI/ML training, caching, and file system "
+            "performance."
+        ),
+    )
+    write_skill(
+        name="gke-storage",
+        description=(
+            "Provisions and configures GKE storage classes and volumes. "
+            "Don't use for troubleshooting volume mount failures "
+            "(use `gke-storage-troubleshooting`)."
+        ),
+    )
+
+    report = lint_tree(tmp_path)
+    mutual_issues = [i for i in report.issues if i.rule == "missing-mutual-handoff"]
+    gke_issues = [
+        i
+        for i in mutual_issues
+        if i.skill == "gke-storage-troubleshooting" and "google-cloud-storage-fuse" in i.message
+    ]
+    fuse_issues = [
+        i
+        for i in mutual_issues
+        if i.skill == "google-cloud-storage-fuse" and "gke-storage-troubleshooting" in i.message
+    ]
+    assert len(gke_issues) == 1
+    assert len(fuse_issues) == 1
+    assert gke_issues[0].severity == Severity.WARN
+
+
+def test_missing_mutual_handoff_resolves_when_reciprocal_handoffs_added(
+    write_skill: Callable[..., Path],
+    tmp_path: Path,
+) -> None:
+    """Verify missing-mutual-handoff passes cleanly once both neighbors hand off to each other."""
+    write_skill(
+        name="gke-storage-troubleshooting",
+        description=(
+            "Diagnoses and resolves GKE storage issues and Cloud Storage FUSE OOM. "
+            "Don't use for Cloud Storage FUSE performance tuning or mount configuration "
+            "(use `google-cloud-storage-fuse`)."
+        ),
+    )
+    write_skill(
+        name="google-cloud-storage-fuse",
+        description=(
+            "Configures, mounts, and tunes Cloud Storage FUSE on GKE clusters. "
+            "Don't use for diagnosing PVC Pending or CSI crash troubleshooting "
+            "(use `gke-storage-troubleshooting`)."
+        ),
+    )
+
+    report = lint_tree(tmp_path)
+    mutual_issues = [i for i in report.issues if i.rule == "missing-mutual-handoff"]
+    assert len(mutual_issues) == 0
+
+
+def test_extract_skill_references_multi_target_list_with_oxford_comma() -> None:
+    """Verify 3+ skill handoff lists with and without Oxford commas extract every skill ID."""
+    from reach.lint import extract_skill_references
+
+    desc = (
+        "Analyzes BigQuery slot consumption and query costs. "
+        "Don't use for generic BigQuery administration, ML, or DataFrames "
+        "(use `bigquery-basics`, `bigquery-ai-ml`, or `bigquery-bigframes`). "
+        "Do not use for streaming ingestion — use pubsub-streaming, dataflow-pipelines and "
+        "bigquery-storage-write."
+    )
+    refs = extract_skill_references(desc, self_name="bigquery-slot-cost-optimizer")
+    assert refs == (
+        "bigquery-ai-ml",
+        "bigquery-basics",
+        "bigquery-bigframes",
+        "bigquery-storage-write",
+        "dataflow-pipelines",
+        "pubsub-streaming",
+    )
+
+
+def test_missing_mutual_handoff_fires_when_neither_skill_has_existing_boundaries(
+    write_skill: Callable[..., Path],
+    tmp_path: Path,
+) -> None:
+    """Verify missing-mutual-handoff fires on unbounded pairs with phrase encroachment."""
+    write_skill(
+        name="gke-storage-troubleshooting",
+        description="Diagnoses and resolves GKE storage issues and Cloud Storage FUSE OOM.",
+    )
+    write_skill(
+        name="google-cloud-storage-fuse",
+        description="Configures, mounts, and tunes Cloud Storage FUSE on GKE clusters.",
+    )
+
+    report = lint_tree(tmp_path)
+    mutual_issues = [i for i in report.issues if i.rule == "missing-mutual-handoff"]
+    skills_flagged = {i.skill for i in mutual_issues}
+    assert skills_flagged == {"gke-storage-troubleshooting", "google-cloud-storage-fuse"}
+

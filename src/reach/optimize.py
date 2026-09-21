@@ -572,6 +572,8 @@ Each candidate should:
 2. Distinctly claim the user tasks and intents this skill solves.
 3. Incorporate distinctive unclaimed terms where natural.
 4. Avoid or disclaim ceded terms that cause confusing misroutes to rivals.
+5. If referencing another skill in a routing handoff ('use <skill>'), only reference
+   existing rival skills listed above — never reference non-existent skill names.
 
 Format your output as a JSON object with a 'candidates' array:
 {{
@@ -587,11 +589,15 @@ Format your output as a JSON object with a 'candidates' array:
 
 def filter_candidates(
     candidates: Sequence[OptimizationCandidate],
-    skill_name: str,  # noqa: ARG001
+    skill_name: str,
     config: LintSettings | None = None,
+    known_skills: Sequence[str] | set[str] | frozenset[str] | None = None,
 ) -> list[OptimizationCandidate]:
     """Validate candidates with static linter rules, marking non-compliant candidates."""
+    from reach.lint import find_unknown_skill_references
+
     lint_config = config or LintSettings()
+    known_lower = {s.lower() for s in known_skills} | {skill_name.lower()} if known_skills else None
     results: list[OptimizationCandidate] = []
 
     for candidate in candidates:
@@ -608,6 +614,21 @@ def filter_candidates(
                     f"Description length {desc_len} > {lint_config.max_description_length}"
                 )
             )
+        elif known_lower is not None:
+            unknown = find_unknown_skill_references(
+                candidate.description,
+                known_lower,
+                self_name=skill_name,
+                settings=lint_config,
+            )
+            if unknown:
+                results.append(
+                    candidate.mark_filtered(
+                        f"References unknown skill(s) in routing handoff: {', '.join(unknown)}"
+                    )
+                )
+            else:
+                results.append(candidate.unfiltered())
         else:
             results.append(candidate.unfiltered())
     return results
@@ -1335,6 +1356,7 @@ def _run_optimization_round(
         raw_candidates,
         skill_name=target_skill.name,
         config=lint_config,
+        known_skills={s.name for s in skills_corpus},
     )
 
     rounds_left = iterations - iter_idx + 1

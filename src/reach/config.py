@@ -440,6 +440,8 @@ class LintSettings(BaseModel):
     max_name_length: int = Field(default=64, ge=1)
     min_description_length: int = Field(default=20, ge=1)
     similarity_threshold: float = Field(default=0.92, ge=0.0, le=1.0)
+    mutual_handoff_similarity_threshold: float = Field(default=0.75, ge=0.0, le=1.0)
+    mutual_handoff_lexical_threshold: float = Field(default=0.35, ge=0.0, le=1.0)
     rules: dict[str, Any] = Field(default_factory=dict)
 
     @classmethod

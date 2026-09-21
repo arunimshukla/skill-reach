@@ -199,6 +199,7 @@ _REWRITE_LABELS = {
     "disclaimed": "already disclaimed",
     "unclaimed": "yours alone",
     "contenders": "also within reach",
+    "mutual_handoff": "missing mutual handoff",
 }
 
 
@@ -216,6 +217,7 @@ def print_rewrite(console: Console, rewrite: Rewrite) -> None:
         ("disclaimed", ", ".join(c.term for c in rewrite.disclaimed)),
         ("unclaimed", ", ".join(rewrite.unclaimed)),
         ("contenders", contender_desc),
+        ("mutual_handoff", ", ".join(rewrite.missing_mutual_handoffs)),
     )
     table = Table(box=box.SIMPLE, pad_edge=False, show_header=False)
     table.add_column("", style="reach.label")

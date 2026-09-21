@@ -95,6 +95,8 @@ power = 0.80
 max_description_length = 1024
 max_name_length = 64
 min_description_length = 20
+mutual_handoff_lexical_threshold = 0.35
+mutual_handoff_similarity_threshold = 0.75
 
 [lint.rules]
 description-too-short = "warn"
@@ -105,9 +107,11 @@ invalid-yaml = "error"
 listing-overflow = "warn"
 lockfile-drift = "warn"
 missing-description = "error"
+missing-mutual-handoff = "warn"
 missing-name = "error"
 name-mismatch = "error"
 reserved-name-collision = "warn"
+unknown-skill-reference = "error"
 unresolved-declared-dependency = "warn"
 unresolved-placeholder = "warn"
 unbounded-attractor = "warn"
@@ -331,10 +335,12 @@ Controls static frontmatter and budget thresholds.
 
 | Key                      | Type    | Default  | Description                                                                              |
 | :----------------------- | :------ | :------- | :--------------------------------------------------------------------------------------- |
-| `max_description_length` | Integer | `1024`   | Maximum allowable character length for description before triggering `listing-overflow`. |
-| `min_description_length` | Integer | `20`     | Minimum character length before triggering `description-too-short`.                      |
-| `max_name_length`        | Integer | `64`     | Maximum character length for skill name.                                                 |
-| `rules.<rule-name>`      | String  | (varies) | Severity override for any static lint rule: `"error"`, `"warn"`, or `"ignore"`.          |
+| `max_description_length`              | Integer | `1024`   | Maximum allowable character length for description before triggering `listing-overflow`. |
+| `min_description_length`              | Integer | `20`     | Minimum character length before triggering `description-too-short`.                      |
+| `max_name_length`                     | Integer | `64`     | Maximum character length for skill name.                                                 |
+| `mutual_handoff_similarity_threshold` | Float   | `0.75`   | Minimum semantic similarity between neighbors before requiring reciprocal handoffs.      |
+| `mutual_handoff_lexical_threshold`    | Float   | `0.35`   | Minimum lexical competition score before requiring reciprocal handoffs.                  |
+| `rules.<rule-name>`                   | String  | (varies) | Severity override for any static lint rule: `"error"`, `"warn"`, or `"ignore"`.          |
 
 ### `[check]`
 

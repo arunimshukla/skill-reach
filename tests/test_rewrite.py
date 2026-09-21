@@ -756,3 +756,46 @@ def test_unclaimed_terms_with_pretokenized_corpus(make_corpus) -> None:
         tokenized_corpus=tokenized,
     )
     assert isinstance(terms, tuple)
+
+
+def test_suggest_rewrite_tracks_missing_mutual_handoffs(corpus_builder) -> None:
+    """Verify suggest_rewrite identifies rivals missing reciprocal handoffs back to target."""
+    unreciprocated = (
+        corpus_builder()
+        .add(
+            "bigquery-observability",
+            "Monitors BigQuery slot utilization and INFORMATION_SCHEMA telemetry. "
+            "Don't use for query cost tuning (use `bigquery-slot-cost-optimizer`).",
+        )
+        .add(
+            "bigquery-slot-cost-optimizer",
+            "Analyzes BigQuery slot consumption and query costs using INFORMATION_SCHEMA.",
+        )
+        .build_skills()
+    )
+    overlap_1 = rank_corpus(unreciprocated)
+    rw_1 = suggest_rewrite(overlap_1.find("bigquery-observability"), unreciprocated)
+    assert rw_1.rival == "bigquery-slot-cost-optimizer"
+    assert rw_1.rival_disclaims_target is False
+    assert "bigquery-slot-cost-optimizer" in rw_1.missing_mutual_handoffs
+
+    reciprocated = (
+        corpus_builder()
+        .add(
+            "bigquery-observability",
+            "Monitors BigQuery slot utilization and INFORMATION_SCHEMA telemetry. "
+            "Don't use for query cost tuning (use `bigquery-slot-cost-optimizer`).",
+        )
+        .add(
+            "bigquery-slot-cost-optimizer",
+            "Analyzes BigQuery slot consumption and query costs using INFORMATION_SCHEMA. "
+            "Don't use for operational telemetry monitoring (use `bigquery-observability`).",
+        )
+        .build_skills()
+    )
+    overlap_2 = rank_corpus(reciprocated)
+    rw_2 = suggest_rewrite(overlap_2.find("bigquery-observability"), reciprocated)
+    assert rw_2.rival == "bigquery-slot-cost-optimizer"
+    assert rw_2.rival_disclaims_target is True
+    assert rw_2.missing_mutual_handoffs == ()
+
