@@ -106,6 +106,16 @@ class MapFlags(Flags):
         Field(serialization_alias="expected_skill"),
         Parameter(help="Column holding the skill that should be selected"),
     ] = None
+    acceptable_skills_column: Annotated[
+        str | None,
+        Field(serialization_alias="acceptable_skills"),
+        Parameter(help="Column holding neutral router or helper skills"),
+    ] = None
+    notes_column: Annotated[
+        str | None,
+        Field(serialization_alias="notes"),
+        Parameter(help="Column holding per-query notes"),
+    ] = None
     separator: Annotated[
         str | None,
         Parameter(help="Delimiter separating multiple skill names in a single cell"),
