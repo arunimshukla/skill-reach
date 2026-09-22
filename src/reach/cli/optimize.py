@@ -200,6 +200,22 @@ def _optimize(
             help="1-based candidate rank to inspect diff or apply (default: 1)",
         ),
     ] = 1,
+    workers: Annotated[
+        int | None,
+        POSITIVE_INT,
+        Parameter(
+            name=["--workers", "-j"],
+            help="Number of parallel probe workers (default: from reach.toml or 4)",
+        ),
+    ] = None,
+    with_handoff: Annotated[
+        bool,
+        SWITCH,
+        Parameter(
+            name="--with-handoff",
+            help="Synthesize and stage reciprocal Layer-2 SKILL.md Routing Notes",
+        ),
+    ] = False,
     format: Annotated[
         OptimizeFormat,
         Parameter(
@@ -216,9 +232,10 @@ def _optimize(
 ) -> int:
     """Optimize a skill's description using candidate synthesis and empirical probes."""
     from reach.optimize import optimize_skill
-    from reach.views import build_console
+    from reach.views import Console, build_console
 
     console = build_console()
+    err_console = Console(stderr=True)
 
     from reach.config import OptimizeSettings, RunConfig, default_agent
 
@@ -229,6 +246,11 @@ def _optimize(
     resolved_agent = agent or (
         run_config.runtime.agent if run_config is not None else default_agent()
     )
+    runtime_options = (
+        dict(run_config.runtime.options)
+        if run_config is not None and run_config.runtime.options
+        else None
+    )
     eff_settings = RunConfig.resolve(
         OptimizeSettings,
         config=run_config,
@@ -237,6 +259,8 @@ def _optimize(
         holdout=holdout if holdout != DEFAULT_HOLDOUT or run_config is None else None,
         review=review if review or run_config is None else None,
         auto_queries=auto_queries if not auto_queries or run_config is None else None,
+        workers=workers,
+        with_handoff=with_handoff if with_handoff or run_config is None else None,
     )
 
     from reach.catalog import resolve_skill_target
@@ -267,13 +291,21 @@ def _optimize(
 
     from contextlib import nullcontext
 
+    is_tty = sys.stderr.isatty()
     status_msg = (
         f"[cyan]Optimizing skill [bold]{effective_skill}[/bold] "
-        f"(budget: {eff_settings.budget})...[/cyan]"
+        f"(budget: {eff_settings.budget}, workers: {eff_settings.workers})...[/cyan]"
     )
-    status_ctx = (
-        console.status(status_msg) if format == "text" and sys.stderr.isatty() else nullcontext()
-    )
+    status_ctx = console.status(status_msg) if format == "text" and is_tty else nullcontext()
+
+    def _on_progress(msg: str) -> None:
+        if format != "text":
+            return
+        update_fn = getattr(status_ctx, "update", None)
+        if is_tty and callable(update_fn):
+            update_fn(f"[cyan]{msg}[/cyan]")
+        else:
+            err_console.print(f"[dim]\\[reach optimize][/dim] {msg}")
 
     try:
         with status_ctx:
@@ -284,11 +316,13 @@ def _optimize(
                 agent=resolved_agent,
                 candidates_count=candidates,
                 auto_apply=auto_apply,
+                runtime_options=runtime_options,
                 force=force,
                 config=config,
                 global_scope=global_,
                 settings=eff_settings,
                 candidate_index=candidate,
+                progress_callback=_on_progress if format == "text" else None,
             )
     except ValueError as err:
         console.print(f"[red]Error:[/] {err}")
@@ -304,6 +338,7 @@ def _optimize(
         candidate=candidate,
         auto_apply=auto_apply,
         force=force,
+        yes=yes,
     )
 
 
@@ -315,6 +350,7 @@ def _render_optimization_output(
     candidate: int,
     auto_apply: bool,
     force: bool,
+    yes: bool = False,
 ) -> int:
     """Render optimization report in requested format or launch interactive prompt."""
     from reach.views import print_optimization, render_optimization_diff
@@ -336,7 +372,13 @@ def _render_optimization_output(
                 console.print("[dim]No modifications recommended or diff unavailable.[/]")
         case _:
             print_optimization(console, report)
-            if not auto_apply and report.candidates and sys.stdin.isatty() and sys.stdout.isatty():
+            if (
+                not auto_apply
+                and not yes
+                and report.candidates
+                and sys.stdin.isatty()
+                and sys.stdout.isatty()
+            ):
                 _prompt_interactive_apply(
                     console,
                     report,
@@ -404,7 +446,7 @@ def _prompt_interactive_apply(
     if not report.candidates or not report.manifest_path:
         return
 
-    from reach.optimize import update_skill_description
+    from reach.optimize import apply_optimization_candidate
 
     n_cands = len(report.candidates)
     def_idx = default_candidate if 1 <= default_candidate <= n_cands else 1
@@ -430,7 +472,7 @@ def _prompt_interactive_apply(
         should_apply, selected_idx = parsed
         if should_apply:
             target_cand = report.candidates[selected_idx - 1]
-            if update_skill_description(report.manifest_path, target_cand.description):
+            if apply_optimization_candidate(report, target_cand):
                 console.print(
                     f"[green]✓[/green] Applied candidate #{selected_idx} description to "
                     f"[bold]{report.manifest_path}[/bold]"

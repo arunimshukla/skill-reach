@@ -28,6 +28,13 @@ if TYPE_CHECKING:
     from reach.optimize import OptimizationCandidate, OptimizationReport
 
 
+def _should_show_trajectory_recall(report: OptimizationReport) -> bool:
+    """Determine whether trajectory recall columns/metrics should be displayed."""
+    return report.handoff is not None or any(
+        c.trajectory_recall > c.recall for c in report.candidates
+    )
+
+
 def render_optimization_diff(
     report: OptimizationReport,
     candidate_index: int = 1,
@@ -41,13 +48,31 @@ def render_optimization_diff(
     cand = report.candidates[idx]
     baseline_lines = ["description: >-\n", f"  {report.baseline_description}\n"]
     candidate_lines = ["description: >-\n", f"  {cand.description}\n"]
-    diff = difflib.unified_diff(
-        baseline_lines,
-        candidate_lines,
-        fromfile=f"a/{report.skill_name}/SKILL.md",
-        tofile=f"b/{report.skill_name}/SKILL.md (candidate #{candidate_index})",
+
+    if report.handoff is not None:
+        baseline_lines.extend(report.handoff.target_body_before.splitlines(keepends=True))
+        candidate_lines.extend(report.handoff.target_body_after.splitlines(keepends=True))
+
+    target_diff = "".join(
+        difflib.unified_diff(
+            baseline_lines,
+            candidate_lines,
+            fromfile=f"a/{report.skill_name}/SKILL.md",
+            tofile=f"b/{report.skill_name}/SKILL.md (candidate #{candidate_index})",
+        )
     )
-    return "".join(diff)
+    if report.handoff is None:
+        return target_diff
+
+    rival_diff = "".join(
+        difflib.unified_diff(
+            report.handoff.rival_body_before.splitlines(keepends=True),
+            report.handoff.rival_body_after.splitlines(keepends=True),
+            fromfile=f"a/{report.handoff.rival_skill}/SKILL.md",
+            tofile=f"b/{report.handoff.rival_skill}/SKILL.md (reciprocal handoff)",
+        )
+    )
+    return f"{target_diff}{rival_diff}"
 
 
 MAX_DESCRIPTION_PREVIEW: Final[int] = 55
@@ -63,6 +88,11 @@ def _print_optimization_baseline(console: Console, report: OptimizationReport) -
     if report.unclaimed_terms:
         console.print(
             f"[bold]Unclaimed Distinctive Terms:[/] [green]{', '.join(report.unclaimed_terms)}[/]",
+        )
+    if report.handoff is not None:
+        console.print(
+            f"[bold]Layer-2 Reciprocal Handoff:[/] "
+            f"[cyan]{report.handoff.target_skill} ↔ {report.handoff.rival_skill}[/]"
         )
 
     if report.rounds:
@@ -85,10 +115,15 @@ def _print_optimization_baseline(console: Console, report: OptimizationReport) -
                 )
         console.print()
 
+    show_traj = _should_show_trajectory_recall(report)
     if report.has_probes:
+        traj_segment = (
+            f"Trajectory Recall: {report.baseline_trajectory_recall:.1%} | " if show_traj else ""
+        )
         console.print(
             f"[bold]Baseline Metrics:[/] "
             f"Recall: {report.baseline_recall:.1%} | "
+            f"{traj_segment}"
             f"Accuracy: {report.baseline_accuracy:.1%} | "
             f"Misroutes: {report.baseline_misroute:.1%}\n",
         )
@@ -115,7 +150,8 @@ def _format_candidate_row(
     idx: int,
     *,
     has_test: Literal[True],
-) -> tuple[str, str, str, str, str, str, str]: ...
+    show_traj: bool = False,
+) -> tuple[str, ...]: ...
 
 
 @overload
@@ -125,7 +161,8 @@ def _format_candidate_row(
     idx: int,
     *,
     has_test: Literal[False] = False,
-) -> tuple[str, str, str, str, str, str]: ...
+    show_traj: bool = False,
+) -> tuple[str, ...]: ...
 
 
 @overload
@@ -135,7 +172,8 @@ def _format_candidate_row(
     idx: int,
     *,
     has_test: bool,
-) -> tuple[str, str, str, str, str, str, str] | tuple[str, str, str, str, str, str]: ...
+    show_traj: bool = False,
+) -> tuple[str, ...]: ...
 
 
 def _format_candidate_row(
@@ -144,37 +182,43 @@ def _format_candidate_row(
     idx: int,
     *,
     has_test: bool = False,
-) -> tuple[str, str, str, str, str, str, str] | tuple[str, str, str, str, str, str]:
+    show_traj: bool = False,
+) -> tuple[str, ...]:
     """Format single candidate row values for optimization comparison table."""
     if has_probes:
         delta_str = _format_candidate_delta(cand.delta_recall)
         rec_str = f"{cand.recall:.1%}"
+        traj_str = f"{cand.trajectory_recall:.1%}"
         mis_str = f"{cand.misroute_rate:.1%}"
     else:
         delta_str = "[dim]—[/]"
         rec_str = "[dim]—[/]"
+        traj_str = "[dim]—[/]"
         mis_str = "[dim]—[/]"
 
     lint_str = "[green]✓ CLEAN[/]" if cand.lint_clean else "[yellow]✗ WARN[/]"
+    row: list[str] = [f"#{idx}", cand.description, delta_str, rec_str]
+    if show_traj:
+        row.append(traj_str)
     if has_test:
         test_str = f"{cand.test_recall:.1%}" if cand.test_recall is not None else "[dim]—[/]"
-        return f"#{idx}", cand.description, delta_str, rec_str, test_str, mis_str, lint_str
-
-    return f"#{idx}", cand.description, delta_str, rec_str, mis_str, lint_str
+        row.append(test_str)
+    row.extend([mis_str, lint_str])
+    return tuple(row)
 
 
 def _print_optimization_footer(console: Console, report: OptimizationReport) -> None:
     """Print next-step application recommendation or confirmation notice."""
     if report.applied:
+        handoff_suffix = (
+            f" and {report.handoff.rival_skill}/SKILL.md" if report.handoff is not None else ""
+        )
         console.print(
-            f"[bold green]✓ Successfully updated {report.skill_name}/SKILL.md "
+            f"[bold green]✓ Successfully updated {report.skill_name}/SKILL.md{handoff_suffix} "
             "with candidate #1![/]",
         )
     elif report.best_candidate:
-        has_improvement = report.best_candidate.delta_recall > 0.0 or (
-            report.best_candidate.delta_recall == 0.0
-            and report.best_candidate.misroute_rate < report.baseline_misroute
-        )
+        has_improvement = report.candidate_has_improvement(report.best_candidate)
         if report.has_probes and not has_improvement:
             if report.baseline_recall >= 1.0 and report.baseline_misroute <= 0.0:
                 console.print(
@@ -213,19 +257,30 @@ def print_optimization(console: Console, report: OptimizationReport) -> None:
         return
 
     has_test = any(c.test_recall is not None for c in report.candidates)
+    show_traj = _should_show_trajectory_recall(report)
 
     table = Table(box=box.ROUNDED, show_header=True, header_style="bold", expand=True)
     table.add_column("Rank", justify="center", style="bold", no_wrap=True)
     table.add_column("Candidate Description", style="cyan", ratio=4)
     table.add_column("Δ Recall", justify="right", no_wrap=True)
     table.add_column("Recall", justify="right", no_wrap=True)
+    if show_traj:
+        table.add_column("Traj Recall", justify="right", no_wrap=True)
     if has_test:
         table.add_column("Holdout Recall", justify="right", no_wrap=True)
     table.add_column("Misroutes", justify="right", no_wrap=True)
     table.add_column("Linter", justify="center", no_wrap=True)
 
     for idx, cand in enumerate(report.candidates, start=1):
-        table.add_row(*_format_candidate_row(cand, report.has_probes, idx, has_test=has_test))
+        table.add_row(
+            *_format_candidate_row(
+                cand,
+                report.has_probes,
+                idx,
+                has_test=has_test,
+                show_traj=show_traj,
+            )
+        )
 
     console.print(table)
     console.print()
