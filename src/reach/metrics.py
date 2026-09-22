@@ -648,10 +648,11 @@ def _probe_outcome_is_pass(result: ProbeResult, query: Query | None = None) -> b
     if result.error:
         return False
     if query is not None:
-        return query.effective_predicted_label(result) == query.truth_label
+        return score_trajectory(query, result.invoked_skills).trajectory_hit
     if result.invocation_pattern is not None:
         return result.invocation_pattern in (
             InvocationPattern.ORACLE_ONLY,
+            InvocationPattern.MIXED_ORACLE,
             InvocationPattern.CORRECT_ABSTENTION,
         )
     return result.selected

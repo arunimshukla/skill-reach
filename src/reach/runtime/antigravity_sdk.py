@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 from collections.abc import Mapping
@@ -69,6 +70,7 @@ from reach.runtime._fs import (
     ensure_private_directory,
     extract_tool_path,
     normalize_skill_tool_args,
+    probe_slot_dir,
     resolve_skill_from_path,
     safe_cleanup_isolated_dir,
 )
@@ -452,6 +454,12 @@ class AntigravitySdkRuntime(_AntigravitySdkConfigMixin, AntigravityRuntime):
             return (*SELECTION_TOOLS, *MULTI_TURN_SELECTION_TOOLS)
         return MULTI_TURN_SELECTION_TOOLS
 
+    @staticmethod
+    def _resolve_sdk_slot(workdir: Path) -> tuple[Path, Path]:
+        """Resolve the root SDK directory and thread-isolated slot directory."""
+        sdk_root = (Path(workdir) / ".reach_antigravity_sdk").resolve()
+        return sdk_root, probe_slot_dir(sdk_root)
+
     def _select_config(
         self,
         workdir: Path,
@@ -460,9 +468,12 @@ class AntigravitySdkRuntime(_AntigravitySdkConfigMixin, AntigravityRuntime):
         """Assemble LocalAgentConfig with turn budget, inspection tools, and hooks."""
         app_data_dir = None
         if self.options.isolate_config_dir or self.options.app_data_dir:
-            sdk_dir = ensure_private_directory(
-                self.options.app_data_dir or (workdir / ".reach_antigravity_sdk")
+            sdk_target = (
+                self.options.app_data_dir
+                if self.options.app_data_dir is not None
+                else self._resolve_sdk_slot(workdir)[1]
             )
+            sdk_dir = ensure_private_directory(sdk_target)
             app_data_dir = str(sdk_dir)
 
         enabled_tools = list(self._default_selection_tools)
@@ -594,8 +605,14 @@ class AntigravitySdkRuntime(_AntigravitySdkConfigMixin, AntigravityRuntime):
         if not self.options.auto_clean:
             return
         if self.options.isolate_config_dir:
-            sdk_dir = self.options.app_data_dir or (Path(workdir) / ".reach_antigravity_sdk")
-            safe_cleanup_isolated_dir(workdir, sdk_dir)
+            if self.options.app_data_dir is not None:
+                safe_cleanup_isolated_dir(workdir, self.options.app_data_dir)
+            else:
+                sdk_root, slot_dir = self._resolve_sdk_slot(workdir)
+                safe_cleanup_isolated_dir(workdir, slot_dir)
+                # Prune the root only once the last concurrent worker has released its slot.
+                with contextlib.suppress(OSError):
+                    sdk_root.rmdir()
 
     @override
     def select(

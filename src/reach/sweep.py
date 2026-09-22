@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import difflib
 import math
 import random
 import statistics
@@ -36,7 +37,7 @@ from reach.catalog import (
 from reach.config import RunConfig
 from reach.diff import DEFAULT_CONFIDENCE, NOISE_INFLATION
 from reach.diff import noise_floor as diff_noise_floor
-from reach.metrics import DecompositionResult, decompose_pass_rate_drop
+from reach.metrics import DecompositionResult, decompose_pass_rate_drop, score_trajectory
 from reach.models import NO_SKILL, Catalog, CatalogMode, ProbeResult, Query, QueryKind, Skill
 from reach.queries import QuerySet, load_query_set
 from reach.run import Composition, conduct
@@ -44,7 +45,7 @@ from reach.runtime import AgentRuntime, build_runtime
 from reach.uncertainty import wilson_interval
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+    from collections.abc import Callable, Mapping, Sequence
 
 __all__ = [
     "ScalingPoint",
@@ -76,6 +77,8 @@ class ScalingPoint(BaseModel):
     abstention_interval: tuple[float, float] | None = None
     f1_score: float = 0.0
     f1_interval: tuple[float, float] = (0.0, 1.0)
+    entrypoint_pass_rate: float | None = None
+    entrypoint_f1_score: float | None = None
     in_scope_probes: int = 0
     negative_probes: int = 0
     disclosure_states: dict[str, int] = Field(default_factory=dict)
@@ -216,30 +219,60 @@ def find_kneedle_knee(
     return None
 
 
+def _evaluate_probe_trajectory(
+    result: ProbeResult,
+    expected: str | None,
+    query: Query | None = None,
+    *,
+    trajectory: bool = True,
+) -> tuple[bool, tuple[str, ...]]:
+    """Evaluate probe trajectory via score_trajectory and return (hit, scored_invocations)."""
+    raw_seq = (
+        tuple(result.invoked_skills)
+        if result.invoked_skills
+        else ((result.invoked_skill,) if result.invoked_skill is not None else ())
+    )
+    if query is not None:
+        t_score = score_trajectory(query, raw_seq)
+        scored_seq = query.scored_invocations(raw_seq)
+        hit = t_score.trajectory_hit if trajectory else t_score.entrypoint_hit
+        return (not result.error and hit), scored_seq
+
+    scored_seq = raw_seq
+    if expected is None:
+        return (not result.error and len(scored_seq) == 0), scored_seq
+    hit = (
+        (expected in scored_seq) if trajectory else (bool(scored_seq) and scored_seq[0] == expected)
+    )
+    return (not result.error and hit), scored_seq
+
+
 def _classify_probe_outcome(
     result: ProbeResult,
     expected: str | None,
     installed_skills: set[str],
     target_skill: str | None = None,
+    query: Query | None = None,
+    *,
+    trajectory: bool = True,
 ) -> tuple[bool, bool, bool]:
     """Classify a single probe result into (is_tp, is_fp, is_fn) confusion indicators."""
+    hit, scored_seq = _evaluate_probe_trajectory(result, expected, query, trajectory=trajectory)
     if target_skill is not None:
-        is_tp = (
-            not result.error and expected == target_skill and result.predicted_label == target_skill
-        )
+        is_tp = expected == target_skill and hit
         is_fn = expected == target_skill and not is_tp
-        is_fp = (
-            not result.error and result.predicted_label == target_skill and expected != target_skill
+        invoked_target = (
+            (target_skill in scored_seq)
+            if trajectory
+            else (bool(scored_seq) and scored_seq[0] == target_skill)
         )
+        is_fp = not result.error and invoked_target and expected != target_skill
         return is_tp, is_fp, is_fn
 
-    is_tp = not result.error and expected is not None and result.predicted_label == expected
+    is_tp = expected is not None and hit
     is_fn = expected is not None and not is_tp
-    is_fp = (
-        not result.error
-        and result.predicted_label in installed_skills
-        and result.predicted_label != expected
-    )
+    first_invoked = scored_seq[0] if scored_seq else NO_SKILL
+    is_fp = not result.error and not hit and first_invoked in installed_skills
     return is_tp, is_fp, is_fn
 
 
@@ -250,6 +283,9 @@ def bootstrap_f1_ci(
     iterations: int = 1000,
     seed: int = 42,
     target_skill: str | None = None,
+    queries_by_id: Mapping[str, Query] | None = None,
+    *,
+    trajectory: bool = True,
 ) -> tuple[float, float]:
     """Compute empirical bootstrap confidence interval for micro F1 score."""
     m = len(results)
@@ -257,7 +293,14 @@ def bootstrap_f1_ci(
         return (0.0, 1.0)
 
     outcomes = [
-        _classify_probe_outcome(r, truth.get(r.query_id), installed_skills, target_skill)
+        _classify_probe_outcome(
+            r,
+            truth.get(r.query_id),
+            installed_skills,
+            target_skill=target_skill,
+            query=queries_by_id.get(r.query_id) if queries_by_id is not None else None,
+            trajectory=trajectory,
+        )
         for r in results
     ]
     tp_arr = [int(tp) for tp, _, _ in outcomes]
@@ -331,6 +374,50 @@ def compute_sla_crossings(
     return discrete_k, interp_k
 
 
+_FUZZY_MATCH_CUTOFF = 0.5
+_MAX_FUZZY_SUGGESTIONS = 3
+_ADAPTIVE_WORKER_REFERENCE_SCALE = 25
+
+
+class _SkillNotFoundError(KeyError, ValueError):
+    """Raise when a requested target or anchor skill is absent from the loaded corpus."""
+
+    def __str__(self) -> str:
+        """Return unquoted exception message string."""
+        return str(self.args[0]) if self.args else ""
+
+
+def _format_missing_skill_hint(
+    missing_names: Sequence[str],
+    corpus_names: Sequence[str],
+) -> str:
+    """Build a fuzzy close-match suggestion suffix for missing skill names."""
+    sorted_names = sorted(corpus_names)
+    suggestions: list[str] = []
+    for name in missing_names:
+        scored = [
+            (difflib.SequenceMatcher(None, name, candidate).ratio(), candidate)
+            for candidate in sorted_names
+        ]
+        scored.sort(key=lambda item: (-item[0], item[1]))
+        matches = [candidate for ratio, candidate in scored if ratio >= _FUZZY_MATCH_CUTOFF][
+            :_MAX_FUZZY_SUGGESTIONS
+        ]
+        if len(matches) < _MAX_FUZZY_SUGGESTIONS and "-" in name:
+            prefix = "-".join(name.split("-")[:-1]) + "-"
+            for candidate in sorted_names:
+                if candidate.startswith(prefix) and candidate not in matches:
+                    matches.append(candidate)
+                    if len(matches) >= _MAX_FUZZY_SUGGESTIONS:
+                        break
+        for match in matches:
+            if match not in suggestions:
+                suggestions.append(match)
+    if not suggestions:
+        return ""
+    return f". Did you mean: {', '.join(suggestions[:_MAX_FUZZY_SUGGESTIONS])}?"
+
+
 def _resolve_sweep_target_and_queries(
     skills: Sequence[Skill],
     raw_query_set: QuerySet,
@@ -346,8 +433,9 @@ def _resolve_sweep_target_and_queries(
 
     by_name = {s.name: s for s in skills}
     if target not in by_name:
-        msg = f"target skill {target!r} not found in loaded skills"
-        raise KeyError(msg)
+        hint = _format_missing_skill_hint((target,), tuple(by_name))
+        msg = f"target skill {target!r} not found in loaded skills{hint}"
+        raise _SkillNotFoundError(msg)
 
     target_queries = tuple(
         q
@@ -410,32 +498,29 @@ class _ScaleDecomposition(NamedTuple):
 
 def _calculate_scale_pass_rate(
     results: Sequence[ProbeResult],
-    truth_labels: Mapping[str, str],
-    truth_expected: Mapping[str, str | None] | None = None,
+    queries_by_id: Mapping[str, Query],
     target_skill: str | None = None,
+    *,
+    trajectory: bool = True,
 ) -> _ScalePassRate:
     """Calculate overall pass rate, failure count, and Wilson confidence interval."""
     executed = len(results)
-    if target_skill is not None and truth_expected is not None:
-        hits = sum(
-            1
-            for r in results
-            if not r.error
-            and (
-                (
-                    truth_expected.get(r.query_id) == target_skill
-                    and r.predicted_label == target_skill
-                )
-                or (
-                    truth_expected.get(r.query_id) != target_skill
-                    and r.predicted_label != target_skill
-                )
+    hits = 0
+    for r in results:
+        if r.error:
+            continue
+        q = queries_by_id.get(r.query_id)
+        exp = q.expected_skill if q is not None else None
+        if target_skill is not None:
+            is_tp, is_fp, _ = _classify_probe_outcome(
+                r, exp, set(), target_skill, query=q, trajectory=trajectory
             )
-        )
-    else:
-        hits = sum(
-            1 for r in results if not r.error and r.predicted_label == truth_labels.get(r.query_id)
-        )
+            if (exp == target_skill and is_tp) or (exp != target_skill and not is_fp):
+                hits += 1
+        else:
+            hit, _ = _evaluate_probe_trajectory(r, exp, q, trajectory=trajectory)
+            if hit:
+                hits += 1
     fails = executed - hits
     pass_rate = hits / executed if executed else 0.0
     interval_obj = wilson_interval(hits, executed)
@@ -450,18 +535,32 @@ def _calculate_scale_pass_rate(
 
 def _compute_scope_counts(
     in_scope: Sequence[ProbeResult],
-    truth_expected: Mapping[str, str | None],
+    queries_by_id: Mapping[str, Query],
     installed: set[str],
     target_skill: str | None = None,
+    *,
+    trajectory: bool = True,
 ) -> tuple[int, int, float, tuple[float, float]]:
     """Compute true positives, routing false positives, recall, and Wilson interval."""
     relevant = [
         r
         for r in in_scope
-        if target_skill is None or truth_expected.get(r.query_id) == target_skill
+        if target_skill is None
+        or (
+            queries_by_id[r.query_id].expected_skill == target_skill
+            if r.query_id in queries_by_id
+            else False
+        )
     ]
     outcomes = [
-        _classify_probe_outcome(r, truth_expected.get(r.query_id), installed, target_skill)
+        _classify_probe_outcome(
+            r,
+            queries_by_id[r.query_id].expected_skill if r.query_id in queries_by_id else None,
+            installed,
+            target_skill,
+            query=queries_by_id.get(r.query_id),
+            trajectory=trajectory,
+        )
         for r in in_scope
     ]
     tp = sum(1 for is_tp, _, _ in outcomes if is_tp)
@@ -474,13 +573,34 @@ def _compute_scope_counts(
 
 def _compute_negative_counts(
     negative: Sequence[ProbeResult],
+    queries_by_id: Mapping[str, Query],
     installed: set[str],
     target_skill: str | None = None,
+    *,
+    trajectory: bool = True,
 ) -> tuple[int, int, float | None, tuple[float, float] | None]:
     """Compute true negatives, distractor false positives, and abstention intervals."""
-    tn = sum(1 for r in negative if not r.error and r.predicted_label == NO_SKILL)
+    tn = sum(
+        1
+        for r in negative
+        if _evaluate_probe_trajectory(
+            r,
+            None,
+            queries_by_id.get(r.query_id),
+            trajectory=trajectory,
+        )[0]
+    )
     fp_distractor = sum(
-        1 for r in negative if _classify_probe_outcome(r, None, installed, target_skill)[1]
+        1
+        for r in negative
+        if _classify_probe_outcome(
+            r,
+            None,
+            installed,
+            target_skill,
+            query=queries_by_id.get(r.query_id),
+            trajectory=trajectory,
+        )[1]
     )
     if not negative:
         return tn, fp_distractor, None, None
@@ -518,35 +638,63 @@ def _compute_f1_score(precision: float, recall: float) -> float:
 
 def _calculate_scale_classification(
     results: Sequence[ProbeResult],
-    truth_expected: Mapping[str, str | None],
+    queries_by_id: Mapping[str, Query],
     installed_skills: set[str] | None,
     seed: int,
     target_skill: str | None = None,
+    *,
+    trajectory: bool = True,
+    compute_ci: bool = True,
 ) -> _ScaleClassificationMetrics:
     """Calculate precision, recall, abstention rate, and F1 confidence intervals."""
     installed = installed_skills if installed_skills is not None else set()
-    in_scope = [r for r in results if truth_expected.get(r.query_id) is not None]
-    negative = [r for r in results if truth_expected.get(r.query_id) is None]
+    in_scope = [
+        r
+        for r in results
+        if (queries_by_id[r.query_id].expected_skill if r.query_id in queries_by_id else None)
+        is not None
+    ]
+    negative = [
+        r
+        for r in results
+        if (queries_by_id[r.query_id].expected_skill if r.query_id in queries_by_id else None)
+        is None
+    ]
 
     tp, internal_fp, recall, recall_interval = _compute_scope_counts(
-        in_scope, truth_expected, installed, target_skill=target_skill
+        in_scope,
+        queries_by_id,
+        installed,
+        target_skill=target_skill,
+        trajectory=trajectory,
     )
     _tn, fp_distractor, abstention_rate, abstention_interval = _compute_negative_counts(
-        negative, installed, target_skill=target_skill
+        negative,
+        queries_by_id,
+        installed,
+        target_skill=target_skill,
+        trajectory=trajectory,
     )
     internal_prec, ext_prec, precision, precision_interval = _compute_precision_metrics(
         tp, internal_fp, fp_distractor, bool(negative)
     )
 
     f1 = _compute_f1_score(precision, recall)
-    f1_ci = bootstrap_f1_ci(
-        results,
-        truth_expected,
-        installed,
-        iterations=1000,
-        seed=seed,
-        target_skill=target_skill,
-    )
+    if compute_ci:
+        truth_expected = {qid: q.expected_skill for qid, q in queries_by_id.items()}
+        f1_ci = bootstrap_f1_ci(
+            results,
+            truth_expected,
+            installed,
+            iterations=1000,
+            seed=seed,
+            target_skill=target_skill,
+            queries_by_id=queries_by_id,
+            trajectory=trajectory,
+        )
+    else:
+        rounded_f1 = round(f1, 4)
+        f1_ci = (rounded_f1, rounded_f1)
 
     return _ScaleClassificationMetrics(
         in_scope_probes=len(in_scope),
@@ -636,14 +784,37 @@ def _build_scaling_point(
 ) -> tuple[ScalingPoint, DecompositionResult | None]:
     """Calculate point metrics, Wilson confidence intervals, and pass-rate decomposition."""
     queries = resolved_query_set.queries
-    truth_labels = {q.id: q.truth_label for q in queries}
-    truth_expected = {q.id: q.expected_skill for q in queries}
+    queries_by_id = {q.id: q for q in queries}
 
     pass_stats = _calculate_scale_pass_rate(
-        results, truth_labels, truth_expected=truth_expected, target_skill=target_skill
+        results,
+        queries_by_id,
+        target_skill=target_skill,
+        trajectory=True,
+    )
+    entry_pass_stats = _calculate_scale_pass_rate(
+        results,
+        queries_by_id,
+        target_skill=target_skill,
+        trajectory=False,
     )
     class_stats = _calculate_scale_classification(
-        results, truth_expected, installed_skills, seed, target_skill=target_skill
+        results,
+        queries_by_id,
+        installed_skills,
+        seed,
+        target_skill=target_skill,
+        trajectory=True,
+        compute_ci=True,
+    )
+    entry_class_stats = _calculate_scale_classification(
+        results,
+        queries_by_id,
+        installed_skills,
+        seed,
+        target_skill=target_skill,
+        trajectory=False,
+        compute_ci=False,
     )
     telemetry = _aggregate_scale_telemetry(results)
     decomp_stats = _evaluate_baseline_decomposition(
@@ -677,6 +848,8 @@ def _build_scaling_point(
             round(class_stats.f1_interval[0], 4),
             round(class_stats.f1_interval[1], 4),
         ),
+        entrypoint_pass_rate=round(entry_pass_stats.pass_rate, 4),
+        entrypoint_f1_score=round(entry_class_stats.f1_score, 4),
         in_scope_probes=class_stats.in_scope_probes,
         negative_probes=class_stats.negative_probes,
         disclosure_states=telemetry.disclosure_states,
@@ -781,9 +954,21 @@ def _resolve_anchor_skills(
     corpus_names = {s.name for s in resolved_skills}
     missing = [a for a in raw_names if a not in corpus_names]
     if missing:
-        msg = f"anchor skill(s) not found in corpus: {', '.join(missing)}"
+        hint = _format_missing_skill_hint(missing, tuple(corpus_names))
+        msg = f"anchor skill(s) not found in corpus: {', '.join(missing)}{hint}"
         raise ValueError(msg)
     return raw_names
+
+
+def _scale_adaptive_workers(
+    base_workers: int,
+    scale: int,
+    reference_scale: int = _ADAPTIVE_WORKER_REFERENCE_SCALE,
+) -> int:
+    """Taper concurrent worker count inversely with catalog size past reference scale."""
+    if base_workers <= 1 or scale <= reference_scale:
+        return max(1, base_workers)
+    return max(1, round(base_workers * (reference_scale / scale)))
 
 
 def _setup_sweep_execution(
@@ -820,6 +1005,36 @@ def _setup_sweep_execution(
     return target, catalogs, query_set, None, None
 
 
+def _assemble_scaling_study(
+    *,
+    target: str | None,
+    is_corpus: bool,
+    actual_scales: Sequence[int],
+    points: Sequence[ScalingPoint],
+    noise_floor: float | None,
+    baseline_count: int,
+    total_skills: int,
+    decomp: DecompositionResult | None,
+    anchor_skills: Sequence[str] | None,
+) -> ScalingStudy:
+    """Compute effective noise floor and knee and construct a ScalingStudy."""
+    effective_noise_floor = _compute_effective_noise_floor(noise_floor, points, baseline_count)
+    evaluated_scales = actual_scales[: len(points)]
+    rate_curve = [p.f1_score for p in points] if is_corpus else [p.pass_rate for p in points]
+    knee = find_kneedle_knee(evaluated_scales, rate_curve, noise_floor=effective_noise_floor)
+    return _build_study_result(
+        target=target,
+        is_corpus=is_corpus,
+        evaluated_scales=evaluated_scales,
+        points=points,
+        knee=knee,
+        noise_floor=effective_noise_floor,
+        total_skills=total_skills,
+        decomp=decomp,
+        anchor_skills=anchor_skills,
+    )
+
+
 def run_scaling_sweep(
     config: RunConfig | None = None,
     target_skill: str | None = None,
@@ -833,6 +1048,7 @@ def run_scaling_sweep(
     query_set: QuerySet | None = None,
     attempts: int | None = None,
     early_stop: bool | None = None,
+    on_scale_complete: Callable[[int, int, ScalingPoint, ScalingStudy], None] | None = None,
 ) -> ScalingStudy:
     """Execute multi-scale catalog evaluation sweep and return scaling analysis."""
     effective_config = _prepare_sweep_config(config, attempts, early_stop)
@@ -870,100 +1086,107 @@ def run_scaling_sweep(
     work_dir = effective_config.study.workdir
     temp_dir_obj: tempfile.TemporaryDirectory[str] | None = None
     if work_dir is None:
-        temp_dir_obj = tempfile.TemporaryDirectory(prefix="reach_sweep_")
+        temp_dir_obj = tempfile.TemporaryDirectory(prefix="reach_sweep_", delete=False)
         work_dir = Path(temp_dir_obj.name)
 
+    reference_scale = max(actual_scales[0], _ADAPTIVE_WORKER_REFERENCE_SCALE)
+    total_scales = len(actual_scales)
     shared_outcome_cache: dict[Any, Any] = {}
-    try:
-        for scale, catalog in zip(actual_scales, catalogs, strict=True):
-            safe_cat_id = catalog.id.replace(":", "_").replace("/", "_")
-            scale_out = work_dir / f"sweep_{safe_cat_id}.jsonl"
-            scale_config = effective_config.model_copy(
-                update={
-                    "study": effective_config.study.model_copy(
-                        update={
-                            "catalog": catalog.id,
-                            "rescope": True,
-                            "partial": True,
-                            "workdir": work_dir,
-                            "out": scale_out,
-                        }
-                    ),
-                    "catalog": effective_config.catalog.model_copy(
-                        update={"mode": CatalogMode.SWEEP}
-                    ),
-                }
-            )
+    for step_idx, (scale, catalog) in enumerate(zip(actual_scales, catalogs, strict=True), start=1):
+        safe_cat_id = catalog.id.replace(":", "_").replace("/", "_")
+        scale_out = work_dir / f"sweep_{safe_cat_id}.jsonl"
+        scale_config = effective_config.model_copy(
+            update={
+                "study": effective_config.study.model_copy(
+                    update={
+                        "catalog": catalog.id,
+                        "rescope": True,
+                        "partial": True,
+                        "workdir": work_dir,
+                        "out": scale_out,
+                    }
+                ),
+                "catalog": effective_config.catalog.model_copy(update={"mode": CatalogMode.SWEEP}),
+            }
+        )
 
-            scale_query_set = (
-                corpus_plan.queries_for_scale(
-                    catalog=catalog,
-                    raw_query_set=raw_query_set,
-                )
-                if is_corpus and corpus_plan is not None
-                else resolved_query_set
-            )
-
-            composed = Composition(
-                config=scale_config,
-                query_set=scale_query_set,
+        scale_query_set = (
+            corpus_plan.queries_for_scale(
                 catalog=catalog,
-                skills=tuple(resolved_skills),
+                raw_query_set=raw_query_set,
             )
-
-            outcome = conduct(
-                config=scale_config,
-                runtime=resolved_runtime,
-                composed=composed,
-                allow_truncation=True,
-                append_across_arms=True,
-                workers=workers,
-                outcome_cache=shared_outcome_cache,
-            )
-
-            point, decomp = _build_scaling_point(
-                scale=scale,
-                catalog_id=catalog.id,
-                results=outcome.results,
-                resolved_query_set=scale_query_set,
-                baseline_results=baseline_results,
-                installed_skills=set(catalog.skills),
-                target_skill=target if not is_corpus else None,
-                seed=effective_config.catalog.seed,
-            )
-            points.append(point)
-
-            if scale == actual_scales[0]:
-                baseline_results = outcome.results
-            elif decomp is not None:
-                final_decomp = decomp
-
-            if (
-                effective_config.study.early_stop
-                and is_corpus
-                and len(points) >= _MIN_EARLY_STOP_POINTS
-                and point.f1_interval[1] < _EARLY_STOP_F1_THRESHOLD
-            ):
-                break
-
-        effective_noise_floor = _compute_effective_noise_floor(
-            noise_floor, points, len(baseline_results)
+            if is_corpus and corpus_plan is not None
+            else resolved_query_set
         )
-        evaluated_scales = actual_scales[: len(points)]
-        rate_curve = [p.f1_score for p in points] if is_corpus else [p.pass_rate for p in points]
-        knee = find_kneedle_knee(evaluated_scales, rate_curve, noise_floor=effective_noise_floor)
 
-        return _build_study_result(
-            target=target,
-            is_corpus=is_corpus,
-            evaluated_scales=evaluated_scales,
-            points=points,
-            knee=knee,
-            noise_floor=effective_noise_floor,
-            total_skills=len(resolved_skills),
-            decomp=final_decomp,
-            anchor_skills=resolved_anchors,
+        composed = Composition(
+            config=scale_config,
+            query_set=scale_query_set,
+            catalog=catalog,
+            skills=tuple(resolved_skills),
         )
-    finally:
-        if temp_dir_obj is not None:
-            temp_dir_obj.cleanup()
+
+        scale_workers = _scale_adaptive_workers(workers, scale, reference_scale=reference_scale)
+        outcome = conduct(
+            config=scale_config,
+            runtime=resolved_runtime,
+            composed=composed,
+            allow_truncation=True,
+            append_across_arms=True,
+            workers=scale_workers,
+            outcome_cache=shared_outcome_cache,
+        )
+
+        point, decomp = _build_scaling_point(
+            scale=scale,
+            catalog_id=catalog.id,
+            results=outcome.results,
+            resolved_query_set=scale_query_set,
+            baseline_results=baseline_results,
+            installed_skills=set(catalog.skills),
+            target_skill=target if not is_corpus else None,
+            seed=effective_config.catalog.seed,
+        )
+        points.append(point)
+
+        if scale == actual_scales[0]:
+            baseline_results = outcome.results
+        elif decomp is not None:
+            final_decomp = decomp
+
+        if on_scale_complete is not None:
+            partial_study = _assemble_scaling_study(
+                target=target,
+                is_corpus=is_corpus,
+                actual_scales=actual_scales,
+                points=points,
+                noise_floor=noise_floor,
+                baseline_count=len(baseline_results),
+                total_skills=len(resolved_skills),
+                decomp=final_decomp,
+                anchor_skills=resolved_anchors,
+            )
+            on_scale_complete(step_idx, total_scales, point, partial_study)
+
+        if (
+            effective_config.study.early_stop
+            and is_corpus
+            and len(points) >= _MIN_EARLY_STOP_POINTS
+            and point.f1_interval[1] < _EARLY_STOP_F1_THRESHOLD
+        ):
+            break
+
+    result = _assemble_scaling_study(
+        target=target,
+        is_corpus=is_corpus,
+        actual_scales=actual_scales,
+        points=points,
+        noise_floor=noise_floor,
+        baseline_count=len(baseline_results),
+        total_skills=len(resolved_skills),
+        decomp=final_decomp,
+        anchor_skills=resolved_anchors,
+    )
+    if temp_dir_obj is not None:
+        temp_dir_obj.cleanup()
+    return result
