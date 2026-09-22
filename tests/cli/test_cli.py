@@ -1119,6 +1119,19 @@ def test_a_set_exports_to_stdout_when_no_file_is_named(exported: Path, capsys) -
     assert header == "id,text,kind,expected_skill,acceptable_skills,notes"
 
 
+def test_a_custom_separator_is_used_for_stdout_exports(exported: Path, capsys) -> None:
+    """Verify --separator controls acceptable skill joining on stdout export."""
+    assert main(["query", str(exported), "--format", "csv", "--separator", "|"]) == 0
+    assert "finding-google-skills|gcs-router" in capsys.readouterr().out
+
+
+def test_a_custom_separator_is_used_for_file_exports(exported: Path, tmp_path: Path) -> None:
+    """Verify --separator controls acceptable skill joining on file export."""
+    out = tmp_path / "rows.csv"
+    assert main(["query", str(exported), "--out", str(out), "--separator", "|"]) == 0
+    assert "finding-google-skills|gcs-router" in out.read_text(encoding="utf-8")
+
+
 def test_the_row_format_is_read_off_the_name_it_writes(exported: Path, tmp_path: Path) -> None:
     """Verify query export infers output format from --out file extension."""
     out = tmp_path / "rows.jsonl"

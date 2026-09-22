@@ -66,7 +66,7 @@ class FieldMap(BaseModel):
     @field_validator("separator")
     @classmethod
     def _require_separator(cls, value: str) -> str:
-        """Validate that multi-skill cells have a non-empty delimiter."""
+        """Ensure multi-skill cells have a non-empty delimiter."""
         if not value:
             msg = "separator must not be empty"
             raise ValueError(msg)
@@ -309,6 +309,16 @@ def _skills(value: object, separator: str) -> tuple[str, ...]:
     if isinstance(value, str):
         return tuple(skill for part in value.split(separator) if (skill := part.strip()))
     if isinstance(value, (list, tuple)):
-        return tuple(skill for part in value if (skill := _text(part).strip()))
+        skills: list[str] = []
+        for part in value:
+            if not isinstance(part, str):
+                msg = (
+                    "acceptable_skills array elements must be strings, "
+                    f"got {type(part).__name__}"
+                )
+                raise ValueError(msg)
+            if skill := part.strip():
+                skills.append(skill)
+        return tuple(skills)
     msg = f"acceptable_skills must be a delimited string or array, got {type(value).__name__}"
     raise ValueError(msg)

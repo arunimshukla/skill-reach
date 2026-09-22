@@ -336,10 +336,15 @@ def _handle_existing_query_source(
 
     query_set = _load_or_import_query_set(source_file, study, mapping, notes, format_opt)
     target_fmt = _resolve_query_target_format(format_opt, out)
+    field_map = mapping.field_map() if mapping is not None else None
 
     if out is None:
         if target_fmt in {"csv", "jsonl"}:
-            rendered = export_query_set(query_set, Exchange(target_fmt))
+            rendered = export_query_set(
+                query_set,
+                Exchange(target_fmt),
+                mapping=field_map,
+            )
             print(rendered, end="")
             return 0
         effective_skills = study.skills if study and study.skills else None
@@ -355,7 +360,7 @@ def _handle_existing_query_source(
             show_citations=show_citations,
         )
 
-    save_query_set(query_set, out, fmt=target_fmt)
+    save_query_set(query_set, out, fmt=target_fmt, mapping=field_map)
     then_msg = (
         f"{len(query_set.queries)} queries for catalog '{query_set.catalog_id}'; "
         "review them, then probe with `reach eval`"

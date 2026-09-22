@@ -223,6 +223,27 @@ def test_jsonl_import_accepts_an_acceptable_skills_array() -> None:
     assert imported.queries[0].acceptable_skills == ("skill-finder", "kms-router")
 
 
+@pytest.mark.parametrize(
+    "bad_skill",
+    [123, {"nested": "object"}],
+    ids=["integer", "object"],
+)
+def test_jsonl_import_refuses_non_string_acceptable_skills(bad_skill: object) -> None:
+    """Verify JSONL acceptable_skills arrays reject non-string entries."""
+    document = json.dumps(
+        {
+            "text": "rotate our keys",
+            "expected_skill": "kms-rotation",
+            "acceptable_skills": ["skill-finder", bad_skill],
+        },
+    )
+    with pytest.raises(
+        ValueError,
+        match="acceptable_skills array elements must be strings",
+    ):
+        import_query_set(document, Exchange.JSONL, catalog_id="c")
+
+
 def test_an_empty_separator_is_refused() -> None:
     """Verify FieldMap rejects a separator that cannot split imported cells."""
     with pytest.raises(ValueError, match="separator must not be empty"):
