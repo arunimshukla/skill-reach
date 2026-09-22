@@ -1844,7 +1844,7 @@ def test_run_config_from_toml_and_resolve_presence_based_optimize_workers_inheri
         agent = "antigravity-sdk"
         [runtime.options]
         vertex = true
-        project = "vertical-datum-418119"
+        project = "test-cloud-project-123"
         """,
     )
     rt = RuntimeSettings.resolve_for_optimize(
@@ -1854,5 +1854,5 @@ def test_run_config_from_toml_and_resolve_presence_based_optimize_workers_inheri
     )
     assert rt.agent == "antigravity-sdk"
     assert rt.options["vertex"] is True
-    assert rt.options["project"] == "vertical-datum-418119"
+    assert rt.options["project"] == "test-cloud-project-123"
     assert rt.options["location"] == "us-central1"

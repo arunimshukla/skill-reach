@@ -874,19 +874,19 @@ def test_optimize_with_handoff_cli_diff_and_auto_apply(
 ) -> None:
     """Verify --with-handoff renders target+rival diffs and patches both SKILL.md files."""
     target_dir = write_skill(
-        name="bigquery-observability",
-        description="Provides BigQuery slot query bottlenecks and telemetry.",
-        body="# BigQuery Observability\n\nUse region qualifier lookups in INFORMATION_SCHEMA.\n",
+        name="metrics-collector",
+        description="Provides query bottlenecks and telemetry collection.",
+        body="# Metrics Collector\n\nUse region qualifier lookups in metric schemas.\n",
     )
     rival_dir = write_skill(
-        name="bigquery-slot-cost-optimizer",
-        description="Analyzes BigQuery slot query bottlenecks and cost optimization.",
-        body="# BigQuery Slot Cost Optimizer\n\nFix query plan bottlenecks and slot contention.\n",
+        name="metrics-analyzer",
+        description="Analyzes query bottlenecks and cost optimization.",
+        body="# Metrics Analyzer\n\nFix query plan bottlenecks and contention.\n",
     )
     ret_diff = main(
         [
             "optimize",
-            "bigquery-observability",
+            "metrics-collector",
             "--skills",
             str(tmp_path),
             "--agent",
@@ -898,14 +898,14 @@ def test_optimize_with_handoff_cli_diff_and_auto_apply(
     )
     assert ret_diff == 0
     diff_out = capsys.readouterr().out
-    assert "a/bigquery-observability/SKILL.md" in diff_out
-    assert "a/bigquery-slot-cost-optimizer/SKILL.md" in diff_out
+    assert "a/metrics-collector/SKILL.md" in diff_out
+    assert "a/metrics-analyzer/SKILL.md" in diff_out
     assert "> **Routing Note:**" in diff_out
 
     ret_apply = main(
         [
             "optimize",
-            "bigquery-observability",
+            "metrics-collector",
             "--skills",
             str(tmp_path),
             "--agent",

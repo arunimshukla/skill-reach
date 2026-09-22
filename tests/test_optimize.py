@@ -1913,26 +1913,26 @@ def test_filter_candidates_rejects_unknown_skill_references() -> None:
     candidates = [
         OptimizationCandidate(
             description=(
-                "Monitors BigQuery operational telemetry and slot utilization. "
-                "Don't use for root-cause troubleshooting (use `bigquery-troubleshooting` first)."
+                "Monitors system operational telemetry and metrics. "
+                "Don't use for root-cause troubleshooting (use `metrics-troubleshooting` first)."
             ),
             origin=CandidateOrigin.LLM,
         ),
         OptimizationCandidate(
             description=(
-                "Monitors BigQuery operational telemetry and slot utilization. "
-                "Don't use for slot cost optimization (use `bigquery-slot-cost-optimizer`)."
+                "Monitors system operational telemetry and metrics. "
+                "Don't use for cost optimization (use `metrics-analyzer`)."
             ),
             origin=CandidateOrigin.LLM,
         ),
     ]
     filtered = filter_candidates(
         candidates,
-        skill_name="bigquery-observability",
-        known_skills={"bigquery-observability", "bigquery-slot-cost-optimizer"},
+        skill_name="metrics-collector",
+        known_skills={"metrics-collector", "metrics-analyzer"},
     )
     assert filtered[0].lint_clean is False
-    assert "bigquery-troubleshooting" in (filtered[0].filter_reason or "")
+    assert "metrics-troubleshooting" in (filtered[0].filter_reason or "")
     assert filtered[1].lint_clean is True
 
 
@@ -1973,7 +1973,7 @@ def test_resolve_runtime_settings_forwards_toml_runtime_options(tmp_path: Path) 
     cfg_file = tmp_path / "custom_reach.toml"
     cfg_file.write_text(
         '[runtime]\nagent = "antigravity-sdk"\n\n'
-        '[runtime.options]\nvertex = true\nproject = "vertical-datum-418119"\n',
+        '[runtime.options]\nvertex = true\nproject = "test-cloud-project-123"\n',
         encoding="utf-8",
     )
 
@@ -1984,7 +1984,7 @@ def test_resolve_runtime_settings_forwards_toml_runtime_options(tmp_path: Path) 
     )
     assert resolved.agent == "antigravity-sdk"
     assert resolved.options["vertex"] is True
-    assert resolved.options["project"] == "vertical-datum-418119"
+    assert resolved.options["project"] == "test-cloud-project-123"
     assert resolved.options["location"] == "us-central1"
 
     with (
@@ -1997,7 +1997,7 @@ def test_resolve_runtime_settings_forwards_toml_runtime_options(tmp_path: Path) 
             config=cfg_file,
         )
         assert mock_gen.call_args.kwargs["options"]["vertex"] is True
-        assert mock_gen.call_args.kwargs["options"]["project"] == "vertical-datum-418119"
+        assert mock_gen.call_args.kwargs["options"]["project"] == "test-cloud-project-123"
         assert mock_gen.call_args.kwargs["options"]["location"] == "us-central1"
 
         _setup_runtime(
@@ -2007,7 +2007,7 @@ def test_resolve_runtime_settings_forwards_toml_runtime_options(tmp_path: Path) 
         )
         rt_settings = mock_rt.call_args.args[0]
         assert rt_settings.options["vertex"] is True
-        assert rt_settings.options["project"] == "vertical-datum-418119"
+        assert rt_settings.options["project"] == "test-cloud-project-123"
         assert rt_settings.options["location"] == "us-central1"
 
 
@@ -2018,8 +2018,8 @@ def test_run_candidate_probes_batches_workers_and_tracks_trajectory_recall(
     from reach.models import CatalogMode, ProbeResult
 
     queries = [
-        Query(id="q1", text="query 1", expected_skill="bigquery-observability"),
-        Query(id="q2", text="query 2", expected_skill="bigquery-observability"),
+        Query(id="q1", text="query 1", expected_skill="metrics-collector"),
+        Query(id="q2", text="query 2", expected_skill="metrics-collector"),
     ]
     mock_runtime = MagicMock()
     batch_calls: list[tuple[int, int]] = []
@@ -2045,7 +2045,7 @@ def test_run_candidate_probes_batches_workers_and_tracks_trajectory_recall(
                     model="fake",
                     runtime="fake",
                     attempt=1,
-                    invoked_skills=("bigquery-observability",),
+                    invoked_skills=("metrics-collector",),
                 ),
                 # q2: Initial misroute to rival, recovered via Layer-2 handoff in trajectory!
                 ProbeResult(
@@ -2056,7 +2056,7 @@ def test_run_candidate_probes_batches_workers_and_tracks_trajectory_recall(
                     model="fake",
                     runtime="fake",
                     attempt=1,
-                    invoked_skills=("bigquery-slot-cost-optimizer", "bigquery-observability"),
+                    invoked_skills=("metrics-analyzer", "metrics-collector"),
                 ),
             ]
 
@@ -2064,7 +2064,7 @@ def test_run_candidate_probes_batches_workers_and_tracks_trajectory_recall(
         tally = _run_candidate_probes(
             runtime=mock_runtime,
             queries_to_run=queries,
-            target_name="bigquery-observability",
+            target_name="metrics-collector",
             workdir=tmp_path,
             workers=4,
         )
@@ -2083,14 +2083,14 @@ def test_load_optimization_queries_retains_and_interleaves_primary_rival(
     from reach.queries import save_query_set
 
     target = Skill(
-        name="bigquery-observability",
+        name="metrics-collector",
         description="Target desc.",
-        path=tmp_path / "bigquery-observability",
+        path=tmp_path / "metrics-collector",
     )
     rival = Skill(
-        name="bigquery-slot-cost-optimizer",
+        name="metrics-analyzer",
         description="Rival desc.",
-        path=tmp_path / "bigquery-slot-cost-optimizer",
+        path=tmp_path / "metrics-analyzer",
     )
     qs = QuerySet(
         catalog_id="cloud",
@@ -2100,7 +2100,7 @@ def test_load_optimization_queries_retains_and_interleaves_primary_rival(
             Query(id="pos-2", text="pos 2", expected_skill=target.name),
             Query(id="riv-1", text="riv 1", expected_skill=rival.name),
             Query(id="riv-2", text="riv 2", expected_skill=rival.name),
-            Query(id="other-1", text="other 1", expected_skill="gke-networking"),
+            Query(id="other-1", text="other 1", expected_skill="network-helper"),
         ),
     )
     qfile = tmp_path / "queries.json"
@@ -2131,36 +2131,36 @@ def test_reciprocal_handoff_upsert_staging_and_apply(
     )
 
     target_dir = write_skill(
-        name="bigquery-observability",
+        name="metrics-collector",
         description="Old target description.",
-        body="# BigQuery Observability\n\nUse INFORMATION_SCHEMA views for region lookups.\n",
+        body="# Metrics Collector\n\nCollect system metrics and traces.\n",
     )
     rival_dir = write_skill(
-        name="bigquery-slot-cost-optimizer",
-        description="Rival slot cost optimizer description.",
-        body="# BigQuery Slot Cost Optimizer\n\nAnalyze slot contention and query plan stages.\n",
+        name="metrics-analyzer",
+        description="Rival analyzer description.",
+        body="# Metrics Analyzer\n\nAnalyze performance metrics and bottlenecks.\n",
     )
     target = Skill(
-        name="bigquery-observability",
+        name="metrics-collector",
         description="Old target description.",
         path=target_dir,
     )
     rival = Skill(
-        name="bigquery-slot-cost-optimizer",
-        description="Rival slot cost optimizer description.",
+        name="metrics-analyzer",
+        description="Rival analyzer description.",
         path=rival_dir,
     )
 
     handoff = build_reciprocal_handoff(
         target=target,
         rival=rival,
-        ceded_terms=("slot", "bottlenecks"),
-        unclaimed_terms=("region", "qualifier"),
+        ceded_terms=("bottlenecks", "analysis"),
+        unclaimed_terms=("traces", "collector"),
     )
-    assert handoff.target_skill == "bigquery-observability"
-    assert handoff.rival_skill == "bigquery-slot-cost-optimizer"
-    assert "bigquery-slot-cost-optimizer" in handoff.target_note
-    assert "bigquery-observability" in handoff.rival_note
+    assert handoff.target_skill == "metrics-collector"
+    assert handoff.rival_skill == "metrics-analyzer"
+    assert "metrics-analyzer" in handoff.target_note
+    assert "metrics-collector" in handoff.rival_note
 
     # Idempotent upsert right after # Heading
     target_md = target_dir / "SKILL.md"
@@ -2168,7 +2168,7 @@ def test_reciprocal_handoff_upsert_staging_and_apply(
     assert upsert_skill_routing_note(target_md, rival.name, handoff.target_note) is True
     text_after = target_md.read_text(encoding="utf-8")
     assert text_after.count("> **Routing Note:**") == 1
-    assert "# BigQuery Observability\n\n> **Routing Note:**" in text_after
+    assert "# Metrics Collector\n\n> **Routing Note:**" in text_after
 
     # Verify evaluate_candidate stages both target and rival with Routing Notes
     installed_bodies: dict[str, str] = {}
@@ -2187,9 +2187,7 @@ def test_reciprocal_handoff_upsert_staging_and_apply(
             return super().install(catalog, skills, workdir)
 
     with patch("reach.optimize._setup_runtime", return_value=InspectingRuntime()):
-        cand = OptimizationCandidate(
-            description="Updated telemetry guidance for INFORMATION_SCHEMA and Cloud Monitoring."
-        )
+        cand = OptimizationCandidate(description="Updated telemetry guidance for collection.")
         evaluate_candidate(
             candidate=cand,
             target=target,
@@ -2199,10 +2197,10 @@ def test_reciprocal_handoff_upsert_staging_and_apply(
             handoff=handoff,
         )
 
-    assert "> **Routing Note:**" in installed_bodies["bigquery-observability"]
-    assert "bigquery-slot-cost-optimizer" in installed_bodies["bigquery-observability"]
-    assert "> **Routing Note:**" in installed_bodies["bigquery-slot-cost-optimizer"]
-    assert "bigquery-observability" in installed_bodies["bigquery-slot-cost-optimizer"]
+    assert "> **Routing Note:**" in installed_bodies["metrics-collector"]
+    assert "metrics-analyzer" in installed_bodies["metrics-collector"]
+    assert "> **Routing Note:**" in installed_bodies["metrics-analyzer"]
+    assert "metrics-collector" in installed_bodies["metrics-analyzer"]
 
     # Verify apply_optimization_candidate updates both target and rival SKILL.md on disk
     report = OptimizationReport(
@@ -2240,8 +2238,8 @@ def test_baseline_evaluation_populates_trajectory_hits_by_id_for_paired_deltas(
     """Verify _evaluate_baseline_performance populates trajectory_hits_by_id for paired deltas."""
     from reach.optimize import _evaluate_baseline_performance
 
-    target_dir = write_skill(name="bigquery-observability", description="Target desc.")
-    target = Skill(name="bigquery-observability", description="Target desc.", path=target_dir)
+    target_dir = write_skill(name="metrics-collector", description="Target desc.")
+    target = Skill(name="metrics-collector", description="Target desc.", path=target_dir)
     queries = [
         Query(id="q1", text="query 1", expected_skill=target.name),
         Query(id="q2", text="query 2", expected_skill=target.name),
