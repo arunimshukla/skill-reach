@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import difflib
 import math
 from typing import TYPE_CHECKING, override
 
@@ -38,7 +39,9 @@ __all__ = [
     "Rival",
     "Standing",
     "compete",
+    "did_you_mean_hint",
     "rank_corpus",
+    "suggest_close_skills",
 ]
 
 
@@ -125,6 +128,48 @@ class Competition(BaseModel):
         )
 
 
+_MIN_SHARED_TOKENS = 2
+_MIN_JACCARD_SIMILARITY = 0.5
+_CLOSE_MATCH_CUTOFF = 0.55
+
+
+def suggest_close_skills(
+    target: str,
+    available: Sequence[str],
+    *,
+    n: int = 3,
+) -> list[str]:
+    """Return up to n close skill names using token overlap and sequence similarity."""
+    clean_target = target.strip()
+    if not clean_target or not available or n <= 0:
+        return []
+    target_tokens = frozenset(tokenize(clean_target))
+    close_set = set(
+        difflib.get_close_matches(clean_target, available, n=n * 2, cutoff=_CLOSE_MATCH_CUTOFF)
+    )
+    scored: list[tuple[float, float, str]] = []
+    for candidate in available:
+        if not candidate or candidate == clean_target:
+            continue
+        cand_tokens = frozenset(tokenize(candidate))
+        shared = len(target_tokens & cand_tokens)
+        union = len(target_tokens | cand_tokens)
+        jaccard = shared / union if union else 0.0
+        has_token_overlap = shared >= _MIN_SHARED_TOKENS and jaccard >= _MIN_JACCARD_SIMILARITY
+        if candidate not in close_set and not has_token_overlap:
+            continue
+        seq_ratio = difflib.SequenceMatcher(None, target, candidate).ratio()
+        scored.append((jaccard, seq_ratio, candidate))
+    scored.sort(key=lambda item: (-item[0], -item[1], item[2]))
+    return [name for _, _, name in scored[:n]]
+
+
+def did_you_mean_hint(target: str, available: Sequence[str], *, n: int = 3) -> str:
+    """Format a '; did you mean ...?' suffix when close skill names exist."""
+    near = suggest_close_skills(target, available, n=n)
+    return f"; did you mean {', '.join(near)}?" if near else ""
+
+
 class CorpusOverlap(BaseModel):
     """Hold competition rankings for all skills across the corpus."""
 
@@ -137,7 +182,8 @@ class CorpusOverlap(BaseModel):
         for competition in self.competitions:
             if competition.skill == skill:
                 return competition
-        msg = f"no skill named {skill!r} in this corpus"
+        hint = did_you_mean_hint(skill, [c.skill for c in self.competitions])
+        msg = f"no skill named {skill!r} in this corpus{hint}"
         raise ValueError(msg)
 
 

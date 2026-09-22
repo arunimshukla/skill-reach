@@ -16,26 +16,36 @@
 
 from __future__ import annotations
 
+import os
+import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Final
 
 from cyclopts import App, Parameter
+from pydantic import ValidationError
 
 from reach.attribution import attribute_query
 from reach.config import RegistrySettings, RunConfig, RuntimeSettings, resolve_sub_settings
 from reach.discovery import resolve_corpus
-from reach.overlap import CorpusOverlap, rank_corpus
+from reach.overlap import CorpusOverlap, did_you_mean_hint, rank_corpus
 from reach.retrieval import Bm25Scorer
 from reach.rewrite import suggest_all
 from reach.runtime import build_runtime
 from reach.views import (
+    DEFAULT_OVERLAP_TOP,
     Console,
+    OverlapFilter,
     build_console,
+    filter_competitions,
+    filter_rewrites,
     help_formatter,
     overlap_view,
     print_attribution,
     print_discovery,
+    print_no_actionable_rewrites,
+    print_omitted_footer,
     print_overlap,
+    print_overlap_caveat,
     print_rewrite,
     print_skill_overlap,
     render_overlap,
@@ -59,6 +69,9 @@ from .flags import (
 
 #: Minimum number of skills required to compute pairwise similarity.
 MIN_PAIRWISE_SKILLS: Final = 2
+
+#: Default non-TTY console width so long skill families do not collide when piped.
+NON_TTY_OVERLAP_WIDTH: Final = 140
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -91,20 +104,74 @@ def _render_text_overlap(
     *,
     suggest: bool,
     semantic_sims: dict[tuple[str, str], float] | None,
+    overlap_filter: OverlapFilter | None = None,
+    truncate: bool = True,
 ) -> None:
     """Render human-readable overlap tables, rewrites, or competitor scorecards."""
-    if not skill:
-        print_overlap(console, overlap, semantic_similarities=semantic_sims)
-    elif suggest:
-        for rewrite in suggest_all(overlap, found, skill):
-            print_rewrite(console, rewrite)
-    else:
-        for name in skill:
-            print_skill_overlap(
+    filt = overlap_filter or OverlapFilter()
+    all_names = tuple(c.skill for c in overlap.competitions)
+
+    if suggest:
+        if skill:
+            for rewrite in suggest_all(overlap, found, skill):
+                print_rewrite(console, rewrite, caveat=False)
+            print_overlap_caveat(console)
+            return
+
+        shown_rewrites, total_matching = filter_rewrites(
+            overlap,
+            found,
+            skill,
+            overlap_filter=filt,
+            semantic_similarities=semantic_sims,
+            default_top=DEFAULT_OVERLAP_TOP,
+        )
+        if not shown_rewrites:
+            print_no_actionable_rewrites(console, len(found))
+            print_overlap_caveat(console)
+            return
+
+        for rewrite in shown_rewrites:
+            print_rewrite(console, rewrite, caveat=False)
+        if len(shown_rewrites) < total_matching:
+            print_omitted_footer(
                 console,
-                overlap.find(name),
-                semantic_similarities=semantic_sims,
+                total_matching - len(shown_rewrites),
+                total_matching,
             )
+        print_overlap_caveat(console)
+        return
+
+    if not skill:
+        effective_top = (
+            filt.top if filt.top is not None else (None if filt.all_skills else DEFAULT_OVERLAP_TOP)
+        )
+        shown_comps, total_matching = filter_competitions(
+            overlap.competitions,
+            semantic_similarities=semantic_sims,
+            quadrants=filt.quadrants,
+            top=effective_top,
+        )
+        print_overlap(
+            console,
+            overlap,
+            semantic_similarities=semantic_sims,
+            competitions=shown_comps,
+            omitted_count=max(0, total_matching - len(shown_comps)),
+            truncate=truncate,
+        )
+        return
+
+    for name in skill:
+        print_skill_overlap(
+            console,
+            overlap.find(name),
+            semantic_similarities=semantic_sims,
+            caveat=False,
+            truncate=truncate,
+            peers=all_names,
+        )
+    print_overlap_caveat(console)
 
 
 def _render_overlap_output(
@@ -116,15 +183,32 @@ def _render_overlap_output(
     suggest: bool,
     semantic: bool = False,
     format: Format,
+    overlap_filter: OverlapFilter | None = None,
+    truncate: bool = True,
 ) -> None:
-    semantic_sims = _compute_semantic_sims(found, semantic)
+    effective_semantic = semantic or bool(overlap_filter and overlap_filter.quadrants)
+    semantic_sims = _compute_semantic_sims(found, effective_semantic)
 
     if format != "text":
         rendered = (
-            render_rewrite(suggest_view(overlap, found, skill), format)
+            render_rewrite(
+                suggest_view(
+                    overlap,
+                    found,
+                    skill,
+                    overlap_filter=overlap_filter,
+                    semantic_similarities=semantic_sims,
+                ),
+                format,
+            )
             if suggest
             else render_overlap(
-                overlap_view(overlap, skill, semantic_similarities=semantic_sims),
+                overlap_view(
+                    overlap,
+                    skill,
+                    semantic_similarities=semantic_sims,
+                    overlap_filter=overlap_filter,
+                ),
                 format,
             )
         )
@@ -138,6 +222,8 @@ def _render_overlap_output(
         skill,
         suggest=suggest,
         semantic_sims=semantic_sims,
+        overlap_filter=overlap_filter,
+        truncate=truncate,
     )
 
 
@@ -153,9 +239,11 @@ def _handle_explain(
 ) -> int:
     """Diagnose token-level BM25 contributions driving a query toward a rival skill."""
     scorer = Bm25Scorer.from_skills(found)
+    available_names = [s.name for s in found]
     target_obj = next((s for s in found if s.name == target_skill), None)
     if target_obj is None:
-        msg = f"target skill {target_skill!r} not found in resident skills"
+        hint = did_you_mean_hint(target_skill, available_names)
+        msg = f"target skill {target_skill!r} not found in resident skills{hint}"
         raise ValueError(msg)
 
     is_abstention = rival_skill is not None and rival_skill.lower() in (
@@ -180,7 +268,8 @@ def _handle_explain(
     else:
         rival_obj = next((s for s in found if s.name == rival_skill), None)
         if rival_obj is None:
-            msg = f"rival skill {rival_skill!r} not found in resident skills"
+            hint = did_you_mean_hint(rival_skill, available_names)
+            msg = f"rival skill {rival_skill!r} not found in resident skills{hint}"
             raise ValueError(msg)
 
     if not is_abstention and target_skill == rival_skill:
@@ -256,8 +345,7 @@ def _overlap(
         bool,
         SWITCH,
         Parameter(
-            help="Generate suggested description rewrites to reduce lexical "
-            "overlap (requires --skill)",
+            help="Generate suggested description rewrites to reduce lexical overlap",
         ),
     ] = False,
     semantic: Annotated[
@@ -265,6 +353,40 @@ def _overlap(
         SWITCH,
         Parameter(
             help="Include dense semantic similarity and dual-axis diagnostic quadrant matrix",
+        ),
+    ] = False,
+    top: Annotated[
+        int | None,
+        Parameter(
+            name="--top",
+            help="Show only the top N ranked skills",
+        ),
+    ] = None,
+    all_: Annotated[
+        bool,
+        SWITCH,
+        Parameter(
+            name="--all",
+            help="Show all skills without the default 30-row cap or actionable-only filter",
+        ),
+    ] = False,
+    quadrant: Annotated[
+        tuple[str, ...],
+        LIST,
+        Parameter(
+            name="--quadrant",
+            help=(
+                "Filter by diagnostic quadrant: near-duplicate, latent-collision, "
+                "boilerplate, distinct (implies --semantic)"
+            ),
+        ),
+    ] = (),
+    no_truncate: Annotated[
+        bool,
+        SWITCH,
+        Parameter(
+            name="--no-truncate",
+            help="Render full skill names without middle truncation",
         ),
     ] = False,
     agent: Annotated[
@@ -281,10 +403,17 @@ def _overlap(
     config: ConfigFlag = None,
 ) -> int:
     """Find which of your installed skills compete to answer the same requests."""
-    console = build_console()
-    if suggest and not skill:
-        msg = "--suggest needs --skill NAME: specify a target skill to analyze"
-        raise ValueError(msg)
+    use_wide_console = not sys.stderr.isatty() and "COLUMNS" not in os.environ
+    console = build_console(width=NON_TTY_OVERLAP_WIDTH if use_wide_console else None)
+    try:
+        overlap_filter = OverlapFilter(
+            top=top,
+            all_skills=all_,
+            quadrants=quadrant,
+        )
+    except ValidationError as exc:
+        first_msg = exc.errors()[0].get("msg", str(exc)) if exc.errors() else str(exc)
+        raise ValueError(first_msg) from exc
 
     if skill:
         from reach.catalog import resolve_skill_target
@@ -339,6 +468,8 @@ def _overlap(
         suggest=suggest,
         semantic=semantic,
         format=format,
+        overlap_filter=overlap_filter,
+        truncate=not no_truncate,
     )
     return 0
 

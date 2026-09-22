@@ -188,14 +188,15 @@ def test_overlap_suggest_rewrites(
     assert "gke-basics" in err
 
 
-def test_overlap_suggest_without_skill_fails(
+def test_overlap_suggest_without_skill_runs_corpus_wide(
     synthetic_skills_repo: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Verify reach overlap --suggest without --skill exits with code 2."""
+    """Verify reach overlap --suggest without --skill runs corpus-wide and succeeds."""
     status = main(["overlap", "--skills", str(synthetic_skills_repo), "--suggest"])
-    assert status == 2
-    assert "--suggest needs --skill" in capsys.readouterr().err
+    assert status == 0
+    err = capsys.readouterr().err
+    assert "cedes" in err or "No actionable rewrites" in err
 
 
 def test_overlap_nonexistent_skill_fails(

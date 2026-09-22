@@ -21,6 +21,7 @@ import math
 import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass
+from enum import StrEnum
 from math import log
 from typing import TYPE_CHECKING, Any, Protocol, override, runtime_checkable
 
@@ -38,6 +39,7 @@ __all__ = [
     "Bm25Scorer",
     "DenseScorer",
     "HybridScorer",
+    "OverlapQuadrant",
     "Scorer",
     "TextScorer",
     "build_scorer",
@@ -665,19 +667,53 @@ def build_scorer(
             raise ValueError(msg)
 
 
+#: Minimum prefix token length for single-word quadrant resolution.
+_MIN_QUADRANT_PREFIX_LEN: int = 3
+
+
+class OverlapQuadrant(StrEnum):
+    """Classify the diagnostic quadrant between lexical and semantic overlap."""
+
+    NEAR_DUPLICATE = "Near-Duplicate"
+    BOILERPLATE = "Boilerplate / Style"
+    LATENT_COLLISION = "Latent Collision"
+    DISTINCT = "Distinct"
+
+    @classmethod
+    def _missing_(cls, value: object) -> OverlapQuadrant | None:
+        if not isinstance(value, str):
+            return None
+        tokens = tuple(tokenize(value.replace("_", "-")))
+        if not tokens:
+            return None
+        for member in cls:
+            member_name_tokens = tuple(tokenize(member.name.replace("_", "-")))
+            if tokens in (member_name_tokens, tuple(tokenize(member.value))):
+                return member
+        if len(tokens) == 1 and len(tokens[0]) >= _MIN_QUADRANT_PREFIX_LEN:
+            prefix_matches = [
+                m
+                for m in cls
+                if (val_tokens := tokenize(m.value)) and val_tokens[0].startswith(tokens[0])
+            ]
+            if len(prefix_matches) == 1:
+                return prefix_matches[0]
+        return None
+
+
 def classify_overlap_quadrant(
     lexical_ratio: float,
     semantic_similarity: float,
     lex_high: float = 0.5,
     sem_high: float = 0.75,
-) -> str:
+) -> OverlapQuadrant:
     """Classify the relationship between lexical and semantic overlap into a diagnostic quadrant."""
     match (lexical_ratio >= lex_high, semantic_similarity >= sem_high):
         case (True, True):
-            return "Near-Duplicate"
+            return OverlapQuadrant.NEAR_DUPLICATE
         case (True, False):
-            return "Boilerplate / Style"
+            return OverlapQuadrant.BOILERPLATE
         case (False, True):
-            return "Latent Collision"
+            return OverlapQuadrant.LATENT_COLLISION
         case _:
-            return "Distinct"
+            return OverlapQuadrant.DISTINCT
