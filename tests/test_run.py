@@ -1058,3 +1058,48 @@ def test_write_results_atomic_roundtrip(tmp_path: Path) -> None:
     assert loaded[0].invoked_skills == ("s1",)
     assert loaded[1].query_id == "q2"
     assert loaded[1].error == "timeout"
+
+
+def test_resume_filters_stale_corpus_digest_catalog_and_out_of_scope_queries(
+    make_config,
+    answering_runtime,
+    queries,
+    tmp_path: Path,
+) -> None:
+    """Verify resume ignores rows with stale corpus_digest, catalog, or out-of-scope query_id."""
+    out = tmp_path / "results.jsonl"
+    config = make_config(study={"out": out}, plan={"attempts": 1})
+    first_outcome = conduct(config, answering_runtime)
+    assert len(first_outcome.results) == 2
+
+    # Tamper with stored rows to simulate an out-of-scope query, a changed SKILL.md digest,
+    # and a changed catalog membership (e.g. different --anchor at the same K).
+    valid_row = first_outcome.results[0]
+    stale_digest_row = first_outcome.results[1].model_copy(
+        update={"corpus_digest": "sha256:stale-digest"},
+    )
+    stale_catalog_row = first_outcome.results[0].model_copy(
+        update={
+            "query_id": queries[1].id,
+            "observed_catalog": ("some-other-skill",),
+        },
+    )
+    extra_query_row = first_outcome.results[0].model_copy(
+        update={"query_id": "q-unrelated-anchor"},
+    )
+    write_results(out, [valid_row, stale_digest_row, stale_catalog_row, extra_query_row])
+
+    second_runtime = FakeRuntime(
+        {q.text: q.expected_skill for q in queries},
+    )
+    resumed_outcome = conduct(config, second_runtime, append_across_arms=True)
+
+    # Only valid_row (queries[0]) should be reused for the active run; queries[1] must be re-probed,
+    # and q-unrelated-anchor must not leak into outcome.results, while valid rows from other
+    # anchors/catalogs (stale_catalog_row, extra_query_row) are preserved on disk.
+    assert resumed_outcome.reused == 1
+    assert second_runtime.queries == [queries[1].text]
+    assert [r.query_id for r in resumed_outcome.results] == [queries[0].id, queries[1].id]
+    disk_rows = load_results(out)
+    assert len(disk_rows) == 4
+    assert {r.corpus_digest for r in disk_rows} == {valid_row.corpus_digest}
