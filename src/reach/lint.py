@@ -41,7 +41,7 @@ from reach.config import LintSettings, resolve_path
 
 if TYPE_CHECKING:
     from reach.models import Skill
-    from reach.overlap import SkillCompetition
+    from reach.overlap import Competition
     from reach.retrieval import Bm25Scorer
 
 __all__ = [
@@ -1006,8 +1006,8 @@ def _is_peer_one_way_handoff(
 def _build_unacknowledged_sem_lex_adj(
     skills: Sequence[Skill],
     refs_by_name: Mapping[str, frozenset[str]],
-    comp_by_name: Mapping[str, SkillCompetition],
-    full_comp_by_name: Mapping[str, SkillCompetition],
+    comp_by_name: Mapping[str, Competition],
+    full_comp_by_name: Mapping[str, Competition],
     dense_similarities: Mapping[tuple[str, str], float] | None,
     *,
     lex_thresh: float,
