@@ -20,7 +20,8 @@ import asyncio
 import contextlib
 import json
 import os
-from collections.abc import Iterable, Mapping, Sequence
+import re
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, cast, override
@@ -202,18 +203,17 @@ _HTTP_TOO_MANY_REQUESTS = 429
 _HTTP_ERROR_THRESHOLD = 400
 
 
-_DIR_READ_ERR_RE = r"read\s+([^\r\n]+?):\s*is a directory"
+_DIR_READ_ERR_PATTERN = re.compile(r"read\s+([^\r\n]+?):\s*is a directory", flags=re.IGNORECASE)
 
 
-def _extract_step_dir_error_skill(step: object, resident: Iterable[str]) -> str | None:
+def _extract_step_dir_error_skill(step: object, resident: Collection[str]) -> str | None:
     """Resolve a resident skill name when a step failed attempting to read a skill directory."""
-    import re
-
     raw_err = str(getattr(step, "error", "") or "").strip()
     if not raw_err or "is a directory" not in raw_err.lower():
         return None
-    for match in re.finditer(_DIR_READ_ERR_RE, raw_err, flags=re.IGNORECASE):
-        if skill := resolve_skill_from_path(match.group(1).strip(), resident):
+    for match in _DIR_READ_ERR_PATTERN.finditer(raw_err):
+        captured_path = match.group(1).strip().strip("'\"`")
+        if skill := resolve_skill_from_path(captured_path, resident):
             return skill
     return None
 
@@ -225,7 +225,7 @@ def _iter_conversation_history(agent: object) -> Sequence[object]:
     return history if isinstance(history, Sequence) else ()
 
 
-def _extract_step_skills(step: object, resident: Iterable[str]) -> list[str]:
+def _extract_step_skills(step: object, resident: Collection[str]) -> list[str]:
     """Extract resident skill names from a step's directory error or tool calls."""
     skills: list[str] = []
     if dir_skill := _extract_step_dir_error_skill(step, resident):
@@ -245,7 +245,7 @@ def _extract_step_skills(step: object, resident: Iterable[str]) -> list[str]:
 def _format_step_error(
     step: object,
     error_status: object,
-    resident: Iterable[str] = (),
+    resident: Collection[str] = (),
     *,
     is_dir_skill_step: bool = False,
 ) -> str | None:
@@ -283,7 +283,7 @@ def _format_step_error(
 
 def _extract_history_error(
     agent: object,
-    resident: Iterable[str] = (),
+    resident: Collection[str] = (),
 ) -> str | None:
     """Extract formatted rate-limit or system error from SDK conversation history."""
     history = _iter_conversation_history(agent)
@@ -303,13 +303,13 @@ def _extract_history_error(
 
 def _inspect_conversation_history(
     agent: object,
-    resident: Iterable[str],
+    resident: Collection[str],
     tracker: TrajectoryTracker,
     base_tools: Iterable[str],
     *,
     post_step_ran: bool = False,
 ) -> tuple[tuple[str, ...], str | None]:
-    """Single-pass history inspection recovering chronological skills and terminal step errors."""
+    """Inspect conversation history in a single pass to recover chronological skills and errors."""
     history = _iter_conversation_history(agent)
     tools = list(base_tools)
     if not history:
@@ -713,8 +713,8 @@ class AntigravitySdkRuntime(_AntigravitySdkConfigMixin, AntigravityRuntime):
                     raw_text = await text_fn() if text_fn is not None else None
                     text_out = str(raw_text).strip() if isinstance(raw_text, str) else ""
                     stream_tools = [_tool_name(call.name) async for call in response.tool_calls]
-                    stop_reason = response.stop_reason
-                except Exception:
+                    stop_reason = getattr(response, "stop_reason", "END_TURN")
+                except (Exception, asyncio.CancelledError):
                     if not tracker.early_exit_hit:
                         raise
                 observed_tools, history_error = _inspect_conversation_history(

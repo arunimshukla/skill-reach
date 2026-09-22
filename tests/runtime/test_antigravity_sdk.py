@@ -682,7 +682,7 @@ def test_select_recovers_skill_from_view_file_directory_step_error(
     step_err = (
         "The model produced an invalid tool call. "
         '("model output error: invalid tool call error (invalid_args) failed to read file: '
-        f'read {skill_dir}: is a directory")'
+        f"read '{skill_dir}': is a directory\")"
     )
     history_step = type(
         "_Step",
@@ -739,22 +739,37 @@ def test_select_preserves_turn1_directory_skill_order_and_cancels_on_early_exit(
     outcome_multi = rt_multi.select("use skills", workdir)
     assert outcome_multi.invoked_skills == ("skill-a", "skill-b")
 
-    # 2. Real-time _on_post_step hook triggers early_exit and cancels connection on Turn 1
+    # 2. Real-time _on_post_step hook triggers early_exit and cancels connection on Turn 1,
+    # and _select_async suppresses asyncio.CancelledError when early_exit_hit is True
     rt_early = AntigravitySdkRuntime(
         options=AntigravitySdkOptions(model="test-model", early_exit=True),
     )
     rt_early._resident = ("skill-a", "skill-b")
     cancelled: list[bool] = []
-    tracker = rt_early.make_tracker(target_skill="skill-a")
-    fake_conn = type("_Conn", (), {"cancel": staticmethod(lambda: cancelled.append(True))})()
-    fake_conv = type("_Conv", (), {"connection": fake_conn, "history": [step1]})()
-    fake_ag = type("_Ag", (), {"conversation": fake_conv})()
-    post_seen: list[bool] = []
-    hooks = rt_early._build_selection_hooks(tracker, [], [fake_ag], post_seen)
-    assert len(hooks) == 2
-    asyncio.run(hooks[1](step1))
-    assert tracker.early_exit_hit is True
-    assert tracker.invoked_skills == ["skill-a"]
+
+    from typing import Self
+
+    class _CancellingAgent:
+        def __init__(self, config: Any) -> None:
+            self.config = config
+            conn = type("_Conn", (), {"cancel": staticmethod(lambda: cancelled.append(True))})()
+            self.conversation = type("_Conv", (), {"connection": conn, "history": [step1]})()
+
+        async def __aenter__(self) -> Self:
+            return self
+
+        async def __aexit__(self, *_: object) -> None:
+            return None
+
+        async def chat(self, _query: str) -> Any:
+            await self.config.hooks[1](step1)
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr("reach.runtime.antigravity_sdk.Agent", _CancellingAgent)
+    outcome_early = rt_early.select("use skill a", workdir, target_skill="skill-a")
+    assert outcome_early.error is None
+    assert outcome_early.early_exit is True
+    assert outcome_early.invoked_skills == ("skill-a",)
     assert cancelled == [True]
 
 

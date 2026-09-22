@@ -214,6 +214,8 @@ def _is_resumable_row(
     active_query_ids: set[str] | None = None,
     corpus_digest: str = "",
     catalog_skills: set[str] | None = None,
+    config_fingerprint: str = "",
+    condition_digest: str = "",
 ) -> bool:
     """Return whether a recorded ProbeResult satisfies resume criteria for the active run."""
     if row.error:
@@ -221,6 +223,13 @@ def _is_resumable_row(
     if active_query_ids is not None and row.query_id not in active_query_ids:
         return False
     if corpus_digest and row.corpus_digest != corpus_digest:
+        return False
+    if (
+        config_fingerprint
+        and row.config_fingerprint
+        and row.config_fingerprint != config_fingerprint
+        and not (condition_digest and row.condition_digest == condition_digest)
+    ):
         return False
     return not (catalog_skills is not None and set(row.observed_catalog) != catalog_skills)
 
@@ -231,6 +240,8 @@ def _partition_resumed_results(
     active_query_ids: set[str],
     corpus_digest: str,
     catalog_skills: set[str],
+    config_fingerprint: str = "",
+    condition_digest: str = "",
 ) -> tuple[list[ProbeResult], set[tuple[str, int]], list[ProbeResult], bool]:
     """Partition JSONL rows into active resumed rows and preserved other-anchor/arm rows."""
     by_attempt: dict[tuple[str, int], ProbeResult] = {}
@@ -241,13 +252,22 @@ def _partition_resumed_results(
             active_query_ids=active_query_ids,
             corpus_digest=corpus_digest,
             catalog_skills=catalog_skills,
+            config_fingerprint=config_fingerprint,
+            condition_digest=condition_digest,
         ):
             by_attempt[(row.query_id, row.attempt)] = row
         elif (
             not row.error
             and (not corpus_digest or row.corpus_digest == corpus_digest)
             and (
-                row.query_id not in active_query_ids or set(row.observed_catalog) != catalog_skills
+                row.query_id not in active_query_ids
+                or set(row.observed_catalog) != catalog_skills
+                or (
+                    bool(config_fingerprint)
+                    and bool(row.config_fingerprint)
+                    and row.config_fingerprint != config_fingerprint
+                    and not (condition_digest and row.condition_digest == condition_digest)
+                )
             )
         ):
             key = (
@@ -270,6 +290,8 @@ def completed_attempts(
     active_query_ids: set[str] | None = None,
     corpus_digest: str = "",
     catalog_skills: set[str] | None = None,
+    config_fingerprint: str = "",
+    condition_digest: str = "",
 ) -> set[tuple[str, int]]:
     """Return completed, successful (query_id, attempt) pairs from existing results."""
     resolved = Path(path).expanduser()
@@ -283,6 +305,8 @@ def completed_attempts(
             active_query_ids=active_query_ids,
             corpus_digest=corpus_digest,
             catalog_skills=catalog_skills,
+            config_fingerprint=config_fingerprint,
+            condition_digest=condition_digest,
         )
     }
 
@@ -738,6 +762,8 @@ class ProbeHarness:
                     active_query_ids={q.id for q in query_set.queries},
                     corpus_digest=provenance.corpus_digest,
                     catalog_skills=set(catalog.skills),
+                    config_fingerprint=provenance.config_fingerprint,
+                    condition_digest=provenance.condition_digest,
                 )
 
         total = len(query_set.queries) * config.plan.attempts
