@@ -49,27 +49,43 @@ def _parse_quadrant_item(raw: str | OverlapQuadrant) -> OverlapQuadrant:
     try:
         return OverlapQuadrant(raw)
     except ValueError as exc:
-        valid = ", ".join("-".join(tokenize(m.name)) for m in OverlapQuadrant)
+        valid = ", ".join("-".join(tokenize(m.name.replace("_", "-"))) for m in OverlapQuadrant)
         msg = f"unknown quadrant {raw!r}; expected one of: {valid}"
         raise ValueError(msg) from exc
 
 
 def _parse_quadrants_field(raw: object) -> frozenset[OverlapQuadrant]:
-    """Normalize a string or sequence of quadrant names into a validated frozenset."""
+    """Normalize CLI strings or sequences into a validated frozenset of OverlapQuadrant."""
     if raw is None:
         return frozenset()
-    if isinstance(raw, (str, OverlapQuadrant)):
-        parts = [p.strip() for p in str(raw).split(",") if p.strip()]
+    if isinstance(raw, str):
+        parts = [p.strip() for p in raw.split(",") if p.strip()]
     elif isinstance(raw, (list, tuple, set, frozenset)):
         parts = [p.strip() for entry in raw for p in str(entry).split(",") if p.strip()]
     else:
-        msg = f"invalid quadrant filter value: {raw!r}"
+        msg = f"invalid quadrant filter type: {type(raw).__name__}"
         raise TypeError(msg)
-    return frozenset(_parse_quadrant_item(part) for part in parts)
+    return frozenset(_parse_quadrant_item(p) for p in parts)
+
+
+def _lookup_similarity(
+    skill: str,
+    rival: str,
+    semantic_similarities: Mapping[tuple[str, str], float] | None,
+) -> float | None:
+    """Look up bidirectional pairwise semantic similarity with finite validation."""
+    if semantic_similarities is None:
+        return None
+    sim = semantic_similarities.get((skill, rival))
+    if sim is None:
+        sim = semantic_similarities.get((rival, skill))
+    if sim is None or not math.isfinite(sim):
+        return None
+    return sim
 
 
 class OverlapFilter(BaseModel):
-    """Validate and normalize CLI filter parameters for corpus overlap views."""
+    """Specify row filtering and slicing criteria for overlap views and reports."""
 
     model_config = ConfigDict(frozen=True)
 
@@ -81,20 +97,6 @@ class OverlapFilter(BaseModel):
     ] = frozenset()
 
 
-def _lookup_similarity(
-    skill: str,
-    rival: str,
-    semantic_similarities: Mapping[tuple[str, str], float],
-) -> float | None:
-    """Look up symmetrical semantic similarity score between two skill names."""
-    if not rival:
-        return None
-    sim = semantic_similarities.get((skill, rival))
-    if sim is None:
-        sim = semantic_similarities.get((rival, skill))
-    return sim
-
-
 def filter_competitions(
     competitions: Sequence[Competition],
     *,
@@ -102,7 +104,7 @@ def filter_competitions(
     quadrants: frozenset[OverlapQuadrant] = frozenset(),
     top: int | None = None,
 ) -> tuple[list[Competition], int]:
-    """Filter competitions by quadrant and optional top limit, returning (shown, total_matching)."""
+    """Filter competitions by quadrant and slice to top N, returning (sliced, total_matching)."""
     if quadrants:
         matched: list[Competition] = []
         for comp in competitions:
@@ -201,7 +203,7 @@ def print_omitted_footer(
     omitted_count: int,
     total_matching: int,
 ) -> None:
-    """Print a dim footer line indicating how many additional skills were omitted."""
+    """Print standardized footer when rows are omitted due to --top or default cap."""
     if omitted_count <= 0:
         return
     console.print(
@@ -252,6 +254,7 @@ def print_overlap(
     omitted_count: int = 0,
     total_matching: int | None = None,
     truncate: bool = True,
+    caveat: bool = True,
 ) -> None:
     """Render Table ranking skills by lexical overlap and optional semantic similarity."""
     corpus_total = len(overlap.competitions)
@@ -318,7 +321,8 @@ def print_overlap(
         )
     _print_overlap_table(console, table, truncate=truncate)
     print_omitted_footer(console, effective_omitted, matching_total)
-    print_overlap_caveat(console)
+    if caveat:
+        print_overlap_caveat(console)
 
 
 def _outranked(count: int) -> Text:

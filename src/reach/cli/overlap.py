@@ -478,7 +478,7 @@ def _overlap(
         found,
         skill,
         suggest=suggest,
-        semantic=semantic or bool(overlap_filter.quadrants),
+        semantic=semantic,
         format=format,
         overlap_filter=overlap_filter,
         truncate=not no_truncate,

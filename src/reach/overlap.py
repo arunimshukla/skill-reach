@@ -148,6 +148,8 @@ def suggest_close_skills(
     )
     scored: list[tuple[float, float, str]] = []
     for candidate in available:
+        if candidate == target:
+            continue
         cand_tokens = frozenset(tokenize(candidate))
         shared = len(target_tokens & cand_tokens)
         union = len(target_tokens | cand_tokens)

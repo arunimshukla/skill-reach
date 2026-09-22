@@ -686,7 +686,11 @@ class OverlapQuadrant(StrEnum):
             member_name_tokens = tuple(tokenize(member.name.replace("_", "-")))
             if tokens in (member_name_tokens, tuple(tokenize(member.value))):
                 return member
-        prefix_matches = [m for m in cls if tokenize(m.value)[0].startswith(tokens[0])]
+        prefix_matches = [
+            m
+            for m in cls
+            if (val_tokens := tokenize(m.value)) and val_tokens[0].startswith(tokens[0])
+        ]
         if len(prefix_matches) == 1 and len(tokens) == 1:
             return prefix_matches[0]
         return None
