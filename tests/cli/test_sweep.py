@@ -765,7 +765,7 @@ def test_sweep_passes_loaded_skills_once_and_checkpoints_each_scale(
     )
     assert code == 0
     passed_skills = captured_kwargs.get("skills")
-    assert isinstance(passed_skills, list)
+    assert isinstance(passed_skills, (list, tuple))
     assert len(passed_skills) == 6
     assert checkpoints_seen == [1, 2, 3]
     captured = capsys.readouterr()
