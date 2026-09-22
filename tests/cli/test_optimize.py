@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING
 from unittest.mock import patch
 
 from reach.cli import main
-from reach.optimize import OptimizationCandidate
+from reach.optimize import OptimizationCandidate, OptimizationReport
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -919,3 +919,42 @@ def test_optimize_with_handoff_cli_diff_and_auto_apply(
     assert ret_apply == 0
     assert "> **Routing Note:**" in (target_dir / "SKILL.md").read_text(encoding="utf-8")
     assert "> **Routing Note:**" in (rival_dir / "SKILL.md").read_text(encoding="utf-8")
+
+
+def test_optimize_short_flag_jobs_for_workers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify that -j short flag sets worker count for empirical probes."""
+    target_dir = tmp_path / "sample-target"
+    target_dir.mkdir(parents=True)
+    (target_dir / "SKILL.md").write_text(
+        "---\nname: sample-target\ndescription: Target skill description.\n---\n# Sample\nBody\n",
+        encoding="utf-8",
+    )
+    observed_workers: list[int] = []
+
+    def mock_optimize_skill(*args: object, **kwargs: object) -> OptimizationReport:
+        settings = kwargs.get("settings")
+        observed_workers.append(getattr(settings, "workers", 0))
+        return OptimizationReport(
+            skill_name="sample-target",
+            baseline_description="Target skill description.",
+        )
+
+    monkeypatch.setattr("reach.optimize.optimize_skill", mock_optimize_skill)
+    ret = main(
+        [
+            "optimize",
+            "sample-target",
+            "--skills",
+            str(tmp_path),
+            "--agent",
+            "fake",
+            "-j",
+            "3",
+            "--yes",
+        ]
+    )
+    assert ret == 0
+    assert observed_workers == [3]

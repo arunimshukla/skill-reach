@@ -204,7 +204,7 @@ def _optimize(
         int | None,
         POSITIVE_INT,
         Parameter(
-            name=["--workers", "-w"],
+            name=["--workers", "-j"],
             help="Number of parallel probe workers (default: from reach.toml or 4)",
         ),
     ] = None,
