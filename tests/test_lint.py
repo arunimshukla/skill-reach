@@ -1313,4 +1313,3 @@ def test_missing_mutual_handoff_ignores_multi_skill_template_cliques(tmp_path: P
         "workflow-pipeline-authoring",
         "workflow-pipeline-debugging",
     }
-
