@@ -26,6 +26,7 @@ from reach.config import (
     RunConfig,
     RuntimeSettings,
     StudySettings,
+    default_agent,
     resolve_sub_settings,
 )
 from reach.queries import load_query_set
@@ -459,10 +460,21 @@ def _resolve_sweep_effective_config(
     out: Path | None,
 ) -> tuple[RunConfig, AgentRuntime]:
     """Resolve layered runtime, registry, and study settings across CLI flags and configs."""
+    resolved_agent = (
+        agent
+        or (
+            run_config.runtime.agent
+            if run_config is not None and "agent" in run_config.runtime.model_fields_set
+            else None
+        )
+        or (run_config.general.default_agent if run_config is not None else None)
+        or (run_config.runtime.agent if run_config is not None else None)
+        or default_agent()
+    )
     eff_runtime = RunConfig.resolve(
         RuntimeSettings,
         run_config,
-        agent=agent,
+        agent=resolved_agent,
         model=model,
     )
     if not eff_runtime.agent:

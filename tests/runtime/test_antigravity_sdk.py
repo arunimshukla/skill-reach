@@ -217,6 +217,25 @@ def test_select_config_points_at_the_installed_skills_directory(
     assert config.skills_paths == [str(runtime.skills_dir(workdir))]
 
 
+def test_select_config_includes_symlink_parents_when_use_symlinks_true(
+    tmp_path: Path,
+) -> None:
+    """Verify skills_paths includes resolved symlink parent directories when enabled."""
+    runtime = AntigravitySdkRuntime(options=AntigravitySdkOptions(use_symlinks=True))
+    workdir = tmp_path / "work"
+    skills_dir = runtime.skills_dir(workdir)
+    skills_dir.mkdir(parents=True, exist_ok=True)
+
+    external_source = tmp_path / "external_skills" / "custom-skill"
+    external_source.mkdir(parents=True, exist_ok=True)
+    symlink_dst = skills_dir / "custom-skill"
+    symlink_dst.symlink_to(external_source, target_is_directory=True)
+
+    config = runtime._select_config(workdir)
+    assert str(skills_dir) in config.skills_paths
+    assert str(external_source.parent) in config.skills_paths
+
+
 def test_select_reports_the_structured_selection(
     monkeypatch: pytest.MonkeyPatch,
     runtime: AntigravitySdkRuntime,
@@ -533,7 +552,7 @@ def test_antigravity_sdk_generator_uninstalled_raises_helpful_error(
 def test_antigravity_sdk_options_defaults() -> None:
     """Verify AntigravitySdkOptions default parameters for performance and isolation."""
     opts = AntigravitySdkOptions()
-    assert opts.use_symlinks is True
+    assert opts.use_symlinks is False
     assert opts.isolate_config_dir is True
     assert opts.auto_clean is False
     assert opts.app_data_dir is None

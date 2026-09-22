@@ -65,6 +65,7 @@ __all__ = [
     "FAKE_AGENT",
     "AgentOptions",
     "AgentRuntime",
+    "AntigravityOptions",
     "AntigravityRuntime",
     "CatalogFit",
     "CliAgentRuntime",
@@ -130,6 +131,12 @@ class AgentOptions(BaseModel):
 
             validate_isolated_directory(self.custom_isolation_dir, self.isolation_dir_field)
         return self
+
+
+class AntigravityOptions(AgentOptions):
+    """Hold common configuration options for Antigravity-ecosystem agent runtimes."""
+
+    use_symlinks: bool = False
 
 
 class CliOptions(AgentOptions):

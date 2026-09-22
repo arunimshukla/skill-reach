@@ -787,6 +787,17 @@ class RunConfig(BaseModel):
             )
         return self
 
+    @model_validator(mode="after")
+    def _inherit_runtime_agent_from_general(self) -> Self:
+        """Inherit general.default_agent into runtime.agent when runtime.agent is unset."""
+        if "agent" not in self.runtime.model_fields_set:
+            object.__setattr__(
+                self,
+                "runtime",
+                self.runtime.model_copy(update={"agent": self.general.default_agent}),
+            )
+        return self
+
     def require_queries(self, hint: str = "") -> Path:
         """Forward queries path requirement to study settings."""
         return self.study.require_queries(hint)

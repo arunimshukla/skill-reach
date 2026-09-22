@@ -881,7 +881,10 @@ def test_install_uses_symlinks_by_default(
     catalog = build_catalogs(skills, CatalogMode.SINGLETON)[0]
     workdir = runtime.install(catalog, skills, tmp_path / f"work_{agent}")
     skill_entry = runtime.skills_dir(workdir) / catalog.skills[0]
-    assert skill_entry.is_symlink()
+    if isinstance(runtime, AntigravityRuntime):
+        assert not skill_entry.is_symlink()
+    else:
+        assert skill_entry.is_symlink()
 
 
 @pytest.mark.parametrize("agent", known_agents())
@@ -897,6 +900,22 @@ def test_install_copies_when_use_symlinks_is_false(
     workdir = runtime.install(catalog, skills, tmp_path / f"work_{agent}")
     skill_entry = runtime.skills_dir(workdir) / catalog.skills[0]
     assert not skill_entry.is_symlink()
+
+
+@pytest.mark.parametrize("agent", antigravity_agents())
+def test_antigravity_agents_can_enable_use_symlinks(
+    agent: str,
+    skill_repo: Path,
+    tmp_path: Path,
+) -> None:
+    """Verify Antigravity runtimes create symlinks when use_symlinks is explicitly set to True."""
+    runtime = _build_agent(agent, tmp_path, use_symlinks=True)
+    assert runtime.use_symlinks is True
+    skills = load_skills(skill_repo)
+    catalog = build_catalogs(skills, CatalogMode.SINGLETON)[0]
+    workdir = runtime.install(catalog, skills, tmp_path / f"work_{agent}_symlinks")
+    skill_entry = runtime.skills_dir(workdir) / catalog.skills[0]
+    assert skill_entry.is_symlink()
 
 
 @pytest.mark.parametrize("agent", known_agents())
@@ -1272,10 +1291,11 @@ def test_all_agents_configurable_max_turns_and_early_exit(agent: str, tmp_path: 
 def test_all_agents_default_performance_and_isolation_options(agent: str, tmp_path: Path) -> None:
     """Verify performance and isolation options default to expected values across all agents."""
     rt = _build_agent(agent, tmp_path)
-    assert rt.use_symlinks is True
+    expected_symlinks = not isinstance(rt, AntigravityRuntime)
+    assert rt.use_symlinks is expected_symlinks
     assert rt.isolate_config_dir is True
     assert rt.auto_clean is False
-    assert rt.options.use_symlinks is True
+    assert rt.options.use_symlinks is expected_symlinks
     assert rt.options.isolate_config_dir is True
     assert rt.options.auto_clean is False
 
@@ -1659,9 +1679,10 @@ def test_build_text_generator_options_model_is_respected() -> None:
 
 def test_agent_options_inheritance_hierarchy() -> None:
     """Verify AgentOptions is the root model and all registered agent options subclass it."""
-    from reach.runtime import AgentOptions, CliOptions
+    from reach.runtime import AgentOptions, AntigravityOptions, CliOptions
 
     assert issubclass(CliOptions, AgentOptions)
+    assert issubclass(AntigravityOptions, AgentOptions)
 
     for agent in known_agents():
         opt_cls = options_model(agent)
@@ -1692,7 +1713,8 @@ def test_agent_options_inheritance_hierarchy() -> None:
         assert opt_cls is not None
         assert issubclass(opt_cls, AgentOptions)
         instance = opt_cls()
-        assert instance.use_symlinks is True
+        expected_symlinks = not issubclass(opt_cls, AntigravityOptions)
+        assert instance.use_symlinks is expected_symlinks
         assert instance.isolate_config_dir is True
         assert instance.auto_clean is False
 
