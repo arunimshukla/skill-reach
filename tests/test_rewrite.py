@@ -525,10 +525,72 @@ def test_the_verb_suggests_for_the_skill_it_was_pointed_at(skill_repo: Path, cap
     assert "no probe was issued" in shown_page
 
 
-def test_the_verb_refuses_to_suggest_for_a_whole_corpus(skill_repo: Path, capsys) -> None:
-    """Verify overlap --suggest exits with code 2 when --skill argument is omitted."""
-    assert main(["overlap", "--skills", str(skill_repo), "--suggest"]) == 2
-    assert "--skill" in capsys.readouterr().err
+def test_the_verb_suggests_across_a_whole_corpus_without_skill_flag(
+    skill_repo: Path,
+    capsys,
+) -> None:
+    """Verify overlap --suggest runs across the corpus when --skill argument is omitted."""
+    assert main(["overlap", "--skills", str(skill_repo), "--suggest"]) == 0
+    err = capsys.readouterr().err
+    assert "No actionable rewrites across 3 skills" in err
+    assert err.count("no probe was issued") == 1
+
+    assert main(["overlap", "--skills", str(skill_repo), "--suggest", "--all"]) == 0
+    err_all = capsys.readouterr().err
+    assert "gke-basics" in err_all
+    assert "gcs-lifecycle-rules" in err_all
+    assert err_all.count("no probe was issued") == 1
+
+
+def test_corpus_wide_suggest_filters_to_actionable_rewrites(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    """Verify corpus-wide --suggest emits only REWORD or missing-handoff skills by default."""
+    for name, desc in (
+        ("widget-basics", BLUNT),
+        ("widget-rollout", RIVAL),
+        (
+            "bq-observability",
+            (
+                "Monitors BigQuery slot utilization and INFORMATION_SCHEMA telemetry. "
+                "Don't use for warehouse cost analysis (use `bq-cost-optimizer`)."
+            ),
+        ),
+        (
+            "bq-cost-optimizer",
+            "Analyzes BigQuery slot utilization and INFORMATION_SCHEMA telemetry.",
+        ),
+        ("gadget-tuning", "Tune gadget throughput for busy pipelines."),
+        ("ledger-audit", "Reconcile ledger entries against statements."),
+        ("mailer-templates", "Author transactional mail templates."),
+        ("photo-resize", "Crop photographs to a target aspect ratio."),
+        ("query-planner", "Report how the planner picks a strategy."),
+    ):
+        d = tmp_path / name
+        d.mkdir()
+        (d / "SKILL.md").write_text(
+            f"---\nname: {name}\ndescription: {desc}\n---\n{BODY}",
+            encoding="utf-8",
+        )
+
+    assert main(["overlap", "--skills", str(tmp_path), "--suggest"]) == 0
+    err = capsys.readouterr().err
+    assert "widget-basics cedes" in err
+    assert "ledger-audit" not in err
+    assert err.count("no probe was issued") == 1
+
+    payload = json.loads(
+        emitted(
+            ["overlap", "--skills", str(tmp_path), "--suggest", "--format", "json"],
+            capsys,
+        ),
+    )
+    assert payload["corpus_size"] == 9
+    by_skill = {s["skill"]: s for s in payload["skills"]}
+    assert "ledger-audit" not in by_skill
+    assert by_skill["widget-basics"]["verdict"] == "reword"
+    assert by_skill["bq-observability"]["missing_mutual_handoffs"] == ["bq-cost-optimizer"]
 
 
 def test_the_suggestion_replaces_the_standings_rather_than_following_them(

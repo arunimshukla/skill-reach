@@ -21,6 +21,7 @@ import math
 import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass
+from enum import StrEnum
 from math import log
 from typing import TYPE_CHECKING, Any, Protocol, override, runtime_checkable
 
@@ -38,6 +39,7 @@ __all__ = [
     "Bm25Scorer",
     "DenseScorer",
     "HybridScorer",
+    "OverlapQuadrant",
     "Scorer",
     "TextScorer",
     "build_scorer",
@@ -665,19 +667,38 @@ def build_scorer(
             raise ValueError(msg)
 
 
+class OverlapQuadrant(StrEnum):
+    """Classify the diagnostic quadrant between lexical and semantic overlap."""
+
+    NEAR_DUPLICATE = "Near-Duplicate"
+    BOILERPLATE = "Boilerplate / Style"
+    LATENT_COLLISION = "Latent Collision"
+    DISTINCT = "Distinct"
+
+    @classmethod
+    def _missing_(cls, value: object) -> OverlapQuadrant | None:
+        """Resolve case- and punctuation-insensitive CLI slugs via tokenized enum names."""
+        if not isinstance(value, str) or not (tokens := tuple(tokenize(value))):
+            return None
+        for member in cls:
+            if tokens in (tuple(tokenize(member.name)), tuple(tokenize(member.value))):
+                return member
+        return None
+
+
 def classify_overlap_quadrant(
     lexical_ratio: float,
     semantic_similarity: float,
     lex_high: float = 0.5,
     sem_high: float = 0.75,
-) -> str:
+) -> OverlapQuadrant:
     """Classify the relationship between lexical and semantic overlap into a diagnostic quadrant."""
     match (lexical_ratio >= lex_high, semantic_similarity >= sem_high):
         case (True, True):
-            return "Near-Duplicate"
+            return OverlapQuadrant.NEAR_DUPLICATE
         case (True, False):
-            return "Boilerplate / Style"
+            return OverlapQuadrant.BOILERPLATE
         case (False, True):
-            return "Latent Collision"
+            return OverlapQuadrant.LATENT_COLLISION
         case _:
-            return "Distinct"
+            return OverlapQuadrant.DISTINCT

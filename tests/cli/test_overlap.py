@@ -1003,3 +1003,294 @@ def test_overlap_multiple_skills_preserves_independent_catalogs(
 
     code = main(["overlap", "--skill", str(s1), "--skill", str(s2)])
     assert code == 0
+
+
+@pytest.fixture
+def prefix_suffix_family(corpus_builder) -> list[Skill]:
+    """Provide skills sharing both prefix and suffix where only the middle token differs."""
+    return (
+        corpus_builder()
+        .add(
+            "agent-platform-tuning-management",
+            "Manage model fine-tuning jobs and adapter hyperparameters on Agent Platform.",
+        )
+        .add(
+            "agent-platform-endpoint-management",
+            "Manage model deployment endpoints and traffic splits on Agent Platform.",
+        )
+        .add(
+            "agent-platform-prompt-management",
+            "Manage versioned prompt templates and variables on Agent Platform.",
+        )
+        .add(
+            "google-cloud-waf-cost-optimization",
+            "Optimize Google Cloud architecture for cloud cost and billing efficiency.",
+        )
+        .add(
+            "google-cloud-waf-performance-optimization",
+            "Optimize Google Cloud architecture for low latency and throughput performance.",
+        )
+        .build_skills()
+    )
+
+
+@pytest.mark.parametrize("width", [60, 80, 100, 160])
+def test_prefix_and_suffix_family_never_collides_across_widths(
+    make_console,
+    rendered,
+    prefix_suffix_family,
+    width: int,
+) -> None:
+    """Verify skills sharing both prefix and suffix render distinct cells across terminal widths."""
+    console, buffer = make_console(width=width)
+    print_overlap(console, rank_corpus(prefix_suffix_family))
+    cells = shown_cells(rendered(buffer), 0)
+
+    assert len(cells) == len(prefix_suffix_family)
+    assert len(set(cells)) == len(prefix_suffix_family), (
+        f"prefix-suffix family collided at width {width}: {cells}"
+    )
+
+
+def _write_skills(root: Path, specs: list[tuple[str, str]]) -> None:
+    """Create temporary skill subdirectories with SKILL.md files."""
+    for name, desc in specs:
+        d = root / name
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "SKILL.md").write_text(
+            f"---\nname: {name}\ndescription: {desc}\n---\n",
+            encoding="utf-8",
+        )
+
+
+def test_no_truncate_flag_preserves_full_skill_names(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Verify --no-truncate renders full skill and rival names without ellipsis."""
+    _write_skills(
+        tmp_path,
+        [
+            ("agent-platform-tuning-management", "Manage tuning jobs on Agent Platform."),
+            ("agent-platform-endpoint-management", "Manage endpoints on Agent Platform."),
+        ],
+    )
+
+    assert main(["overlap", "--skills", str(tmp_path), "--no-truncate"]) == 0
+    err = capsys.readouterr().err
+    assert "agent-platform-tuning-management" in err
+    assert "agent-platform-endpoint-management" in err
+    assert "…" not in err.splitlines()[2]
+
+
+def test_large_corpus_auto_caps_text_at_30_rows_and_respects_top_and_all(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Verify >30 skills auto-cap at 30 in text mode while --all and --top control row count."""
+    from unittest.mock import patch
+
+    from reach.retrieval import DenseScorer
+
+    _write_skills(
+        tmp_path,
+        [
+            (f"cloud-skill-{i:02d}", f"Configure cloud resource group {i % 5} rules.")
+            for i in range(35)
+        ],
+    )
+
+    # Default text output caps at 30 with omission footer
+    assert main(["overlap", "--skills", str(tmp_path)]) == 0
+    err_default = capsys.readouterr().err
+    assert "Showing 30 of 35 skills" in err_default
+    assert "5 more skills omitted" in err_default
+
+    # --all displays all 35 rows
+    assert main(["overlap", "--skills", str(tmp_path), "--all"]) == 0
+    err_all = capsys.readouterr().err
+    assert "35 skills, ranked by" in err_all
+    assert "more skills omitted" not in err_all
+
+    # --quadrant also respects the 30-row cap in text mode unless --all is passed
+    mock_vectors = {f"cloud-skill-{i:02d}": [1.0, 0.0] for i in range(35)}
+    with patch.object(DenseScorer, "from_skills", return_value=DenseScorer(vectors=mock_vectors)):
+        assert main(["overlap", "--skills", str(tmp_path), "--quadrant", "latent-collision"]) == 0
+        err_quad = capsys.readouterr().err
+        assert "Showing 30 of 35 skills" in err_quad
+        assert "5 more skills omitted" in err_quad
+
+    # --top 5 displays 5 rows in both text and JSON
+    assert main(["overlap", "--skills", str(tmp_path), "--top", "5"]) == 0
+    err_top = capsys.readouterr().err
+    assert "Showing 5 of 35 skills" in err_top
+    assert "30 more skills omitted" in err_top
+
+    payload_unfiltered = json.loads(
+        emitted(["overlap", "--skills", str(tmp_path), "--format", "json"], capsys)
+    )
+    assert payload_unfiltered["corpus_size"] == 35
+    assert len(payload_unfiltered["skills"]) == 35
+
+    payload_top = json.loads(
+        emitted(
+            ["overlap", "--skills", str(tmp_path), "--top", "5", "--format", "json"],
+            capsys,
+        )
+    )
+    assert payload_top["corpus_size"] == 35
+    assert len(payload_top["skills"]) == 5
+
+
+def test_quadrant_filter_auto_enables_semantic_and_filters_rows(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Verify --quadrant implies --semantic and filters both text and JSON outputs."""
+    from unittest.mock import patch
+
+    from reach.retrieval import DenseScorer
+
+    _write_skills(
+        tmp_path,
+        [
+            ("dup-a", "Manage Kubernetes cluster autoscaling and node pools."),
+            ("dup-b", "Manage Kubernetes cluster autoscaling and node pools."),
+            ("distinct-c", "Reconcile billing invoices and tax ledgers."),
+        ],
+    )
+
+    mock_vectors = {
+        "dup-a": [1.0, 0.0],
+        "dup-b": [0.99, 0.01],
+        "distinct-c": [0.0, 1.0],
+    }
+    with patch.object(DenseScorer, "from_skills", return_value=DenseScorer(vectors=mock_vectors)):
+        payload = json.loads(
+            emitted(
+                [
+                    "overlap",
+                    "--skills",
+                    str(tmp_path),
+                    "--quadrant",
+                    "near-duplicate",
+                    "--format",
+                    "json",
+                ],
+                capsys,
+            )
+        )
+        assert payload["corpus_size"] == 3
+        assert [s["skill"] for s in payload["skills"]] == ["dup-a", "dup-b"]
+        assert all(s["quadrant"] == "Near-Duplicate" for s in payload["skills"])
+
+
+@pytest.mark.parametrize(
+    ("extra_args", "expected_snippet"),
+    [
+        (["--top", "0"], "greater than or equal to 1"),
+        (["--quadrant", "not-a-quadrant"], "unknown quadrant"),
+    ],
+)
+def test_invalid_top_or_quadrant_fails_with_validation_error(
+    skill_repo: Path,
+    capsys: pytest.CaptureFixture[str],
+    extra_args: list[str],
+    expected_snippet: str,
+) -> None:
+    """Verify invalid --top or --quadrant values exit with code 2 and descriptive error."""
+    assert main(["overlap", "--skills", str(skill_repo), *extra_args]) == 2
+    assert expected_snippet in _panel_text(capsys.readouterr().err)
+
+
+def test_unknown_skill_in_overlap_and_explain_suggests_fuzzy_matches(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Verify mistyped or middle-expanded --skill suggests close matches in corpus."""
+    _write_skills(
+        tmp_path,
+        [
+            (name, f"Skill for {name}.")
+            for name in (
+                "agent-platform-tuning",
+                "agent-platform-tuning-management",
+                "agent-platform-endpoint-management",
+            )
+        ],
+    )
+
+    assert (
+        main(
+            [
+                "overlap",
+                "--skills",
+                str(tmp_path),
+                "--skill",
+                "agent-platform-model-tuning",
+            ]
+        )
+        == 2
+    )
+    err = _panel_text(capsys.readouterr().err)
+    assert "did you mean" in err
+    assert "agent-platform-tuning" in err
+
+    assert (
+        main(
+            [
+                "overlap",
+                "explain",
+                "tune model",
+                "--skills",
+                str(tmp_path),
+                "--skill",
+                "agent-platform-model-tuning",
+            ]
+        )
+        == 2
+    )
+    err_explain = _panel_text(capsys.readouterr().err)
+    assert "did you mean" in err_explain
+    assert "agent-platform-tuning" in err_explain
+
+
+def test_multi_skill_overlap_and_suggest_print_caveat_once(
+    skill_repo: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Verify OVERLAP_CAVEAT is printed only once at the end of multi-skill output."""
+    assert (
+        main(
+            [
+                "overlap",
+                "--skills",
+                str(skill_repo),
+                "--skill",
+                "gke-basics",
+                "--skill",
+                "gcs-lifecycle-rules",
+            ]
+        )
+        == 0
+    )
+    err_standings = capsys.readouterr().err
+    assert err_standings.count("no probe was issued") == 1
+
+    assert (
+        main(
+            [
+                "overlap",
+                "--skills",
+                str(skill_repo),
+                "--skill",
+                "gke-basics",
+                "--skill",
+                "gcs-lifecycle-rules",
+                "--suggest",
+            ]
+        )
+        == 0
+    )
+    err_suggest = capsys.readouterr().err
+    assert err_suggest.count("no probe was issued") == 1

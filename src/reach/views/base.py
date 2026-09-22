@@ -601,23 +601,120 @@ def _cell(text: str, style: str = "") -> Text:
     return Text(text, style=style, no_wrap=True, overflow="ellipsis")
 
 
-def middle_truncate(value: str, width: int) -> str:
-    """Truncate text by replacing middle characters with an ellipsis."""
+def _common_prefix_len(a: str, b: str) -> int:
+    """Return length of the shared prefix between two strings."""
+    limit = min(len(a), len(b))
+    i = 0
+    while i < limit and a[i] == b[i]:
+        i += 1
+    return i
+
+
+def _common_suffix_len(a: str, b: str) -> int:
+    """Return length of the shared suffix between two strings."""
+    limit = min(len(a), len(b))
+    i = 0
+    while i < limit and a[len(a) - 1 - i] == b[len(b) - 1 - i]:
+        i += 1
+    return i
+
+
+_MIN_DOUBLE_ELLIPSIS_WIDTH = 5
+_MAX_DISTINCT_CHARS = 4
+
+
+def _disambiguate_middle_truncate(
+    value: str,
+    width: int,
+    head: int,
+    tail: int,
+    others: Sequence[str],
+    default_rendered: str,
+) -> str:
+    """Select a split or middle slice that distinguishes value from colliding peers."""
+    keep = width - 1
+
+    def _collides(h: int, t: int) -> list[str]:
+        prefix = value[:h]
+        suffix = value[len(value) - t :] if t > 0 else ""
+        return [p for p in others if p.startswith(prefix) and p.endswith(suffix)]
+
+    colliding = _collides(head, tail)
+    if not colliding:
+        return default_rendered
+
+    lcp = max(_common_prefix_len(value, p) for p in colliding)
+    lcs = max(_common_suffix_len(value, p) for p in colliding)
+
+    min_side = min(_MAX_DISTINCT_CHARS, max(1, keep // 3))
+    valid_splits: list[tuple[int, int, int, int]] = []
+    for h in range(min_side, keep - min_side + 1):
+        t = keep - h
+        if not _collides(h, t):
+            distinct_chars = min(_MAX_DISTINCT_CHARS, max(h - lcp, t - lcs))
+            balance_penalty = abs(h - head)
+            valid_splits.append((distinct_chars, -balance_penalty, h, t))
+
+    if valid_splits:
+        valid_splits.sort(reverse=True)
+        _, _, best_h, best_t = valid_splits[0]
+        return f"{value[:best_h]}…{value[len(value) - best_t :]}"
+
+    if width >= _MIN_DOUBLE_ELLIPSIS_WIDTH:
+        avail = width - 2
+        p_len = max(1, avail // 3)
+        s_len = max(1, avail // 3)
+        m_len = max(1, avail - p_len - s_len)
+        mid_start = min(lcp, max(0, len(value) - m_len))
+        mid = value[mid_start : mid_start + m_len]
+        return f"{value[:p_len]}…{mid}…{value[len(value) - s_len :]}"
+
+    return default_rendered
+
+
+def middle_truncate(
+    value: str,
+    width: int,
+    *,
+    peers: Sequence[str] = (),
+) -> str:
+    """Truncate text by replacing middle characters with an ellipsis, disambiguating peers."""
     if width <= 0 or len(value) <= width:
         return value
     if width == 1:
         return "…"
     keep = width - 1
     tail = (keep + 1) // 2
-    return f"{value[: keep - tail]}…{value[len(value) - tail :]}"
+    head = keep - tail
+    default_rendered = f"{value[:head]}…{value[len(value) - tail :]}"
+    others = [p for p in peers if p != value and len(p) > keep] if peers else []
+    if not others:
+        return default_rendered
+    return _disambiguate_middle_truncate(
+        value,
+        width,
+        head,
+        tail,
+        others,
+        default_rendered,
+    )
 
 
 class _TruncatedName:
     """Renderable cell that middle-truncates long skill names."""
 
-    def __init__(self, value: str, style: str = "") -> None:
+    def __init__(
+        self,
+        value: str,
+        style: str = "",
+        *,
+        peers: Sequence[str] = (),
+        truncate: bool = True,
+    ) -> None:
         self.value = value
         self.style = style
+        self.peers = tuple(peers)
+        self.truncate = truncate
 
     def __rich_console__(
         self,
@@ -625,8 +722,11 @@ class _TruncatedName:
         options: ConsoleOptions,
     ) -> Generator[Text]:
         """Draw the middle-truncated name text within available max_width."""
+        if not self.truncate:
+            yield Text(self.value, style=self.style, no_wrap=True)
+            return
         yield Text(
-            middle_truncate(self.value, options.max_width),
+            middle_truncate(self.value, options.max_width, peers=self.peers),
             style=self.style,
             no_wrap=True,
             overflow="ellipsis",
@@ -638,6 +738,8 @@ class _TruncatedName:
         options: ConsoleOptions,
     ) -> Measurement:
         """Measure the minimum and maximum width required for this cell."""
+        if not self.truncate:
+            return Measurement(len(self.value), len(self.value))
         return Measurement(min(1, len(self.value)), len(self.value))
 
 
