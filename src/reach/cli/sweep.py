@@ -157,9 +157,9 @@ def _print_anchor_coverage(
     console: Console,
     queries_path: Path,
     anchor: str | None,
-    configured_anchor: str | None,
+    configured_anchor: int | Sequence[str] | str | None,
     skills: Sequence[Skill],
-    scales: Sequence[int],
+    scales: Sequence[int] | None,
     target: str | None,
 ) -> None:
     """Print anchor query coverage summary and warn on 0-query anchor skills."""

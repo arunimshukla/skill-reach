@@ -640,6 +640,7 @@ def test_post_probe_concurrent_workers_do_not_delete_active_sibling_slots(
     )
 
     config_main = rt._select_config(workdir)
+    assert config_main.app_data_dir is not None
     main_slot = Path(config_main.app_data_dir)
     sentinel = main_slot / "active_session.json"
     sentinel.write_text("{}", encoding="utf-8")
@@ -648,6 +649,7 @@ def test_post_probe_concurrent_workers_do_not_delete_active_sibling_slots(
 
     def _worker_probe() -> None:
         cfg_w = rt._select_config(workdir)
+        assert cfg_w.app_data_dir is not None
         w_slot = Path(cfg_w.app_data_dir)
         worker_slot_holder.append(w_slot)
         (w_slot / "worker_session.json").write_text("{}", encoding="utf-8")
