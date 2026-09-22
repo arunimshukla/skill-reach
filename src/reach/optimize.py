@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import difflib
 import json
 import random
@@ -57,7 +58,7 @@ from reach.rewrite import skill_body, suggest_rewrite, synthesize_directional_di
 from reach.runtime import FAKE_AGENT, TextGenerator, build_runtime, build_text_generator
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping, Sequence
+    from collections.abc import Sequence
 
     from reach.runtime import AgentRuntime
 
@@ -167,7 +168,9 @@ def _compute_paired_delta(
             effective_base = sum(1 for q_id in paired_pos_ids if baseline_hits_by_id[q_id]) / len(
                 paired_pos_ids
             )
-    return round(candidate_metric - effective_base, 4)
+    delta = candidate_metric - effective_base
+    clamped = max(-1.0, min(1.0, delta))
+    return round(clamped, 4)
 
 
 class _CandidateProbeTally(BaseModel):
@@ -587,7 +590,16 @@ def build_reciprocal_handoff(
 
 
 def render_body_with_routing_note(body: str, other_skill: str, note_line: str) -> str:
-    """Insert or idempotently update a Routing Note blockquote right after the H1 heading."""
+    """Insert or idempotently update a Routing Note blockquote after the H1 heading.
+
+    Args:
+        body: Markdown body of the target SKILL.md.
+        other_skill: Name of the rival skill to route to.
+        note_line: Formatted blockquote markdown string containing the routing notice.
+
+    Returns:
+        Updated markdown body containing the routing note.
+    """
     cleaned_note = note_line.strip()
     lines = body.splitlines()
     for idx, line in enumerate(lines):
@@ -613,7 +625,16 @@ def render_body_with_routing_note(body: str, other_skill: str, note_line: str) -
 
 
 def upsert_skill_routing_note(manifest_path: Path, other_skill: str, note_line: str) -> bool:
-    """Idempotently insert or update a Routing Note blockquote in a SKILL.md manifest body."""
+    """Idempotently insert or update a Routing Note blockquote in a SKILL.md manifest body.
+
+    Args:
+        manifest_path: Absolute path to the skill's SKILL.md file.
+        other_skill: Name of the other skill referenced in the routing note.
+        note_line: Formatted markdown blockquote containing the routing note.
+
+    Returns:
+        True if the note was successfully inserted or updated, or False on I/O error.
+    """
     if not manifest_path.is_file():
         return False
     try:
@@ -639,31 +660,54 @@ def apply_optimization_candidate(
     report: OptimizationReport,
     candidate: OptimizationCandidate,
 ) -> bool:
-    """Apply candidate description and optional reciprocal Layer-2 handoffs atomically to disk."""
-    if report.manifest_path is None:
+    """Apply candidate description and optional reciprocal Layer-2 handoffs atomically to disk.
+
+    Args:
+        report: Optimization report containing target manifest path and staged handoff metadata.
+        candidate: Candidate proposed for disk application.
+
+    Returns:
+        True if all target and rival file updates succeeded cleanly, or False otherwise.
+    """
+    handoff = report.handoff
+    if (
+        report.manifest_path is None
+        or not report.manifest_path.is_file()
+        or (handoff is not None and not handoff.rival_manifest_path.is_file())
+    ):
         return False
-    if report.handoff is None:
+    if handoff is None:
         return update_skill_description(report.manifest_path, candidate.description)
+
+    try:
+        orig_target_content = report.manifest_path.read_text(encoding="utf-8")
+    except OSError:
+        return False
 
     target_body = _read_skill_body(report.manifest_path)
     updated_target_body = render_body_with_routing_note(
         target_body,
-        report.handoff.rival_skill,
-        report.handoff.target_note,
+        handoff.rival_skill,
+        handoff.target_note,
     )
-    target_ok = update_skill_description(
+    if not update_skill_description(
         report.manifest_path,
         candidate.description,
         body_override=updated_target_body,
-    )
-    if not target_ok:
+    ):
         return False
-    rival_ok = upsert_skill_routing_note(
-        report.handoff.rival_manifest_path,
-        report.handoff.target_skill,
-        report.handoff.rival_note,
-    )
-    return target_ok and rival_ok
+
+    if not upsert_skill_routing_note(
+        handoff.rival_manifest_path,
+        handoff.target_skill,
+        handoff.rival_note,
+    ):
+        # Rollback target manifest modification to preserve catalog consistency
+        with contextlib.suppress(OSError):
+            atomic_write_text(report.manifest_path, orig_target_content, encoding="utf-8")
+        return False
+
+    return True
 
 
 def _resolve_lint_settings(config: LintSettings | Path | None = None) -> LintSettings:
@@ -982,9 +1026,15 @@ def synthesize_candidates(
     false_triggers: Sequence[str] = (),
     previous_description: str | None = None,
     iteration: int = 1,
+    *,
+    agent: str | None = None,
+    runtime_options: Mapping[str, Any] | None = None,
 ) -> list[OptimizationCandidate]:
     """Synthesize candidate descriptions using LLM generation or vocabulary heuristics."""
     lint_config = _resolve_lint_settings(config)
+    if driver is None and agent is not None:
+        cfg_path = config if isinstance(config, Path) else None
+        driver = _setup_driver(agent=agent, runtime_options=runtime_options, config=cfg_path)
     if driver is not None and driver.name != FAKE_AGENT:
         llm_results = _synthesize_via_llm(
             driver,
@@ -1489,7 +1539,7 @@ def _candidate_rank_key(
     origin_prio = float(ORIGIN_PRIORITY.get(c.origin, 0))
     if has_test:
         test_rec = c.test_recall if c.test_recall is not None else -1.0
-        test_traj = c.test_trajectory_recall if c.test_trajectory_recall is not None else test_rec
+        test_traj = c.test_trajectory_recall if c.test_trajectory_recall is not None else -1.0
         test_acc = c.test_accuracy if c.test_accuracy is not None else -1.0
         return (
             test_rec,
@@ -1733,6 +1783,7 @@ def _run_optimization_round(  # noqa: PLR0913, PLR0915
         false_triggers=false_triggers,
         previous_description=prev_description,
         iteration=iter_idx,
+        runtime_options=runtime_options,
     )
     linted_candidates = filter_candidates(
         raw_candidates,

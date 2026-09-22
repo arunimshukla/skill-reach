@@ -33,9 +33,11 @@ from reach.optimize import (
     IterationRecord,
     OptimizationCandidate,
     OptimizationReport,
+    ReciprocalHandoff,
     _evaluate_all_candidates,
     _run_candidate_probes,
     _synthesize_via_heuristics,
+    apply_optimization_candidate,
     build_optimization_prompt,
     evaluate_candidate,
     filter_candidates,
@@ -2266,3 +2268,101 @@ def test_baseline_evaluation_populates_trajectory_hits_by_id_for_paired_deltas(
 
     assert base.hits_by_id == {"q1": True, "q2": False}
     assert base.trajectory_hits_by_id == {"q1": True, "q2": True}
+
+
+def test_apply_optimization_candidate_rolls_back_target_on_rival_failure(
+    tmp_path: Path,
+) -> None:
+    """Verify apply_optimization_candidate rolls back target modification if rival write fails."""
+    target_dir = tmp_path / "target-skill"
+    target_dir.mkdir()
+    target_manifest = target_dir / "SKILL.md"
+    orig_content = "---\nname: target-skill\ndescription: Original desc.\n---\n# Target\nBody\n"
+    target_manifest.write_text(orig_content, encoding="utf-8")
+
+    # 1. Preflight check: missing rival manifest prevents modification
+    rival_manifest = tmp_path / "rival-skill" / "SKILL.md"
+    handoff = ReciprocalHandoff(
+        target_skill="target-skill",
+        rival_skill="rival-skill",
+        target_note="> **Routing Note:** Use rival.",
+        rival_note="> **Routing Note:** Use target.",
+        target_manifest_path=target_manifest,
+        rival_manifest_path=rival_manifest,
+        target_body_before="# Target\nBody\n",
+        rival_body_before="# Rival\nBody\n",
+    )
+    report = OptimizationReport(
+        skill_name="target-skill",
+        baseline_description="Original desc.",
+        manifest_path=target_manifest,
+        handoff=handoff,
+    )
+    cand = OptimizationCandidate(description="New candidate desc.")
+
+    # Preflight fails because rival_manifest does not exist yet
+    assert not apply_optimization_candidate(report, cand)
+    assert target_manifest.read_text(encoding="utf-8") == orig_content
+
+    # 2. Mid-write rollback: rival manifest exists, but upsert fails
+    rival_manifest.parent.mkdir(parents=True)
+    rival_manifest.write_text("# Rival\nBody\n", encoding="utf-8")
+    with patch("reach.optimize.upsert_skill_routing_note", return_value=False):
+        assert not apply_optimization_candidate(report, cand)
+    # Target manifest must be rolled back to original content
+    assert target_manifest.read_text(encoding="utf-8") == orig_content
+
+
+def test_candidate_rank_key_test_trajectory_recall_sentinel() -> None:
+    """Verify _candidate_rank_key sets test_trajectory_recall to -1.0 when None, not test_recall."""
+    from reach.optimize import _candidate_rank_key
+
+    cand_with_traj = OptimizationCandidate(
+        description="With trajectory",
+        recall=0.8,
+        test_recall=0.8,
+        test_trajectory_recall=0.9,
+    )
+    cand_without_traj = OptimizationCandidate(
+        description="Without trajectory",
+        recall=0.8,
+        test_recall=0.8,
+        test_trajectory_recall=None,
+    )
+
+    key_with = _candidate_rank_key(cand_with_traj, has_test=True)
+    key_without = _candidate_rank_key(cand_without_traj, has_test=True)
+
+    # key_with has 0.9 as second element
+    assert key_with[0] == 0.8
+    assert key_with[1] == 0.9
+
+    # key_without must have -1.0 as second element, NOT 0.8
+    assert key_without[0] == 0.8
+    assert key_without[1] == -1.0
+    assert key_with > key_without
+
+
+def test_compute_paired_delta_clamps_extreme_bounds() -> None:
+    """Verify _compute_paired_delta clamps values strictly to [-1.0, 1.0]."""
+    from reach.optimize import _compute_paired_delta
+
+    # candidate_metric far exceeding 1.0
+    clamped_high = _compute_paired_delta(
+        candidate_metric=2.5,
+        fallback_baseline=0.0,
+        baseline_hits_by_id=None,
+        queries_to_run=[],
+        target_name="test",
+    )
+    assert clamped_high == 1.0
+
+    # candidate_metric negative
+    clamped_low = _compute_paired_delta(
+        candidate_metric=-2.5,
+        fallback_baseline=1.0,
+        baseline_hits_by_id=None,
+        queries_to_run=[],
+        target_name="test",
+    )
+    assert clamped_low == -1.0
