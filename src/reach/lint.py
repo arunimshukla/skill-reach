@@ -41,6 +41,7 @@ from reach.config import LintSettings, resolve_path
 
 if TYPE_CHECKING:
     from reach.models import Skill
+    from reach.overlap import Competition
     from reach.retrieval import Bm25Scorer
 
 __all__ = [
@@ -1002,6 +1003,46 @@ def _is_peer_one_way_handoff(
     )
 
 
+def _build_unacknowledged_sem_lex_adj(
+    skills: Sequence[Skill],
+    refs_by_name: Mapping[str, frozenset[str]],
+    comp_by_name: Mapping[str, Competition],
+    full_comp_by_name: Mapping[str, Competition],
+    dense_similarities: Mapping[tuple[str, str], float] | None,
+    *,
+    lex_thresh: float,
+    sem_thresh: float,
+) -> dict[str, set[str]]:
+    """Build the unacknowledged semantic+lexical similarity adjacency graph."""
+    name_tokens = {s.name: tuple(s.name.split("-")) for s in skills}
+    leaf_stem_counts = Counter(
+        t[:-1] for t in name_tokens.values() if len(t) >= _MAX_PEER_HANDOFF_DEGREE
+    )
+    adj: dict[str, set[str]] = {s.name: set() for s in skills}
+    for i, s1 in enumerate(skills):
+        t1 = name_tokens[s1.name]
+        for s2 in skills[i + 1 :]:
+            if hands_off_to_skill(
+                s1.description, s2.name, refs_by_name[s1.name]
+            ) or hands_off_to_skill(s2.description, s1.name, refs_by_name[s2.name]):
+                continue
+            max_lex = max(
+                _max_lexical_ratio(s1.name, s2.name, comp_by_name),
+                _max_lexical_ratio(s1.name, s2.name, full_comp_by_name),
+            )
+            sem_sim = _symmetric_dense_sim(s1.name, s2.name, dense_similarities)
+            t2 = name_tokens[s2.name]
+            same_multi_token_family = (
+                len(t1) == len(t2) >= _MAX_PEER_HANDOFF_DEGREE
+                and t1[:-1] == t2[:-1]
+                and leaf_stem_counts[t1[:-1]] >= _MAX_PEER_HANDOFF_DEGREE
+            )
+            if max_lex >= lex_thresh and (sem_sim >= sem_thresh or same_multi_token_family):
+                adj[s1.name].add(s2.name)
+                adj[s2.name].add(s1.name)
+    return adj
+
+
 def _check_missing_mutual_handoffs(
     skills: Sequence[Skill],
     paths_by_name: Mapping[str, Sequence[Path]],
@@ -1041,6 +1082,15 @@ def _check_missing_mutual_handoffs(
     issues: list[LintIssue] = []
     lex_thresh = cfg.mutual_handoff_lexical_threshold
     sem_thresh = cfg.mutual_handoff_similarity_threshold
+    sem_lex_adj = _build_unacknowledged_sem_lex_adj(
+        skills,
+        refs_by_name,
+        comp_by_name,
+        full_comp_by_name,
+        dense_similarities,
+        lex_thresh=lex_thresh,
+        sem_thresh=sem_thresh,
+    )
 
     for i, s1 in enumerate(skills):
         for s2 in skills[i + 1 :]:
@@ -1077,12 +1127,16 @@ def _check_missing_mutual_handoffs(
                 in_degree,
                 above_threshold=above_thresh,
             )
+            is_peer_sem_lex = (
+                sem_sim >= sem_thresh
+                and max_lex_ratio >= lex_thresh
+                and len(sem_lex_adj[s1.name]) < _MAX_PEER_HANDOFF_DEGREE
+                and len(sem_lex_adj[s2.name]) < _MAX_PEER_HANDOFF_DEGREE
+                and not (sem_lex_adj[s1.name] & sem_lex_adj[s2.name])
+            )
             high_neighbor_contention = _has_bidirectional_name_claim(s1, s2, taxonomy_tokens) or (
                 unacknowledged
-                and (
-                    (sem_sim >= sem_thresh and max_lex_ratio >= lex_thresh)
-                    or (above_thresh and has_pair_exclusive_triggers)
-                )
+                and (is_peer_sem_lex or (above_thresh and has_pair_exclusive_triggers))
             )
 
             if not (one_way_handoff or high_neighbor_contention):

@@ -1258,3 +1258,58 @@ def test_extract_skill_references_preserves_backticked_specific_and_related_skil
 
     desc = "For database cluster tasks, defer to `service-specific` or prefer `db-related`."
     assert extract_skill_references(desc) == ("db-related", "service-specific")
+
+
+def test_missing_mutual_handoff_ignores_multi_skill_template_cliques(tmp_path: Path) -> None:
+    """Suppress k >= 3 template sibling cliques while flagging 1-to-1 peer collisions."""
+    skills = [
+        (
+            "sdk-client-go",
+            (
+                "Use this skill when building service client integrations with streaming handlers "
+                "and diagnosing configuration or runtime problems in Go."
+            ),
+        ),
+        (
+            "sdk-client-js",
+            (
+                "Use this skill when building service client integrations with streaming handlers "
+                "and diagnosing configuration or runtime problems in JavaScript."
+            ),
+        ),
+        (
+            "sdk-client-python",
+            (
+                "Use this skill when building service client integrations with streaming handlers "
+                "and diagnosing configuration or runtime problems in Python."
+            ),
+        ),
+        (
+            "workflow-pipeline-authoring",
+            (
+                "Author and configure distributed task scheduler DAG definitions, "
+                "operators, and orchestration pipelines."
+            ),
+        ),
+        (
+            "workflow-pipeline-debugging",
+            (
+                "Debug and troubleshoot distributed task scheduler DAG definitions, "
+                "operators, and orchestration pipelines."
+            ),
+        ),
+    ]
+    for name, desc in skills:
+        d = tmp_path / name
+        d.mkdir()
+        (d / "SKILL.md").write_text(
+            f"---\nname: {name}\ndescription: >\n  {desc}\n---\n# {name}\n",
+            encoding="utf-8",
+        )
+
+    report = lint_tree(tmp_path)
+    handoff_skills = {i.skill for i in report.issues if i.rule == "missing-mutual-handoff"}
+    assert handoff_skills == {
+        "workflow-pipeline-authoring",
+        "workflow-pipeline-debugging",
+    }
