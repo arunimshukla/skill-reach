@@ -667,6 +667,10 @@ def build_scorer(
             raise ValueError(msg)
 
 
+#: Minimum prefix token length for single-word quadrant resolution.
+_MIN_QUADRANT_PREFIX_LEN: int = 3
+
+
 class OverlapQuadrant(StrEnum):
     """Classify the diagnostic quadrant between lexical and semantic overlap."""
 
@@ -686,13 +690,14 @@ class OverlapQuadrant(StrEnum):
             member_name_tokens = tuple(tokenize(member.name.replace("_", "-")))
             if tokens in (member_name_tokens, tuple(tokenize(member.value))):
                 return member
-        prefix_matches = [
-            m
-            for m in cls
-            if (val_tokens := tokenize(m.value)) and val_tokens[0].startswith(tokens[0])
-        ]
-        if len(prefix_matches) == 1 and len(tokens) == 1:
-            return prefix_matches[0]
+        if len(tokens) == 1 and len(tokens[0]) >= _MIN_QUADRANT_PREFIX_LEN:
+            prefix_matches = [
+                m
+                for m in cls
+                if (val_tokens := tokenize(m.value)) and val_tokens[0].startswith(tokens[0])
+            ]
+            if len(prefix_matches) == 1:
+                return prefix_matches[0]
         return None
 
 

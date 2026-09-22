@@ -410,8 +410,6 @@ def print_rewrite(
     rewrite: Rewrite,
     *,
     caveat: bool = True,
-    truncate: bool = True,  # noqa: ARG001
-    peers: Sequence[str] = (),  # noqa: ARG001
 ) -> None:
     """Render rewrite suggestions and contested vocabulary analysis for a skill."""
     console.print(_rewrite_heading(rewrite), soft_wrap=True)

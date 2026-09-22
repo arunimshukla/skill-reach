@@ -114,13 +114,7 @@ def _render_text_overlap(
     if suggest:
         if skill:
             for rewrite in suggest_all(overlap, found, skill):
-                print_rewrite(
-                    console,
-                    rewrite,
-                    caveat=False,
-                    truncate=truncate,
-                    peers=all_names,
-                )
+                print_rewrite(console, rewrite, caveat=False)
             print_overlap_caveat(console)
             return
 
@@ -138,13 +132,7 @@ def _render_text_overlap(
             return
 
         for rewrite in shown_rewrites:
-            print_rewrite(
-                console,
-                rewrite,
-                caveat=False,
-                truncate=truncate,
-                peers=all_names,
-            )
+            print_rewrite(console, rewrite, caveat=False)
         if len(shown_rewrites) < total_matching:
             print_omitted_footer(
                 console,

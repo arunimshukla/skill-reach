@@ -155,7 +155,7 @@ reach overlap explain <QUERY> --skill <SKILL> [--rival <RIVAL>] [OPTIONS]
 | `--semantic`           | Flag    | `false`         | Include dense semantic similarity and dual-axis diagnostic quadrant matrix.                                 |
 | `--top`                | Integer | -               | Show only the top N ranked skills.                                                                          |
 | `--all`                | Flag    | `false`         | Show all skills without the default 30-row cap or actionable-only filter.                                   |
-| `--quadrant`           | String  | -               | Filter by diagnostic quadrant: `near-duplicate`, `latent-collision`, `boilerplate`, `distinct`.             |
+| `--quadrant`           | Choice  | -               | Filter by diagnostic quadrant: `near-duplicate`, `latent-collision`, `boilerplate`, `distinct`.             |
 | `--no-truncate`        | Flag    | `false`         | Render full skill names without middle truncation.                                                          |
 | `--agent`              | Choice  | -               | Agent runtime to query for installed skill locations (`claude-code`, `antigravity-cli`, etc.).              |
 | `--global`, `-g`       | Flag    | `false`         | Discover and inspect skills from user global configuration (`~/`).                                          |

@@ -666,7 +666,8 @@ def _disambiguate_middle_truncate(
         p_len = max(1, avail // 3)
         s_len = max(1, avail // 3)
         m_len = max(1, avail - p_len - s_len)
-        mid_start = min(lcp, max(0, len(value) - m_len - s_len))
+        max_start = max(p_len, len(value) - s_len - m_len)
+        mid_start = min(max(p_len, lcp), max_start)
         mid = value[mid_start : mid_start + m_len]
         return f"{value[:p_len]}…{mid}…{value[len(value) - s_len :]}"
 

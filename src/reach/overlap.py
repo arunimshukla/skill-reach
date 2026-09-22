@@ -140,15 +140,16 @@ def suggest_close_skills(
     n: int = 3,
 ) -> list[str]:
     """Return up to n close skill names using token overlap and sequence similarity."""
-    if not available or n <= 0:
+    clean_target = target.strip()
+    if not clean_target or not available or n <= 0:
         return []
-    target_tokens = frozenset(tokenize(target))
+    target_tokens = frozenset(tokenize(clean_target))
     close_set = set(
-        difflib.get_close_matches(target, available, n=n * 2, cutoff=_CLOSE_MATCH_CUTOFF)
+        difflib.get_close_matches(clean_target, available, n=n * 2, cutoff=_CLOSE_MATCH_CUTOFF)
     )
     scored: list[tuple[float, float, str]] = []
     for candidate in available:
-        if candidate == target:
+        if not candidate or candidate == clean_target:
             continue
         cand_tokens = frozenset(tokenize(candidate))
         shared = len(target_tokens & cand_tokens)
