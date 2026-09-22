@@ -19,20 +19,22 @@ from __future__ import annotations
 import difflib
 import json
 import random
+import re
 import shutil
 import tempfile
+from collections.abc import Callable, Mapping
 from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any, Final
 
 import yaml
 from pydantic import (
+    AfterValidator,
     BaseModel,
     ConfigDict,
     Field,
     StringConstraints,
     computed_field,
-    field_validator,
 )
 
 from reach._io import atomic_write_text
@@ -41,7 +43,6 @@ from reach.catalog import load_skills, split_frontmatter
 from reach.config import (
     OptimizeSettings,
     RuntimeSettings,
-    default_agent,
     load_config,
     resolve_discovery_candidates,
     resolve_path,
@@ -56,7 +57,7 @@ from reach.rewrite import skill_body, suggest_rewrite, synthesize_directional_di
 from reach.runtime import FAKE_AGENT, TextGenerator, build_runtime, build_text_generator
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Callable, Mapping, Sequence
 
     from reach.runtime import AgentRuntime
 
@@ -65,13 +66,18 @@ __all__ = [
     "IterationRecord",
     "OptimizationCandidate",
     "OptimizationReport",
+    "ReciprocalHandoff",
+    "apply_optimization_candidate",
     "build_optimization_prompt",
+    "build_reciprocal_handoff",
     "evaluate_candidate",
     "filter_candidates",
     "optimize_skill",
+    "render_body_with_routing_note",
     "split_query_set",
     "synthesize_candidates",
     "update_skill_description",
+    "upsert_skill_routing_note",
 ]
 
 _DEFAULT_OPTIMIZE = OptimizeSettings()
@@ -83,6 +89,7 @@ DEFAULT_POSITIVE_COUNT = _DEFAULT_OPTIMIZE.positive_count
 DEFAULT_ADVERSARIAL_COUNT = _DEFAULT_OPTIMIZE.adversarial_count
 DEFAULT_SEED = _DEFAULT_OPTIMIZE.seed
 DEFAULT_REVIEW_TIMEOUT = _DEFAULT_OPTIMIZE.review_timeout
+DEFAULT_WORKERS = _DEFAULT_OPTIMIZE.workers
 MAX_FEEDBACK_QUERIES: Final[int] = 8
 DEFAULT_TEST_BUDGET: Final[int] = 10
 
@@ -102,11 +109,65 @@ ORIGIN_PRIORITY: Final[dict[CandidateOrigin | str, int]] = {
 }
 
 
-def _round_optional_metric(value: object) -> object:
-    """Round float metric values to 4 decimal places when numeric."""
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        return round(float(value), 4)
-    return value
+def _round_4dp(value: float) -> float:
+    """Round validated float metric to 4 decimal places."""
+    return round(value, 4)
+
+
+type UnitMetric = Annotated[float, AfterValidator(_round_4dp), Field(ge=0.0, le=1.0)]
+type DeltaMetric = Annotated[float, AfterValidator(_round_4dp), Field(ge=-1.0, le=1.0)]
+type NonEmptyStr = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+
+
+class ReciprocalHandoff(BaseModel):
+    """Represent reciprocal Layer-2 SKILL.md body routing notes for target and rival."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    target_skill: NonEmptyStr
+    rival_skill: NonEmptyStr
+    target_manifest_path: Path
+    rival_manifest_path: Path
+    target_note: NonEmptyStr
+    rival_note: NonEmptyStr
+    target_body_before: str = ""
+    rival_body_before: str = ""
+
+    @property
+    def target_body_after(self) -> str:
+        """Render the target SKILL.md body with its reciprocal Routing Note inserted."""
+        return render_body_with_routing_note(
+            self.target_body_before, self.rival_skill, self.target_note
+        )
+
+    @property
+    def rival_body_after(self) -> str:
+        """Render the rival SKILL.md body with its reciprocal Routing Note inserted."""
+        return render_body_with_routing_note(
+            self.rival_body_before, self.target_skill, self.rival_note
+        )
+
+
+def _compute_paired_delta(
+    candidate_metric: float,
+    fallback_baseline: float,
+    baseline_hits_by_id: dict[str, bool] | None,
+    queries_to_run: Sequence[Query],
+    target_name: str,
+) -> float:
+    """Compute paired delta between candidate_metric and baseline hits on positive queries."""
+    effective_base = fallback_baseline
+    if baseline_hits_by_id:
+        paired_pos_ids = [
+            q.id
+            for q in queries_to_run
+            if q.expected_skill == target_name and q.id in baseline_hits_by_id
+        ]
+        if paired_pos_ids:
+            effective_base = sum(1 for q_id in paired_pos_ids if baseline_hits_by_id[q_id]) / len(
+                paired_pos_ids
+            )
+    return round(candidate_metric - effective_base, 4)
 
 
 class _CandidateProbeTally(BaseModel):
@@ -115,19 +176,31 @@ class _CandidateProbeTally(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     triggers: int = Field(default=0, ge=0)
+    trajectory_triggers: int = Field(default=0, ge=0)
     positive_queries: int = Field(default=0, ge=0)
     correct_count: int = Field(default=0, ge=0)
     misroutes: int = Field(default=0, ge=0)
     total_queries: int = Field(default=0, ge=0)
     failed_queries: tuple[str, ...] = ()
+    failed_trajectory_queries: tuple[str, ...] = ()
     misrouted_queries: tuple[str, ...] = ()
 
     @computed_field  # type: ignore[prop-decorator]
     @property
     def recall(self) -> float:
-        """Compute empirical recall across positive queries."""
+        """Compute empirical entrypoint recall across positive queries."""
         return round(
             (self.triggers / self.positive_queries) if self.positive_queries > 0 else 1.0,
+            4,
+        )
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def trajectory_recall(self) -> float:
+        """Compute empirical trajectory recall across positive queries."""
+        effective_traj = max(self.triggers, self.trajectory_triggers)
+        return round(
+            (effective_traj / self.positive_queries) if self.positive_queries > 0 else 1.0,
             4,
         )
 
@@ -158,18 +231,30 @@ class _CandidateProbeTally(BaseModel):
         target_name: str,
     ) -> float:
         """Compute paired delta recall against baseline hits on the same positive query subset."""
-        effective_baseline_recall = baseline_recall
-        if baseline_hits_by_id:
-            paired_pos_ids = [
-                q.id
-                for q in queries_to_run
-                if q.expected_skill == target_name and q.id in baseline_hits_by_id
-            ]
-            if paired_pos_ids:
-                effective_baseline_recall = sum(
-                    1 for q_id in paired_pos_ids if baseline_hits_by_id[q_id]
-                ) / len(paired_pos_ids)
-        return round(self.recall - effective_baseline_recall, 4)
+        return _compute_paired_delta(
+            self.recall,
+            baseline_recall,
+            baseline_hits_by_id,
+            queries_to_run,
+            target_name,
+        )
+
+    def paired_delta_trajectory_recall(
+        self,
+        *,
+        baseline_trajectory_recall: float,
+        baseline_traj_hits_by_id: dict[str, bool] | None,
+        queries_to_run: Sequence[Query],
+        target_name: str,
+    ) -> float:
+        """Compute paired delta trajectory recall against baseline trajectory hits."""
+        return _compute_paired_delta(
+            self.trajectory_recall,
+            baseline_trajectory_recall,
+            baseline_traj_hits_by_id,
+            queries_to_run,
+            target_name,
+        )
 
 
 class OptimizationCandidate(BaseModel):
@@ -177,36 +262,25 @@ class OptimizationCandidate(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
-    accuracy: float = Field(default=0.0, ge=0.0, le=1.0)
-    delta_recall: float = Field(default=0.0, ge=-1.0, le=1.0)
+    accuracy: UnitMetric = 0.0
+    delta_recall: DeltaMetric = 0.0
+    delta_trajectory_recall: DeltaMetric = 0.0
     description: str
     lint_clean: bool = True
     filtered_out: bool = False
     filter_reason: str = ""
-    misroute_rate: float = Field(default=0.0, ge=0.0, le=1.0)
+    misroute_rate: UnitMetric = 0.0
     rationale: str = ""
     origin: CandidateOrigin = CandidateOrigin.HEURISTIC
-    recall: float = Field(default=0.0, ge=0.0, le=1.0)
-    test_recall: Annotated[float, Field(ge=0.0, le=1.0)] | None = None
-    test_accuracy: Annotated[float, Field(ge=0.0, le=1.0)] | None = None
-    test_misroute_rate: Annotated[float, Field(ge=0.0, le=1.0)] | None = None
+    recall: UnitMetric = 0.0
+    trajectory_recall: UnitMetric = 0.0
+    test_recall: UnitMetric | None = None
+    test_trajectory_recall: UnitMetric | None = None
+    test_accuracy: UnitMetric | None = None
+    test_misroute_rate: UnitMetric | None = None
     failed_queries: tuple[str, ...] = ()
+    failed_trajectory_queries: tuple[str, ...] = ()
     misrouted_queries: tuple[str, ...] = ()
-
-    @field_validator(
-        "accuracy",
-        "delta_recall",
-        "misroute_rate",
-        "recall",
-        "test_recall",
-        "test_accuracy",
-        "test_misroute_rate",
-        mode="before",
-    )
-    @classmethod
-    def _round_metrics(cls, value: object) -> object:
-        """Round candidate metric fields to 4 decimal places."""
-        return _round_optional_metric(value)
 
     def mark_filtered(self, reason: str = "") -> OptimizationCandidate:
         """Return a copy marked as filtered out by static lint rules."""
@@ -225,15 +299,19 @@ class OptimizationCandidate(BaseModel):
         tally: _CandidateProbeTally,
         *,
         delta_recall: float,
+        delta_trajectory_recall: float = 0.0,
     ) -> OptimizationCandidate:
         """Return a copy populated with training probe metrics from a _CandidateProbeTally."""
         return self.model_copy(
             update={
                 "recall": tally.recall,
+                "trajectory_recall": tally.trajectory_recall,
                 "accuracy": tally.accuracy,
                 "misroute_rate": tally.misroute_rate,
                 "delta_recall": round(delta_recall, 4),
+                "delta_trajectory_recall": round(delta_trajectory_recall, 4),
                 "failed_queries": tally.failed_queries,
+                "failed_trajectory_queries": tally.failed_trajectory_queries,
                 "misrouted_queries": tally.misrouted_queries,
             }
         )
@@ -243,6 +321,7 @@ class OptimizationCandidate(BaseModel):
         return self.model_copy(
             update={
                 "test_recall": tally.recall,
+                "test_trajectory_recall": tally.trajectory_recall,
                 "test_accuracy": tally.accuracy,
                 "test_misroute_rate": tally.misroute_rate,
             }
@@ -254,14 +333,18 @@ class OptimizationCandidate(BaseModel):
         recall: float,
         accuracy: float,
         misroute_rate: float,
+        trajectory_recall: float | None = None,
     ) -> OptimizationCandidate:
         """Return a copy populated with baseline scores when description matches baseline."""
+        eff_traj = trajectory_recall if trajectory_recall is not None else recall
         return self.model_copy(
             update={
                 "recall": round(recall, 4),
+                "trajectory_recall": round(eff_traj, 4),
                 "accuracy": round(accuracy, 4),
                 "misroute_rate": round(misroute_rate, 4),
                 "delta_recall": 0.0,
+                "delta_trajectory_recall": 0.0,
             }
         )
 
@@ -270,10 +353,13 @@ class OptimizationCandidate(BaseModel):
         return self.model_copy(
             update={
                 "recall": cached.recall,
+                "trajectory_recall": cached.trajectory_recall,
                 "accuracy": cached.accuracy,
                 "misroute_rate": cached.misroute_rate,
                 "delta_recall": cached.delta_recall,
+                "delta_trajectory_recall": cached.delta_trajectory_recall,
                 "failed_queries": cached.failed_queries,
+                "failed_trajectory_queries": cached.failed_trajectory_queries,
                 "misrouted_queries": cached.misrouted_queries,
             }
         )
@@ -283,6 +369,7 @@ class OptimizationCandidate(BaseModel):
         return self.model_copy(
             update={
                 "test_recall": cached.test_recall,
+                "test_trajectory_recall": cached.test_trajectory_recall,
                 "test_accuracy": cached.test_accuracy,
                 "test_misroute_rate": cached.test_misroute_rate,
             }
@@ -294,17 +381,13 @@ class _BaselineEvaluation(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    recall: float = Field(default=0.0, ge=0.0, le=1.0)
-    accuracy: float = Field(default=0.0, ge=0.0, le=1.0)
-    misroute_rate: float = Field(default=0.0, ge=0.0, le=1.0)
+    recall: UnitMetric = 0.0
+    trajectory_recall: UnitMetric = 0.0
+    accuracy: UnitMetric = 0.0
+    misroute_rate: UnitMetric = 0.0
     remaining_budget: int = Field(default=0, ge=0)
     hits_by_id: dict[str, bool] = Field(default_factory=dict)
-
-    @field_validator("recall", "accuracy", "misroute_rate", mode="before")
-    @classmethod
-    def _round_metrics(cls, value: object) -> object:
-        """Round baseline metric fields to 4 decimal places."""
-        return _round_optional_metric(value)
+    trajectory_hits_by_id: dict[str, bool] = Field(default_factory=dict)
 
 
 class _RivalContext(BaseModel):
@@ -390,24 +473,20 @@ class OptimizationReport(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     applied: bool = False
-    baseline_accuracy: float = Field(default=0.0, ge=0.0, le=1.0)
+    baseline_accuracy: UnitMetric = 0.0
     baseline_description: str
-    baseline_misroute: float = Field(default=0.0, ge=0.0, le=1.0)
-    baseline_recall: float = Field(default=0.0, ge=0.0, le=1.0)
+    baseline_misroute: UnitMetric = 0.0
+    baseline_recall: UnitMetric = 0.0
+    baseline_trajectory_recall: UnitMetric = 0.0
     candidates: tuple[OptimizationCandidate, ...] = ()
     ceded_terms: tuple[str, ...] = ()
+    handoff: ReciprocalHandoff | None = None
     has_probes: bool = False
     manifest_path: Path | None = None
     rival_name: str = ""
     rounds: tuple[IterationRecord, ...] = ()
     skill_name: str
     unclaimed_terms: tuple[str, ...] = ()
-
-    @field_validator("baseline_accuracy", "baseline_misroute", "baseline_recall", mode="before")
-    @classmethod
-    def _round_baseline_metrics(cls, value: object) -> object:
-        """Round baseline metric fields to 4 decimal places."""
-        return _round_optional_metric(value)
 
     @property
     def best_candidate(self) -> OptimizationCandidate | None:
@@ -424,19 +503,39 @@ class OptimizationReport(BaseModel):
         """Determine whether the specified candidate improves over baseline.
 
         Returns True if there are no empirical probes (heuristic mode), or if the candidate
-        achieves positive delta recall or strictly lower misroute rate at equal recall.
+        achieves positive delta recall, positive delta trajectory recall, or strictly lower
+        misroute rate at equal recall.
         """
         if not self.has_probes:
             return True
         if candidate is None:
             return False
-        return candidate.delta_recall > 0.0 or (
-            candidate.delta_recall == 0.0 and candidate.misroute_rate < self.baseline_misroute
+        return (
+            candidate.delta_recall > 0.0
+            or candidate.delta_trajectory_recall > 0.0
+            or (candidate.delta_recall == 0.0 and candidate.misroute_rate < self.baseline_misroute)
         )
 
 
-def update_skill_description(manifest_path: Path, new_description: str) -> bool:
-    """Update the description field in SKILL.md frontmatter while preserving file contents."""
+def _read_skill_body(manifest_path: Path) -> str:
+    """Read the markdown body portion of a SKILL.md file if it exists on disk."""
+    if not manifest_path.is_file():
+        return ""
+    try:
+        raw = manifest_path.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    split = split_frontmatter(raw)
+    return split[1] if split is not None else raw
+
+
+def update_skill_description(
+    manifest_path: Path,
+    new_description: str,
+    *,
+    body_override: str | None = None,
+) -> bool:
+    """Update the description field in SKILL.md frontmatter while preserving or overriding body."""
     if not manifest_path.is_file():
         return False
     try:
@@ -450,10 +549,121 @@ def update_skill_description(manifest_path: Path, new_description: str) -> bool:
             return False
         patched = _SkillFrontmatterPatch.model_validate({**data, "description": new_description})
         new_yaml = yaml.safe_dump(patched.model_dump(), sort_keys=False, allow_unicode=True).strip()
-        atomic_write_text(manifest_path, f"---\n{new_yaml}\n---{body}", encoding="utf-8")
+        final_body = body if body_override is None else body_override
+        if final_body and not final_body.startswith("\n"):
+            final_body = "\n" + final_body
+        atomic_write_text(manifest_path, f"---\n{new_yaml}\n---{final_body}", encoding="utf-8")
     except (OSError, yaml.YAMLError, ValueError):
         return False
     return True
+
+
+_H1_HEADING_RE: Final[re.Pattern[str]] = re.compile(r"^(#\s+.+)$", re.MULTILINE)
+
+
+def build_reciprocal_handoff(
+    target: Skill,
+    rival: Skill,
+    ceded_terms: Sequence[str] = (),
+    unclaimed_terms: Sequence[str] = (),
+) -> ReciprocalHandoff:
+    """Construct reciprocal Layer-2 SKILL.md body routing notes for target and rival skills."""
+    target_scope = ", ".join(ceded_terms[:3]) if ceded_terms else f"{rival.name} tasks"
+    rival_scope = ", ".join(unclaimed_terms[:3]) if unclaimed_terms else f"{target.name} tasks"
+    target_note = f"> **Routing Note:** For {target_scope}, use the `{rival.name}` skill instead."
+    rival_note = f"> **Routing Note:** For {rival_scope}, use the `{target.name}` skill instead."
+    target_md = target.path / "SKILL.md"
+    rival_md = rival.path / "SKILL.md"
+    return ReciprocalHandoff(
+        target_skill=target.name,
+        rival_skill=rival.name,
+        target_manifest_path=target_md,
+        rival_manifest_path=rival_md,
+        target_note=target_note,
+        rival_note=rival_note,
+        target_body_before=_read_skill_body(target_md),
+        rival_body_before=_read_skill_body(rival_md),
+    )
+
+
+def render_body_with_routing_note(body: str, other_skill: str, note_line: str) -> str:
+    """Insert or idempotently update a Routing Note blockquote right after the H1 heading."""
+    cleaned_note = note_line.strip()
+    lines = body.splitlines()
+    for idx, line in enumerate(lines):
+        if line.strip().startswith("> **Routing Note:**") and (
+            not other_skill or other_skill in line
+        ):
+            lines[idx] = cleaned_note
+            rebuilt = "\n".join(lines)
+            if body.endswith("\n") and not rebuilt.endswith("\n"):
+                rebuilt += "\n"
+            return rebuilt
+
+    match = _H1_HEADING_RE.search(body)
+    if match is not None:
+        insert_pos = match.end()
+        prefix = body[:insert_pos]
+        suffix = body[insert_pos:].lstrip("\n")
+        suffix_part = f"\n\n{suffix}" if suffix else "\n"
+        return f"{prefix}\n\n{cleaned_note}{suffix_part}"
+
+    stripped = body.lstrip("\n")
+    return f"\n{cleaned_note}\n\n{stripped}" if stripped else f"\n{cleaned_note}\n"
+
+
+def upsert_skill_routing_note(manifest_path: Path, other_skill: str, note_line: str) -> bool:
+    """Idempotently insert or update a Routing Note blockquote in a SKILL.md manifest body."""
+    if not manifest_path.is_file():
+        return False
+    try:
+        text = manifest_path.read_text(encoding="utf-8")
+        split = split_frontmatter(text)
+        if split is not None:
+            raw_frontmatter, body = split
+            new_body = render_body_with_routing_note(body, other_skill, note_line)
+            if not new_body.startswith("\n"):
+                new_body = "\n" + new_body
+            atomic_write_text(
+                manifest_path, f"---\n{raw_frontmatter.strip()}\n---{new_body}", encoding="utf-8"
+            )
+        else:
+            new_body = render_body_with_routing_note(text, other_skill, note_line)
+            atomic_write_text(manifest_path, new_body.lstrip("\n"), encoding="utf-8")
+    except OSError:
+        return False
+    return True
+
+
+def apply_optimization_candidate(
+    report: OptimizationReport,
+    candidate: OptimizationCandidate,
+) -> bool:
+    """Apply candidate description and optional reciprocal Layer-2 handoffs atomically to disk."""
+    if report.manifest_path is None:
+        return False
+    if report.handoff is None:
+        return update_skill_description(report.manifest_path, candidate.description)
+
+    target_body = _read_skill_body(report.manifest_path)
+    updated_target_body = render_body_with_routing_note(
+        target_body,
+        report.handoff.rival_skill,
+        report.handoff.target_note,
+    )
+    target_ok = update_skill_description(
+        report.manifest_path,
+        candidate.description,
+        body_override=updated_target_body,
+    )
+    if not target_ok:
+        return False
+    rival_ok = upsert_skill_routing_note(
+        report.handoff.rival_manifest_path,
+        report.handoff.target_skill,
+        report.handoff.rival_note,
+    )
+    return target_ok and rival_ok
 
 
 def _resolve_lint_settings(config: LintSettings | Path | None = None) -> LintSettings:
@@ -810,25 +1020,37 @@ def synthesize_candidates(
     )
 
 
+def _resolve_runtime_settings(
+    agent: str | None = None,
+    runtime_options: Mapping[str, Any] | None = None,
+    config: Path | None = None,
+) -> RuntimeSettings:
+    """Resolve validated RuntimeSettings merging reach.toml [runtime.options] with overrides."""
+    return RuntimeSettings.resolve_for_optimize(config, agent=agent, options=runtime_options)
+
+
 def _setup_driver(
     agent: str | None = None,
-    runtime_options: dict[str, Any] | None = None,
+    runtime_options: Mapping[str, Any] | None = None,
     config: Path | None = None,
 ) -> TextGenerator:
     """Initialize and configure the designated TextGenerator driver."""
-    resolved_agent = agent or default_agent(config)
-    return build_text_generator(agent=resolved_agent, options=dict(runtime_options or {}))
+    rt_settings = _resolve_runtime_settings(
+        agent=agent, runtime_options=runtime_options, config=config
+    )
+    return build_text_generator(agent=rt_settings.agent, options=dict(rt_settings.options))
 
 
 def _setup_runtime(
     agent: str | None = None,
-    runtime_options: dict[str, Any] | None = None,
+    runtime_options: Mapping[str, Any] | None = None,
     config: Path | None = None,
 ) -> AgentRuntime:
     """Initialize and configure the designated AgentRuntime driver."""
-    resolved_agent = agent or default_agent(config)
-    settings = RuntimeSettings(agent=resolved_agent, options=dict(runtime_options or {}))
-    return build_runtime(settings)
+    rt_settings = _resolve_runtime_settings(
+        agent=agent, runtime_options=runtime_options, config=config
+    )
+    return build_runtime(rt_settings)
 
 
 def _run_candidate_probes(
@@ -837,15 +1059,19 @@ def _run_candidate_probes(
     target_name: str,
     workdir: Path,
     catalog: Catalog | None = None,
+    *,
+    workers: int = DEFAULT_WORKERS,
 ) -> _CandidateProbeTally:
     """Execute empirical queries via ProbeHarness in isolated workspace and tally outcomes."""
     from reach.run import ProbeHarness
 
     triggers = 0
+    trajectory_triggers = 0
     positive_queries = 0
     correct_count = 0
     misroutes = 0
     failed_queries: list[str] = []
+    failed_trajectory_queries: list[str] = []
     misrouted_queries: list[str] = []
 
     active_catalog = catalog or Catalog(
@@ -853,24 +1079,38 @@ def _run_candidate_probes(
         skills=(target_name,),
         mode=CatalogMode.ALL,
     )
-    harness = ProbeHarness(runtime=runtime, workers=1)
+    harness = ProbeHarness(runtime=runtime, workers=max(1, workers))
+    try:
+        results_by_id = {
+            res.query_id: res
+            for res in harness.run_probes(list(queries_to_run), active_catalog, workdir, attempts=1)
+        }
+    except (OSError, RuntimeError, ValueError):
+        results_by_id = {}
 
     for query in queries_to_run:
         is_positive = query.expected_skill == target_name
         if is_positive:
             positive_queries += 1
 
-        try:
-            probe_res = next(harness.run_probes([query], active_catalog, workdir, attempts=1))
-            invoked = query.effective_invoked_skill(probe_res)
-        except (OSError, RuntimeError, ValueError, StopIteration):
-            invoked = None
+        probe_res = results_by_id.get(query.id)
+        invoked = query.effective_invoked_skill(probe_res) if probe_res is not None else None
+        scored_seq = (
+            query.scored_invocations(probe_res.invoked_skills)
+            if probe_res is not None and probe_res.invoked_skills
+            else ((invoked,) if invoked is not None else ())
+        )
 
         if is_positive:
             if invoked == target_name or query.matches_skill(invoked):
                 triggers += 1
+                trajectory_triggers += 1
                 correct_count += 1
             else:
+                if target_name in scored_seq or any(query.matches_skill(s) for s in scored_seq):
+                    trajectory_triggers += 1
+                else:
+                    failed_trajectory_queries.append(query.text)
                 if invoked is not None:
                     misroutes += 1
                 failed_queries.append(query.text)
@@ -882,11 +1122,13 @@ def _run_candidate_probes(
 
     return _CandidateProbeTally(
         triggers=triggers,
+        trajectory_triggers=trajectory_triggers,
         positive_queries=positive_queries,
         correct_count=correct_count,
         misroutes=misroutes,
         total_queries=len(queries_to_run),
         failed_queries=tuple(failed_queries),
+        failed_trajectory_queries=tuple(failed_trajectory_queries),
         misrouted_queries=tuple(misrouted_queries),
     )
 
@@ -934,13 +1176,19 @@ def evaluate_candidate(
     is_test: bool = False,
     skills_corpus: Sequence[Skill] | None = None,
     baseline_hits_by_id: dict[str, bool] | None = None,
+    *,
+    runtime_options: Mapping[str, Any] | None = None,
+    workers: int = DEFAULT_WORKERS,
+    handoff: ReciprocalHandoff | None = None,
+    baseline_trajectory_recall: float = 0.0,
+    baseline_traj_hits_by_id: dict[str, bool] | None = None,
 ) -> OptimizationCandidate:
     """Empirically evaluate a candidate description against queries within a probe budget."""
     if not queries or budget < 1:
         return candidate
 
     queries_to_run = list(queries)[:budget]
-    runtime = _setup_runtime(agent, config=config)
+    runtime = _setup_runtime(agent, runtime_options=runtime_options, config=config)
 
     try:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -951,13 +1199,30 @@ def evaluate_candidate(
             candidate_skill = _materialize_candidate_skill(
                 target, candidate.description, candidate_stage
             )
+            if handoff is not None:
+                upsert_skill_routing_note(
+                    candidate_stage / "SKILL.md",
+                    handoff.rival_skill,
+                    handoff.target_note,
+                )
+
             corpus_source = skills_corpus if skills_corpus is not None else [target, *rivals]
             seen_names = {target.name}
             all_skills = [candidate_skill]
             for s in [*corpus_source, *rivals]:
                 if s.name not in seen_names:
                     seen_names.add(s.name)
-                    all_skills.append(s)
+                    if handoff is not None and s.name == handoff.rival_skill:
+                        rival_stage = temp_path / "candidate_rivals" / s.name
+                        staged_rival = _materialize_candidate_skill(s, s.description, rival_stage)
+                        upsert_skill_routing_note(
+                            rival_stage / "SKILL.md",
+                            handoff.target_skill,
+                            handoff.rival_note,
+                        )
+                        all_skills.append(staged_rival)
+                    else:
+                        all_skills.append(s)
 
             catalog = Catalog(
                 id="opt-catalog",
@@ -972,6 +1237,7 @@ def evaluate_candidate(
                 target.name,
                 workdir,
                 catalog=catalog,
+                workers=workers,
             )
     finally:
         runtime.cleanup()
@@ -985,7 +1251,17 @@ def evaluate_candidate(
         queries_to_run=queries_to_run,
         target_name=target.name,
     )
-    return candidate.with_train_metrics(tally, delta_recall=delta_recall)
+    delta_traj = tally.paired_delta_trajectory_recall(
+        baseline_trajectory_recall=baseline_trajectory_recall,
+        baseline_traj_hits_by_id=baseline_traj_hits_by_id,
+        queries_to_run=queries_to_run,
+        target_name=target.name,
+    )
+    return candidate.with_train_metrics(
+        tally,
+        delta_recall=delta_recall,
+        delta_trajectory_recall=delta_traj,
+    )
 
 
 def _find_target_skill(all_skills: Sequence[Skill], skill_name: str, resolved_root: Path) -> Skill:
@@ -1054,13 +1330,33 @@ def _identify_rivals(
     return rival_name, ceded_terms, unclaimed, rival_skills
 
 
+def _interleave_queries(
+    positives: Sequence[Query],
+    negatives: Sequence[Query],
+) -> list[Query]:
+    """Interleave positive and adversarial rival queries so tight budgets test both."""
+    if not positives:
+        return list(negatives)
+    if not negatives:
+        return list(positives)
+
+    interleaved: list[Query] = []
+    max_len = max(len(positives), len(negatives))
+    for i in range(max_len):
+        if i < len(positives):
+            interleaved.append(positives[i])
+        if i < len(negatives):
+            interleaved.append(negatives[i])
+    return interleaved
+
+
 def split_query_set(
     queries: Sequence[Query],
     target_skill: str,
     holdout: float = DEFAULT_HOLDOUT,
     seed: int = DEFAULT_SEED,
 ) -> tuple[list[Query], list[Query]]:
-    """Split query set into train and test sets, stratified by target_skill expectation."""
+    """Split query set into train and test sets, stratified and interleaved by expectation."""
     min_split_queries = 2
     if holdout <= 0.0 or len(queries) < min_split_queries:
         return list(queries), []
@@ -1075,8 +1371,8 @@ def split_query_set(
     pos_test_count = min(max(0, int(len(positives) * holdout)), max(0, len(positives) - 1))
     neg_test_count = min(max(0, int(len(negatives) * holdout)), max(0, len(negatives) - 1))
 
-    test_queries = positives[:pos_test_count] + negatives[:neg_test_count]
-    train_queries = positives[pos_test_count:] + negatives[neg_test_count:]
+    test_queries = _interleave_queries(positives[:pos_test_count], negatives[:neg_test_count])
+    train_queries = _interleave_queries(positives[pos_test_count:], negatives[neg_test_count:])
 
     return train_queries, test_queries
 
@@ -1091,6 +1387,8 @@ def _bootstrap_queries(
     adversarial_count: int = DEFAULT_ADVERSARIAL_COUNT,
     unclaimed_terms: Sequence[str] = (),
     ceded_terms: Sequence[str] = (),
+    *,
+    runtime_options: Mapping[str, Any] | None = None,
 ) -> QuerySet | None:
     """Auto-synthesize masked positive queries and rival adversarial distractors."""
     catalog = Catalog(
@@ -1102,7 +1400,7 @@ def _bootstrap_queries(
     is_fake = agent == FAKE_AGENT
     if not is_fake:
         try:
-            driver = _setup_driver(agent, config=config)
+            driver = _setup_driver(agent, runtime_options=runtime_options, config=config)
             if driver.name != FAKE_AGENT:
                 res = generate_query_set(
                     catalog=catalog,
@@ -1159,14 +1457,27 @@ def _bootstrap_queries(
 def _load_optimization_queries(
     queries_path: Path | str | None,
     target_skill_name: str,
+    rival_skills: Sequence[Skill] = (),
+    adversarial_count: int = DEFAULT_ADVERSARIAL_COUNT,
 ) -> list[Query]:
-    """Load query set and filter for queries targeting the skill."""
+    """Load query set, retaining target positive queries and interleaved primary rival queries."""
     if queries_path is None:
         return []
     resolved_queries_path = resolve_path(queries_path)
     query_set = load_query_set(resolved_queries_path)
-    queries = [q for q in query_set.queries if q.expected_skill == target_skill_name]
-    return queries or list(query_set.queries)
+    positives = [q for q in query_set.queries if q.expected_skill == target_skill_name]
+    negatives: list[Query] = []
+    if rival_skills and adversarial_count > 0:
+        for rival in rival_skills:
+            if rival.name == target_skill_name:
+                continue
+            rival_matches = [q for q in query_set.queries if q.expected_skill == rival.name]
+            for rq in rival_matches:
+                if len(negatives) < adversarial_count:
+                    negatives.append(rq)
+
+    interleaved = _interleave_queries(positives, negatives)
+    return interleaved or list(query_set.queries)
 
 
 def _candidate_rank_key(
@@ -1178,9 +1489,25 @@ def _candidate_rank_key(
     origin_prio = float(ORIGIN_PRIORITY.get(c.origin, 0))
     if has_test:
         test_rec = c.test_recall if c.test_recall is not None else -1.0
+        test_traj = c.test_trajectory_recall if c.test_trajectory_recall is not None else test_rec
         test_acc = c.test_accuracy if c.test_accuracy is not None else -1.0
-        return (test_rec, test_acc, c.delta_recall, -c.misroute_rate, c.accuracy, origin_prio)
-    return (c.delta_recall, -c.misroute_rate, c.accuracy, origin_prio)
+        return (
+            test_rec,
+            test_traj,
+            test_acc,
+            c.delta_recall,
+            c.delta_trajectory_recall,
+            -c.misroute_rate,
+            c.accuracy,
+            origin_prio,
+        )
+    return (
+        c.delta_recall,
+        c.delta_trajectory_recall,
+        -c.misroute_rate,
+        c.accuracy,
+        origin_prio,
+    )
 
 
 def _deduplicate_candidates_pre_eval(
@@ -1202,6 +1529,39 @@ def _deduplicate_candidates_pre_eval(
     return list(by_desc.values())
 
 
+class _OptimizeExecutionContext(BaseModel):
+    """Bundle resolved runtime settings, worker concurrency, handoffs, and progress callback."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid", arbitrary_types_allowed=True)
+
+    runtime_settings: RuntimeSettings = Field(default_factory=RuntimeSettings)
+    workers: int = Field(default=DEFAULT_WORKERS, ge=1)
+    handoff: ReciprocalHandoff | None = None
+    progress_callback: Callable[[str], None] | None = None
+
+
+def _build_eval_extra_kwargs(
+    runtime_options: Mapping[str, Any] | None,
+    workers: int = DEFAULT_WORKERS,
+    handoff: ReciprocalHandoff | None = None,
+    baseline_trajectory_recall: float = 0.0,
+    baseline_traj_hits_by_id: dict[str, bool] | None = None,
+) -> dict[str, Any]:
+    """Build optional keyword arguments for evaluate_candidate."""
+    extra_kw: dict[str, Any] = {}
+    if runtime_options is not None:
+        extra_kw["runtime_options"] = runtime_options
+    if workers != DEFAULT_WORKERS:
+        extra_kw["workers"] = workers
+    if handoff is not None:
+        extra_kw["handoff"] = handoff
+    if baseline_trajectory_recall > 0.0:
+        extra_kw["baseline_trajectory_recall"] = baseline_trajectory_recall
+    if baseline_traj_hits_by_id is not None:
+        extra_kw["baseline_traj_hits_by_id"] = baseline_traj_hits_by_id
+    return extra_kw
+
+
 def _evaluate_all_candidates(
     candidates: Sequence[OptimizationCandidate],
     target_skill: Skill,
@@ -1218,8 +1578,23 @@ def _evaluate_all_candidates(
     eval_cache: _CandidateEvalCache | None = None,
     *,
     baseline: _BaselineEvaluation | None = None,
+    exec_ctx: _OptimizeExecutionContext | None = None,
+    runtime_options: Mapping[str, Any] | None = None,
+    workers: int = DEFAULT_WORKERS,
+    handoff: ReciprocalHandoff | None = None,
+    progress_callback: Callable[[str], None] | None = None,
 ) -> tuple[list[OptimizationCandidate], int]:
     """Empirically evaluate all lint-clean candidates and rank them."""
+    if exec_ctx is not None:
+        runtime_options = runtime_options or (
+            dict(exec_ctx.runtime_settings.options) if exec_ctx.runtime_settings.options else None
+        )
+        workers = exec_ctx.workers
+        handoff = handoff or exec_ctx.handoff
+        progress_callback = progress_callback or exec_ctx.progress_callback
+
+    baseline_trajectory_recall = baseline.trajectory_recall if baseline else baseline_recall
+    baseline_traj_hits_by_id = baseline.trajectory_hits_by_id if baseline else None
     if baseline is not None:
         baseline_recall = baseline.recall
         baseline_accuracy = baseline.accuracy
@@ -1229,30 +1604,37 @@ def _evaluate_all_candidates(
     cache = eval_cache
     unique_candidates = _deduplicate_candidates_pre_eval(candidates)
     target_norm = target_skill.description.strip()
+    extra_kw = _build_eval_extra_kwargs(
+        runtime_options,
+        workers,
+        handoff,
+        baseline_trajectory_recall,
+        baseline_traj_hits_by_id,
+    )
 
     needs_probe = [
         c
         for c in unique_candidates
         if c.lint_clean
-        and c.description.strip() != target_norm
+        and (c.description.strip() != target_norm or handoff is not None)
         and (cache is None or not cache.has_train(c.description))
     ]
-    num_clean = len(needs_probe)
-    eval_budget_per_candidate = max(1, budget // (num_clean or 1)) if budget > 0 else 0
+    eval_budget_per_candidate = max(1, budget // (len(needs_probe) or 1)) if budget > 0 else 0
     evaluated_candidates: list[OptimizationCandidate] = []
     total_probes_spent = 0
     remaining_budget = budget
 
-    for cand in unique_candidates:
+    for idx, cand in enumerate(unique_candidates, start=1):
         norm = cand.description.strip()
         if not cand.lint_clean:
             evaluated_candidates.append(cand)
             continue
 
-        if norm == target_norm:
+        if norm == target_norm and handoff is None:
             evaluated_candidates.append(
                 cand.with_baseline_metrics(
                     recall=baseline_recall,
+                    trajectory_recall=baseline_trajectory_recall,
                     accuracy=baseline_accuracy,
                     misroute_rate=baseline_misroute,
                 )
@@ -1265,6 +1647,11 @@ def _evaluate_all_candidates(
 
         if queries and eval_budget_per_candidate > 0 and remaining_budget > 0:
             actual_budget = min(len(queries), eval_budget_per_candidate, remaining_budget)
+            if progress_callback is not None:
+                progress_callback(
+                    f"Evaluating candidate #{idx}/{len(unique_candidates)} "
+                    f"({actual_budget} probes)..."
+                )
             evaluated = evaluate_candidate(
                 candidate=cand,
                 target=target_skill,
@@ -1277,6 +1664,7 @@ def _evaluate_all_candidates(
                 config=config,
                 skills_corpus=skills_corpus,
                 baseline_hits_by_id=baseline_hits_by_id,
+                **extra_kw,
             )
             if cache is not None:
                 cache.put_train(evaluated)
@@ -1292,7 +1680,7 @@ def _evaluate_all_candidates(
     return evaluated_candidates, total_probes_spent
 
 
-def _run_optimization_round(
+def _run_optimization_round(  # noqa: PLR0913, PLR0915
     context: _RivalContext,
     train_queries: Sequence[Query],
     test_queries: Sequence[Query],
@@ -1311,11 +1699,28 @@ def _run_optimization_round(
     holdout: float,
     baseline: _BaselineEvaluation,
     eval_cache: _CandidateEvalCache | None = None,
+    exec_ctx: _OptimizeExecutionContext | None = None,
+    runtime_options: Mapping[str, Any] | None = None,
+    workers: int = DEFAULT_WORKERS,
+    handoff: ReciprocalHandoff | None = None,
+    progress_callback: Callable[[str], None] | None = None,
 ) -> _RoundOutcome:
     """Execute candidate synthesis and dual-phase evaluation for a single iteration round."""
+    if exec_ctx is not None:
+        runtime_options = runtime_options or (
+            dict(exec_ctx.runtime_settings.options) if exec_ctx.runtime_settings.options else None
+        )
+        workers = exec_ctx.workers
+        handoff = handoff or exec_ctx.handoff
+        progress_callback = progress_callback or exec_ctx.progress_callback
+
     target_skill = context.target_skill
     rival_skills = context.rival_skills
     skills_corpus = context.all_skills
+    if progress_callback is not None:
+        progress_callback(
+            f"[Round {iter_idx}/{iterations}] Synthesizing {candidates_count} candidates..."
+        )
     raw_candidates = synthesize_candidates(
         target=target_skill,
         rivals=rival_skills,
@@ -1357,6 +1762,11 @@ def _run_optimization_round(
         config=config,
         skills_corpus=skills_corpus,
         eval_cache=eval_cache,
+        exec_ctx=exec_ctx,
+        runtime_options=runtime_options,
+        workers=workers,
+        handoff=handoff,
+        progress_callback=progress_callback,
     )
 
     total_spent = train_spent
@@ -1373,6 +1783,7 @@ def _run_optimization_round(
         ]
         n_test = len(test_cands_to_run) or 1
         test_budget_per_cand = max(1, test_round_budget // n_test) if test_round_budget > 0 else 0
+        extra_test_kw = _build_eval_extra_kwargs(runtime_options, workers, handoff)
 
         for cand in evaluated_candidates:
             norm = cand.description.strip()
@@ -1395,6 +1806,7 @@ def _run_optimization_round(
                     config=config,
                     is_test=True,
                     skills_corpus=skills_corpus,
+                    **extra_test_kw,
                 )
                 if eval_cache is not None:
                     eval_cache.put_test(tested)
@@ -1470,11 +1882,18 @@ def _prepare_optimization_queries(
     config: Path | None,
     ceded_terms: tuple[str, ...],
     unclaimed: tuple[str, ...],
+    *,
+    runtime_options: Mapping[str, Any] | None = None,
 ) -> tuple[list[Query], list[Query], list[Query]]:
     """Load or bootstrap optimization queries and generate train/test splits."""
     queries: list[Query] = []
     if queries_path is not None:
-        queries = _load_optimization_queries(queries_path, target_skill.name)
+        queries = _load_optimization_queries(
+            queries_path,
+            target_skill.name,
+            rival_skills=rival_skills,
+            adversarial_count=settings.adversarial_count,
+        )
         if settings.review and queries:
             reviewed_qs = launch_query_review(
                 QuerySet(
@@ -1498,6 +1917,7 @@ def _prepare_optimization_queries(
             adversarial_count=settings.adversarial_count,
             unclaimed_terms=unclaimed,
             ceded_terms=ceded_terms,
+            runtime_options=runtime_options,
         )
         if bootstrapped is not None:
             if settings.review:
@@ -1520,13 +1940,28 @@ def _evaluate_baseline_performance(
     target_skill: Skill,
     rival_skills: Sequence[Skill],
     train_queries: Sequence[Query],
-    remaining_budget: int,
-    candidates_count: int,
-    agent: str | None,
-    config: Path | None,
+    remaining_budget: int = DEFAULT_BUDGET,
+    candidates_count: int = 3,
+    agent: str | None = None,
+    config: Path | None = None,
     skills_corpus: Sequence[Skill] | None = None,
+    *,
+    all_skills: Sequence[Skill] | None = None,
+    exec_ctx: _OptimizeExecutionContext | None = None,
+    runtime_options: Mapping[str, Any] | None = None,
+    workers: int = DEFAULT_WORKERS,
+    progress_callback: Callable[[str], None] | None = None,
 ) -> _BaselineEvaluation:
     """Empirically evaluate baseline skill description against training queries."""
+    if all_skills is not None and skills_corpus is None:
+        skills_corpus = all_skills
+    if exec_ctx is not None:
+        runtime_options = runtime_options or (
+            dict(exec_ctx.runtime_settings.options) if exec_ctx.runtime_settings.options else None
+        )
+        workers = exec_ctx.workers
+        progress_callback = progress_callback or exec_ctx.progress_callback
+
     if not train_queries or remaining_budget <= 0:
         return _BaselineEvaluation(remaining_budget=remaining_budget)
 
@@ -1535,7 +1970,11 @@ def _evaluate_baseline_performance(
         max(1, remaining_budget // (candidates_count + 1)),
         remaining_budget,
     )
+    if progress_callback is not None:
+        progress_callback(f"[Baseline] Evaluating {target_skill.name} ({base_budget} probes)...")
     baseline_cand = OptimizationCandidate(description=target_skill.description)
+    extra_base_kw = _build_eval_extra_kwargs(runtime_options, workers)
+
     eval_base = evaluate_candidate(
         candidate=baseline_cand,
         target=target_skill,
@@ -1545,20 +1984,35 @@ def _evaluate_baseline_performance(
         budget=base_budget,
         config=config,
         skills_corpus=skills_corpus,
+        **extra_base_kw,
     )
     failed_texts = set(eval_base.failed_queries)
+    failed_traj_texts = set(eval_base.failed_trajectory_queries)
     baseline_hits_by_id = {
         q.id: (q.text not in failed_texts)
         for q in train_queries[:base_budget]
         if q.expected_skill == target_skill.name
     }
+    baseline_traj_hits_by_id = {
+        q.id: (q.text not in failed_traj_texts)
+        for q in train_queries[:base_budget]
+        if q.expected_skill == target_skill.name
+    }
     new_budget = max(0, remaining_budget - min(len(train_queries), base_budget))
+    if progress_callback is not None:
+        progress_callback(
+            f"[Baseline] Recall: {eval_base.recall:.1%} | "
+            f"Trajectory Recall: {eval_base.trajectory_recall:.1%} | "
+            f"Misroutes: {eval_base.misroute_rate:.1%}"
+        )
     return _BaselineEvaluation(
         recall=eval_base.recall,
+        trajectory_recall=eval_base.trajectory_recall,
         accuracy=eval_base.accuracy,
         misroute_rate=eval_base.misroute_rate,
         remaining_budget=new_budget,
         hits_by_id=baseline_hits_by_id,
+        trajectory_hits_by_id=baseline_traj_hits_by_id,
     )
 
 
@@ -1569,9 +2023,7 @@ def _build_optimization_report(
     rival_name: str,
     ceded_terms: tuple[str, ...],
     unclaimed_terms: tuple[str, ...],
-    baseline_recall: float,
-    baseline_accuracy: float,
-    baseline_misroute: float,
+    baseline: _BaselineEvaluation,
     all_candidates: Sequence[OptimizationCandidate],
     global_best: OptimizationCandidate | None,
     rounds_history: Sequence[IterationRecord],
@@ -1580,6 +2032,7 @@ def _build_optimization_report(
     auto_apply: bool,
     candidate_index: int,
     force: bool,
+    handoff: ReciprocalHandoff | None = None,
 ) -> OptimizationReport:
     """Consolidate evaluated candidates and assemble or auto-apply final OptimizationReport."""
     if global_best is not None:
@@ -1606,9 +2059,10 @@ def _build_optimization_report(
         skill_name=skill_name,
         manifest_path=target_skill.path / "SKILL.md",
         baseline_description=target_skill.description,
-        baseline_recall=baseline_recall,
-        baseline_accuracy=baseline_accuracy,
-        baseline_misroute=baseline_misroute,
+        baseline_recall=baseline.recall,
+        baseline_trajectory_recall=baseline.trajectory_recall,
+        baseline_accuracy=baseline.accuracy,
+        baseline_misroute=baseline.misroute_rate,
         rival_name=rival_name,
         ceded_terms=ceded_terms,
         unclaimed_terms=unclaimed_terms,
@@ -1616,14 +2070,14 @@ def _build_optimization_report(
         applied=False,
         has_probes=has_probes,
         rounds=tuple(rounds_history),
+        handoff=handoff,
     )
     if (
         auto_apply
         and selected_cand is not None
         and (report.candidate_has_improvement(selected_cand) or force)
     ):
-        manifest_file = target_skill.path / "SKILL.md"
-        applied = update_skill_description(manifest_file, selected_cand.description)
+        applied = apply_optimization_candidate(report, selected_cand)
         report = report.model_copy(update={"applied": applied})
 
     return report
@@ -1637,39 +2091,47 @@ def optimize_skill(
     candidates_count: int = 3,
     budget: int | None = None,
     auto_apply: bool = False,
-    runtime_options: dict[str, Any] | None = None,
+    runtime_options: Mapping[str, Any] | None = None,
     config: Path | None = None,
     global_scope: bool = False,
     settings: OptimizeSettings | None = None,
     candidate_index: int = 1,
     force: bool = False,
+    *,
+    with_handoff: bool | None = None,
+    workers: int | None = None,
+    progress_callback: Callable[[str], None] | None = None,
 ) -> OptimizationReport:
-    """Orchestrate closed-loop skill description optimization and candidate evaluation.
-
-    Args:
-        skill_name: Target skill identifier to optimize.
-        skills_path: Directory path containing the skill catalog.
-        queries_path: Optional path to labeled queries JSON file.
-        agent: Agent runtime identifier (e.g. "claude-code", "antigravity-cli").
-        candidates_count: Number of description rewrite candidates to synthesize.
-        budget: Optional probe budget override across candidate evaluations.
-        auto_apply: If True, automatically overwrite SKILL.md with the top candidate.
-        runtime_options: Additional key-value configuration options passed to runtime.
-        config: Optional path to custom reach.toml configuration file.
-        global_scope: If True, discovers skills from user global configuration (~/).
-        settings: Optional typed OptimizeSettings model containing iterations, holdout,
-            review, auto_queries, positive_count, and adversarial_count.
-        candidate_index: Index of candidate rewrite to apply when auto_apply is True.
-        force: If True, overwrite SKILL.md even if recall or accuracy did not improve.
-
-    Returns:
-        An OptimizationReport recording baseline scores, evaluated candidates, and rewrite diffs.
-    """
+    """Orchestrate closed-loop skill description optimization and candidate evaluation."""
     settings = settings or OptimizeSettings()
+    updates: dict[str, Any] = {}
     if budget is not None:
-        settings = settings.model_copy(update={"budget": budget})
+        updates["budget"] = budget
+    if with_handoff is not None:
+        updates["with_handoff"] = with_handoff
+    if workers is not None:
+        updates["workers"] = workers
+    if updates:
+        settings = settings.model_copy(update=updates)
 
+    rt_settings = RuntimeSettings.resolve_for_optimize(config, agent=agent, options=runtime_options)
     context = _resolve_target_and_rivals(skill_name, skills_path, config, agent, global_scope)
+
+    handoff: ReciprocalHandoff | None = None
+    if settings.with_handoff and context.rival_skills:
+        handoff = build_reciprocal_handoff(
+            target=context.target_skill,
+            rival=context.rival_skills[0],
+            ceded_terms=context.ceded_terms,
+            unclaimed_terms=context.unclaimed_terms,
+        )
+
+    exec_ctx = _OptimizeExecutionContext(
+        runtime_settings=rt_settings,
+        workers=settings.workers,
+        handoff=handoff,
+        progress_callback=progress_callback,
+    )
 
     queries, train_queries, test_queries = _prepare_optimization_queries(
         target_skill=context.target_skill,
@@ -1681,6 +2143,7 @@ def optimize_skill(
         config=config,
         ceded_terms=context.ceded_terms,
         unclaimed=context.unclaimed_terms,
+        runtime_options=runtime_options,
     )
 
     baseline = _evaluate_baseline_performance(
@@ -1692,6 +2155,8 @@ def optimize_skill(
         agent=agent,
         config=config,
         skills_corpus=context.all_skills,
+        exec_ctx=exec_ctx,
+        runtime_options=runtime_options,
     )
     remaining_budget = baseline.remaining_budget
 
@@ -1728,6 +2193,8 @@ def optimize_skill(
             holdout=settings.holdout,
             baseline=baseline,
             eval_cache=eval_cache,
+            exec_ctx=exec_ctx,
+            runtime_options=runtime_options,
         )
         remaining_budget = max(0, remaining_budget - outcome.probes_spent)
 
@@ -1763,9 +2230,7 @@ def optimize_skill(
         rival_name=context.rival_name,
         ceded_terms=context.ceded_terms,
         unclaimed_terms=context.unclaimed_terms,
-        baseline_recall=baseline.recall,
-        baseline_accuracy=baseline.accuracy,
-        baseline_misroute=baseline.misroute_rate,
+        baseline=baseline,
         all_candidates=all_candidates,
         global_best=global_best,
         rounds_history=rounds_history,
@@ -1774,4 +2239,5 @@ def optimize_skill(
         auto_apply=auto_apply,
         candidate_index=candidate_index,
         force=force,
+        handoff=handoff,
     )

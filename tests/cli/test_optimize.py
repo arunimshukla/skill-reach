@@ -810,3 +810,112 @@ def test_optimize_safety_notice_displays_inferred_catalog_count(
     captured = capsys.readouterr()
     output = captured.err + captured.out
     assert "Target Catalog: 2 skills" in output
+
+
+def test_optimize_yes_skips_interactive_apply_prompt_in_tty(
+    write_skill: Callable[..., Path],
+    tmp_path: Path,
+) -> None:
+    """Verify --yes skips _prompt_interactive_apply even when stdin/stdout are TTYs."""
+    write_skill(name="yes-tool", description="Initial description.")
+    with (
+        patch("sys.stdin.isatty", return_value=True),
+        patch("sys.stdout.isatty", return_value=True),
+        patch("reach.cli.optimize._prompt_interactive_apply") as mock_prompt,
+    ):
+        ret = main(
+            [
+                "optimize",
+                "yes-tool",
+                "--skills",
+                str(tmp_path),
+                "--agent",
+                "fake",
+                "--yes",
+            ]
+        )
+        assert ret == 0
+        mock_prompt.assert_not_called()
+
+
+def test_optimize_non_tty_emits_progress_lines_to_stderr(
+    write_skill: Callable[..., Path],
+    write_queries: Callable[..., Path],
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Verify reach optimize emits phase progress lines to stderr when stderr is not a TTY."""
+    write_skill(name="prog-tool", description="Initial description.")
+    qfile = write_queries(target="prog-tool", count=2)
+    with patch("sys.stderr.isatty", return_value=False):
+        ret = main(
+            [
+                "optimize",
+                "prog-tool",
+                "--skills",
+                str(tmp_path),
+                "--queries",
+                str(qfile),
+                "--agent",
+                "fake",
+                "--budget",
+                "4",
+            ]
+        )
+    assert ret == 0
+    captured = capsys.readouterr()
+    assert "[reach optimize]" in captured.err
+
+
+def test_optimize_with_handoff_cli_diff_and_auto_apply(
+    write_skill: Callable[..., Path],
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Verify --with-handoff renders target+rival diffs and patches both SKILL.md files."""
+    target_dir = write_skill(
+        name="bigquery-observability",
+        description="Provides BigQuery slot query bottlenecks and telemetry.",
+        body="# BigQuery Observability\n\nUse region qualifier lookups in INFORMATION_SCHEMA.\n",
+    )
+    rival_dir = write_skill(
+        name="bigquery-slot-cost-optimizer",
+        description="Analyzes BigQuery slot query bottlenecks and cost optimization.",
+        body="# BigQuery Slot Cost Optimizer\n\nFix query plan bottlenecks and slot contention.\n",
+    )
+    ret_diff = main(
+        [
+            "optimize",
+            "bigquery-observability",
+            "--skills",
+            str(tmp_path),
+            "--agent",
+            "fake",
+            "--with-handoff",
+            "--format",
+            "diff",
+        ]
+    )
+    assert ret_diff == 0
+    diff_out = capsys.readouterr().out
+    assert "a/bigquery-observability/SKILL.md" in diff_out
+    assert "a/bigquery-slot-cost-optimizer/SKILL.md" in diff_out
+    assert "> **Routing Note:**" in diff_out
+
+    ret_apply = main(
+        [
+            "optimize",
+            "bigquery-observability",
+            "--skills",
+            str(tmp_path),
+            "--agent",
+            "fake",
+            "--with-handoff",
+            "--auto-apply",
+            "--force",
+            "--yes",
+        ]
+    )
+    assert ret_apply == 0
+    assert "> **Routing Note:**" in (target_dir / "SKILL.md").read_text(encoding="utf-8")
+    assert "> **Routing Note:**" in (rival_dir / "SKILL.md").read_text(encoding="utf-8")

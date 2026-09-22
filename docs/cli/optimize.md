@@ -113,5 +113,7 @@ reach optimize cloud-run-deploy --format diff
 | `--force`, `-f`      | Flag    | `false`           | Force apply candidate to `SKILL.md` even if no empirical improvement is detected.                                              |
 | `--yes`, `-y`        | Flag    | `false`           | Bypass interactive safety confirmation prompts.                                                                                |
 | `--candidate`, `-c`  | Integer | `1`               | 1-based candidate rank to inspect diff or apply.                                                                               |
+| `--workers`, `-w`    | Integer | `from reach.toml` | Number of parallel probe workers (default: from reach.toml or 4).                                                              |
+| `--with-handoff`     | Flag    | `false`           | Synthesize and stage reciprocal Layer-2 `SKILL.md` Routing Notes.                                                              |
 | `--format`           | Choice  | `text`            | Output format: `text`, `json`, `diff`.                                                                                         |
 | `--config`           | Path    | -                 | Path to `reach.toml` configuration file.                                                                                       |

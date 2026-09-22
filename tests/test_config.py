@@ -1796,3 +1796,63 @@ def test_run_config_validates_load_config_output_while_forbidding_unknown_keys(
 
     with pytest.raises(ValidationError):
         RunConfig.model_validate({**loaded_default, "unknown_section": {}})
+
+
+def test_run_config_from_toml_and_resolve_presence_based_optimize_workers_inheritance(
+    tmp_path: Path,
+) -> None:
+    """Verify RunConfig inherits plan.workers into optimize.workers via model_fields_set."""
+    from reach.config import OptimizeSettings, RuntimeSettings
+
+    # Case 1: [plan] workers = 1 explicitly set, [optimize] workers unset -> inherits 1
+    d1 = tmp_path / "c1"
+    d1.mkdir()
+    toml_inherit_1 = write_toml(
+        d1,
+        """
+        [plan]
+        workers = 1
+        """,
+    )
+    cfg_1 = RunConfig.from_toml(toml_inherit_1)
+    assert cfg_1.optimize.workers == 1
+    assert RunConfig.resolve(OptimizeSettings, cfg_1).workers == 1
+
+    # Case 2: [plan] workers = 8 and [optimize] workers = 4 explicitly set -> preserves 4
+    d2 = tmp_path / "c2"
+    d2.mkdir()
+    toml_explicit_4 = write_toml(
+        d2,
+        """
+        [plan]
+        workers = 8
+        [optimize]
+        workers = 4
+        """,
+    )
+    cfg_4 = RunConfig.from_toml(toml_explicit_4)
+    assert cfg_4.optimize.workers == 4
+    assert RunConfig.resolve(OptimizeSettings, cfg_4).workers == 4
+
+    # Case 3: RuntimeSettings.resolve_for_optimize merges [runtime.options] with overrides
+    d3 = tmp_path / "c3"
+    d3.mkdir()
+    toml_rt = write_toml(
+        d3,
+        """
+        [runtime]
+        agent = "antigravity-sdk"
+        [runtime.options]
+        vertex = true
+        project = "vertical-datum-418119"
+        """,
+    )
+    rt = RuntimeSettings.resolve_for_optimize(
+        toml_rt,
+        agent="antigravity-sdk",
+        options={"location": "us-central1"},
+    )
+    assert rt.agent == "antigravity-sdk"
+    assert rt.options["vertex"] is True
+    assert rt.options["project"] == "vertical-datum-418119"
+    assert rt.options["location"] == "us-central1"

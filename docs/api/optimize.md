@@ -7,7 +7,9 @@ Closed-loop skill description optimization using candidate synthesis and empiric
     options:
       show_root_heading: false
       members:
+        - apply_optimization_candidate
         - build_optimization_prompt
+        - build_reciprocal_handoff
         - CandidateOrigin
         - evaluate_candidate
         - filter_candidates
@@ -15,6 +17,9 @@ Closed-loop skill description optimization using candidate synthesis and empiric
         - OptimizationCandidate
         - OptimizationReport
         - optimize_skill
+        - ReciprocalHandoff
+        - render_body_with_routing_note
         - split_query_set
         - synthesize_candidates
         - update_skill_description
+        - upsert_skill_routing_note

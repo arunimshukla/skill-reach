@@ -431,6 +431,10 @@ def test_optimize_description_heuristics_via_cli(
             str(ws.queries_file),
             "--candidates",
             "2",
+            "--workers",
+            "2",
+            "--with-handoff",
+            "--yes",
             "--auto-apply",
             "--force",
             "--agent",
@@ -438,10 +442,12 @@ def test_optimize_description_heuristics_via_cli(
         ]
     )
     assert opt_proc.returncode == 0, f"Optimize failed:\n{opt_proc.stderr}"
+    assert "[reach optimize]" in opt_proc.stderr
 
     updated_text = skill_manifest.read_text(encoding="utf-8")
     assert updated_text != original_text
     assert "file-copier" in updated_text
+    assert "> **Routing Note:**" in updated_text
 
     eval_out = ws.root / ".reach" / "eval_opt.json"
     eval_proc = ws.run_reach(

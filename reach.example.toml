@@ -129,6 +129,8 @@ adversarial_count = 5
 positive_count = 5
 seed = 42
 review_timeout = 600.0
+workers = 4
+with_handoff = false
 
 [overlap]
 # Claim extraction and overlap analysis thresholds.
