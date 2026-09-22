@@ -581,10 +581,12 @@ def test_select_config_sets_isolated_app_data_dir(
     workdir = tmp_path / "work"
     workdir.mkdir()
 
-    # Default isolation sets workdir / .reach_antigravity_sdk
+    # Default isolation sets per-worker slot under workdir / .reach_antigravity_sdk
+    from reach.runtime._fs import probe_slot_dir
+
     rt = AntigravitySdkRuntime(options=AntigravitySdkOptions(model="test-model"))
     config = rt._select_config(workdir)
-    expected_dir = (workdir / ".reach_antigravity_sdk").resolve()
+    expected_dir = probe_slot_dir((workdir / ".reach_antigravity_sdk").resolve())
     assert config.app_data_dir == str(expected_dir)
     assert expected_dir.is_dir()
     assert "GEMINI_API_KEY" in (config.env or {}) or "GOOGLE_API_KEY" in (config.env or {})
@@ -622,6 +624,51 @@ def test_select_invokes_post_probe(
 
     outcome = rt.select("how do I set up a cluster?", workdir)
     assert outcome.invoked_skill == "gke-basics"
+    assert not (workdir / ".reach_antigravity_sdk").exists()
+
+
+def test_post_probe_concurrent_workers_do_not_delete_active_sibling_slots(
+    tmp_path: Path,
+) -> None:
+    """Verify post_probe cleans only its own slot and preserves active sibling slots."""
+    import threading
+
+    workdir = tmp_path / "concurrent_work"
+    workdir.mkdir()
+    rt = AntigravitySdkRuntime(
+        options=AntigravitySdkOptions(model="test-model", auto_clean=True),
+    )
+
+    config_main = rt._select_config(workdir)
+    assert config_main.app_data_dir is not None
+    main_slot = Path(config_main.app_data_dir)
+    sentinel = main_slot / "active_session.json"
+    sentinel.write_text("{}", encoding="utf-8")
+
+    worker_slot_holder: list[Path] = []
+
+    def _worker_probe() -> None:
+        cfg_w = rt._select_config(workdir)
+        assert cfg_w.app_data_dir is not None
+        w_slot = Path(cfg_w.app_data_dir)
+        worker_slot_holder.append(w_slot)
+        (w_slot / "worker_session.json").write_text("{}", encoding="utf-8")
+        rt.post_probe(workdir)
+
+    t = threading.Thread(target=_worker_probe)
+    t.start()
+    t.join()
+
+    assert len(worker_slot_holder) == 1
+    assert worker_slot_holder[0] != main_slot
+    assert not worker_slot_holder[0].exists()
+    # Main thread's slot and sentinel file must remain intact while active!
+    assert main_slot.is_dir()
+    assert sentinel.is_file()
+
+    # When main thread finishes and runs post_probe, both slot and parent are removed
+    rt.post_probe(workdir)
+    assert not main_slot.exists()
     assert not (workdir / ".reach_antigravity_sdk").exists()
 
 

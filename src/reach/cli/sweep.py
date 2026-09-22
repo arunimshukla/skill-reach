@@ -28,8 +28,9 @@ from reach.config import (
     StudySettings,
     resolve_sub_settings,
 )
+from reach.queries import load_query_set
 from reach.runtime import AgentRuntime, build_runtime
-from reach.sweep import run_scaling_sweep
+from reach.sweep import _resolve_anchor_skills, resolve_sweep_scales, run_scaling_sweep
 from reach.views import Console, build_console, print_sweep, print_wrote, render_sweep
 
 from .app import LOOP, app
@@ -53,7 +54,7 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from reach.models import Skill
-    from reach.sweep import ScalingStudy
+    from reach.sweep import ScalingPoint, ScalingStudy
 
 
 def _resolve_sweep_queries(
@@ -110,14 +111,13 @@ def _resolve_sweep_out_path(
     return Path(".reach/sweep.json")
 
 
-def _output_sweep(
-    console: Console,
+def _write_sweep_file(
     study: ScalingStudy,
     *,
     format: Format,
     out: Path,
 ) -> None:
-    """Render and write scaling study results to disk."""
+    """Serialize scaling study results to the destination file."""
     out_format = format
     if format == "text":
         if out.suffix == ".json":
@@ -133,12 +133,63 @@ def _output_sweep(
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(out_content, encoding="utf-8")
 
+
+def _output_sweep(
+    console: Console,
+    study: ScalingStudy,
+    *,
+    format: Format,
+    out: Path,
+) -> None:
+    """Render and write scaling study results to disk."""
+    _write_sweep_file(study, format=format, out=out)
+
     if format == "text":
         print_sweep(console, study)
         print_wrote(console, out)
     else:
         rendered = render_sweep(study, format)
         print(rendered)
+
+
+def _print_anchor_coverage(
+    *,
+    console: Console,
+    queries_path: Path,
+    anchor: str | None,
+    configured_anchor: int | Sequence[str] | str | None,
+    skills: Sequence[Skill],
+    scales: Sequence[int] | None,
+    target: str | None,
+) -> None:
+    """Print anchor query coverage summary and warn on 0-query anchor skills."""
+    if target is not None or not queries_path.exists():
+        return
+    try:
+        actual_scales = resolve_sweep_scales(len(skills), scales)
+        resolved_anchors = _resolve_anchor_skills(
+            anchor if anchor is not None else configured_anchor,
+            skills,
+            actual_scales,
+        )
+    except ValueError:
+        return
+    if not resolved_anchors:
+        return
+    raw_qs = load_query_set(queries_path)
+    counts = {a: sum(1 for q in raw_qs.queries if q.expected_skill == a) for a in resolved_anchors}
+    covered = sum(1 for count in counts.values() if count > 0)
+    total_matched = sum(counts.values())
+    console.print(
+        f"[dim]Anchor coverage:[/] {total_matched} queries matched across "
+        f"{covered}/{len(resolved_anchors)} anchor skills"
+    )
+    zero_anchors = [a for a, count in counts.items() if count == 0]
+    if zero_anchors:
+        console.print(
+            "[yellow]Warning:[/] anchor skill(s) with 0 matching queries in --queries: "
+            f"[bold]{', '.join(zero_anchors)}[/]"
+        )
 
 
 @app.command(name="sweep", group=LOOP)
@@ -305,8 +356,28 @@ def _sweep(
     effective_config, resolved_queries = _finalize_sweep_study_config(
         effective_config, found, skills, queries, workdir, early_stop
     )
+    destination = _resolve_sweep_out_path(
+        out,
+        configured=effective_config.study.out,
+        queries_path=resolved_queries,
+    )
+    effective_config = effective_config.model_copy(
+        update={
+            "study": effective_config.study.model_copy(update={"out": destination}),
+        }
+    )
     if format == "text":
-        console.print(f"[dim]Using benchmark queries from:[/] [cyan]{resolved_queries}[/]\n")
+        console.print(f"[dim]Using benchmark queries from:[/] [cyan]{resolved_queries}[/]")
+        _print_anchor_coverage(
+            console=console,
+            queries_path=resolved_queries,
+            anchor=anchor,
+            configured_anchor=effective_config.study.anchor,
+            skills=found,
+            scales=parsed_scales or effective_config.study.scales,
+            target=target,
+        )
+        console.print()
 
     if code := confirm_skill_execution(
         console,
@@ -318,6 +389,25 @@ def _sweep(
     ):
         return code
 
+    def _on_scale_complete(
+        step: int,
+        total: int,
+        point: ScalingPoint,
+        partial_study: ScalingStudy,
+    ) -> None:
+        _write_sweep_file(partial_study, format=format, out=destination)
+        if format == "text":
+            secondary = (
+                f"F1={point.f1_score:.1%}"
+                if partial_study.is_corpus_sweep
+                else f"recall={point.recall:.1%}"
+            )
+            console.print(
+                f"  [dim]\\[{step}/{total}][/] Scale [bold]K={point.scale}[/]: "
+                f"pass_rate={point.pass_rate:.1%}, {secondary} "
+                f"[dim]({point.probes_executed} probes)[/]"
+            )
+
     try:
         study = run_scaling_sweep(
             config=effective_config,
@@ -328,8 +418,10 @@ def _sweep(
             rivals_share=rivals_share,
             noise_floor=noise_floor,
             workers=workers if workers is not None else effective_config.plan.workers,
+            skills=found,
             attempts=attempts,
             early_stop=early_stop,
+            on_scale_complete=_on_scale_complete,
         )
     except ValueError as err:
         console.print(f"[red]Error:[/] {err}")
@@ -338,11 +430,6 @@ def _sweep(
         console.print(f"[red]Runtime Error:[/] {err}")
         return 3
 
-    destination = _resolve_sweep_out_path(
-        out,
-        configured=effective_config.study.out,
-        queries_path=resolved_queries,
-    )
     _output_sweep(console, study, format=format, out=destination)
     return 0
 
