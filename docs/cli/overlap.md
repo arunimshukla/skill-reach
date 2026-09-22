@@ -147,8 +147,8 @@ reach overlap explain <QUERY> --skill <SKILL> [--rival <RIVAL>] [OPTIONS]
 
 ### General & Analysis Options
 
-| Option                 | Type   | Default         | Description                                                                                                 |
-| :--------------------- | :----- | :-------------- | :---------------------------------------------------------------------------------------------------------- |
+| Option                 | Type    | Default         | Description                                                                                                 |
+| :--------------------- | :------ | :-------------- | :---------------------------------------------------------------------------------------------------------- |
 | `[SKILLS]`, `--skills` | Path    | Auto-discovered | Path to the skill directory, `SKILL.md` file, or corpus to analyze (discovered from precedence if omitted). |
 | `--skill`              | String  | -               | Analyze overlap specifically for this skill against all competitors (repeatable).                           |
 | `--suggest`            | Flag    | `false`         | Generate suggested description rewrites to reduce lexical overlap (single-skill or corpus-wide).            |

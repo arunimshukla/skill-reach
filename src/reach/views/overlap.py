@@ -803,12 +803,14 @@ def suggest_view(
     semantic_similarities: Mapping[tuple[str, str], float] | None = None,
 ) -> SuggestView:
     """Build a SuggestView containing proposals for the specified skills."""
+    # Structured outputs (JSON/JSONL/CSV) remain uncapped unless --top is explicitly set.
     rewrites, _ = filter_rewrites(
         overlap,
         skills,
         names,
         overlap_filter=overlap_filter,
         semantic_similarities=semantic_similarities,
+        default_top=None,
     )
     return SuggestView(
         corpus_size=len(overlap.competitions),

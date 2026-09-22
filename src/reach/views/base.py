@@ -648,12 +648,13 @@ def _disambiguate_middle_truncate(
 
     min_side = min(_MAX_DISTINCT_CHARS, max(1, keep // 3))
     valid_splits: list[tuple[int, int, int, int]] = []
-    for h in range(min_side, keep - min_side + 1):
-        t = keep - h
-        if not _collides(h, t):
-            distinct_chars = min(_MAX_DISTINCT_CHARS, max(h - lcp, t - lcs))
-            balance_penalty = abs(h - head)
-            valid_splits.append((distinct_chars, -balance_penalty, h, t))
+    if keep >= 2 * min_side:
+        for h in range(min_side, keep - min_side + 1):
+            t = keep - h
+            if not _collides(h, t):
+                distinct_chars = min(_MAX_DISTINCT_CHARS, max(h - lcp, t - lcs))
+                balance_penalty = abs(h - head)
+                valid_splits.append((distinct_chars, -balance_penalty, h, t))
 
     if valid_splits:
         valid_splits.sort(reverse=True)
@@ -665,7 +666,7 @@ def _disambiguate_middle_truncate(
         p_len = max(1, avail // 3)
         s_len = max(1, avail // 3)
         m_len = max(1, avail - p_len - s_len)
-        mid_start = min(lcp, max(0, len(value) - m_len))
+        mid_start = min(lcp, max(0, len(value) - m_len - s_len))
         mid = value[mid_start : mid_start + m_len]
         return f"{value[:p_len]}…{mid}…{value[len(value) - s_len :]}"
 

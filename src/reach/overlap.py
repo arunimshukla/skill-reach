@@ -152,11 +152,11 @@ def suggest_close_skills(
         shared = len(target_tokens & cand_tokens)
         union = len(target_tokens | cand_tokens)
         jaccard = shared / union if union else 0.0
+        has_token_overlap = shared >= _MIN_SHARED_TOKENS and jaccard >= _MIN_JACCARD_SIMILARITY
+        if candidate not in close_set and not has_token_overlap:
+            continue
         seq_ratio = difflib.SequenceMatcher(None, target, candidate).ratio()
-        if candidate in close_set or (
-            shared >= _MIN_SHARED_TOKENS and jaccard >= _MIN_JACCARD_SIMILARITY
-        ):
-            scored.append((jaccard, seq_ratio, candidate))
+        scored.append((jaccard, seq_ratio, candidate))
     scored.sort(key=lambda item: (-item[0], -item[1], item[2]))
     return [name for _, _, name in scored[:n]]
 

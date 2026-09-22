@@ -677,12 +677,18 @@ class OverlapQuadrant(StrEnum):
 
     @classmethod
     def _missing_(cls, value: object) -> OverlapQuadrant | None:
-        """Resolve case- and punctuation-insensitive CLI slugs via tokenized enum names."""
-        if not isinstance(value, str) or not (tokens := tuple(tokenize(value))):
+        if not isinstance(value, str):
+            return None
+        tokens = tuple(tokenize(value.replace("_", "-")))
+        if not tokens:
             return None
         for member in cls:
-            if tokens in (tuple(tokenize(member.name)), tuple(tokenize(member.value))):
+            member_name_tokens = tuple(tokenize(member.name.replace("_", "-")))
+            if tokens in (member_name_tokens, tuple(tokenize(member.value))):
                 return member
+        prefix_matches = [m for m in cls if tokenize(m.value)[0].startswith(tokens[0])]
+        if len(prefix_matches) == 1 and len(tokens) == 1:
+            return prefix_matches[0]
         return None
 
 
