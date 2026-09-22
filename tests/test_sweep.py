@@ -1425,3 +1425,64 @@ def test_sweep_scores_two_turn_mutual_handoff_as_true_positive_and_records_entry
     # while q-acceptable used neutral gcloud first
     assert point.entrypoint_pass_rate == 0.5
     assert point.entrypoint_f1_score == 0.5
+
+
+def test_run_scaling_sweep_invalidates_workdir_cache_on_anchor_or_skill_edit(
+    tmp_path: Path,
+) -> None:
+    """Verify persistent workdir sweep_*.jsonl cache invalidates on anchor or SKILL.md change."""
+    from reach.catalog import load_skills
+    from reach.config import RunConfig, StudySettings
+
+    skills_dir = tmp_path / "corpus"
+    _create_mock_skills(skills_dir, 4)
+    skills_v1 = load_skills(skills_dir)
+    qs = QuerySet(
+        catalog_id="corpus",
+        queries=tuple(
+            Query(
+                id=f"q-{idx}",
+                text=f"query for skill-{idx:02d}",
+                kind=QueryKind.IMPLICIT,
+                expected_skill=f"skill-{idx:02d}",
+            )
+            for idx in range(4)
+        ),
+        provenance=QuerySetProvenance(origin=Origin.AUTHORED),
+    )
+
+    workdir = tmp_path / "persistent_wd"
+    cfg = RunConfig(study=StudySettings(workdir=workdir))
+    answers = {f"query for skill-{idx:02d}": f"skill-{idx:02d}" for idx in range(4)}
+
+    def _probe_count(anchor: str, corpus: list[Skill]) -> int:
+        rt = FakeRuntime(answers, model="mock-model", materialize=False)
+        study = run_scaling_sweep(
+            skills=corpus,
+            query_set=qs,
+            scales=(2, 4),
+            anchor=anchor,
+            attempts=1,
+            runtime=rt,
+            config=cfg,
+        )
+        assert study.points[0].scale == 2
+        return len(rt.queries)
+
+    # Initial run for anchor="skill-00" executes 2 probes (K=2 and K=4)
+    assert _probe_count("skill-00", skills_v1) == 2
+
+    # 1. Change --anchor to "skill-00,skill-03": K=2 catalog changed, so both q-0 and q-3 run at K=2
+    #    (2 probes) while at K=4 q-0 reuses K=4 and q-3 runs (1 probe) -> 3 probes total
+    assert _probe_count("skill-00,skill-03", skills_v1) == 3
+
+    # 2. Switching back to anchor="skill-00" reuses preserved K=2 and K=4 rows on disk (0 probes)
+    assert _probe_count("skill-00", skills_v1) == 0
+
+    # 3. Editing SKILL.md changes corpus_digest and invalidates all cached rows (4 probes)
+    (skills_dir / "skill-03" / "SKILL.md").write_text(
+        "---\nname: skill-03\ndescription: Updated Desc 3\n---\nUpdated Body 3\n",
+        encoding="utf-8",
+    )
+    skills_v2 = load_skills(skills_dir)
+    assert _probe_count("skill-00,skill-03", skills_v2) == 4

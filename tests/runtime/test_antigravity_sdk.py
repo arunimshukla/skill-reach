@@ -627,6 +627,152 @@ def test_select_invokes_post_probe(
     assert not (workdir / ".reach_antigravity_sdk").exists()
 
 
+@pytest.mark.parametrize(
+    ("use_custom_dir", "expect_exists"),
+    [
+        (False, False),
+        (True, True),
+    ],
+)
+def test_post_probe_always_cleans_ephemeral_slot_even_when_auto_clean_false(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    use_custom_dir: bool,
+    expect_exists: bool,
+) -> None:
+    """Verify ephemeral slot_dir is cleaned when auto_clean=False while custom dir stays."""
+    workdir = tmp_path / "work_default_clean"
+    workdir.mkdir()
+    target_dir = (workdir / "user_app_data") if use_custom_dir else None
+
+    rt = AntigravitySdkRuntime(
+        options=AntigravitySdkOptions(
+            model="test-model",
+            auto_clean=False,
+            app_data_dir=target_dir,
+        ),
+    )
+    rt._resident = ("gke-basics",)
+    _fake_agent(monkeypatch, _FakeResponse(structured={"selected_skill": "gke-basics"}))
+
+    outcome = rt.select("how do I set up a cluster?", workdir)
+    assert outcome.invoked_skill == "gke-basics"
+    checked_path = target_dir if target_dir is not None else (workdir / ".reach_antigravity_sdk")
+    assert checked_path.exists() is expect_exists
+
+
+def test_select_recovers_skill_from_view_file_directory_step_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Verify select recovers resident skill when cortex rejects view_file on a skill directory."""
+    workdir = tmp_path / "work_dir_err"
+    skill_dir = workdir / ".agents" / "skills" / "bigquery-slot-cost-optimizer"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: bigquery-slot-cost-optimizer\n---\n",
+        encoding="utf-8",
+    )
+
+    rt = AntigravitySdkRuntime(
+        options=AntigravitySdkOptions(model="test-model"),
+    )
+    rt._resident = ("bigquery-slot-cost-optimizer", "other-skill")
+
+    step_err = (
+        "The model produced an invalid tool call. "
+        '("model output error: invalid tool call error (invalid_args) failed to read file: '
+        f"read '{skill_dir}': is a directory\")"
+    )
+    history_step = type(
+        "_Step",
+        (),
+        {"status": "ERROR", "error": step_err, "http_code": 0},
+    )()
+    _fake_agent(
+        monkeypatch,
+        _FakeResponse(structured=None, text=""),
+        history=[history_step],
+    )
+
+    outcome = rt.select(
+        "optimize bigquery slots",
+        workdir,
+        target_skill="bigquery-slot-cost-optimizer",
+    )
+    assert outcome.error is None
+    assert outcome.invoked_skills == ("bigquery-slot-cost-optimizer",)
+
+
+def test_select_preserves_turn1_directory_skill_order_and_cancels_on_early_exit(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Verify Turn-1 directory view_file precedes Turn-2 skill and triggers early-exit cancel."""
+    workdir = tmp_path / "work_traj_order"
+    for name in ("skill-a", "skill-b"):
+        s_dir = workdir / ".agents" / "skills" / name
+        s_dir.mkdir(parents=True)
+        (s_dir / "SKILL.md").write_text(f"---\nname: {name}\n---\n", encoding="utf-8")
+
+    skill_a_dir = workdir / ".agents" / "skills" / "skill-a"
+    skill_b_file = workdir / ".agents" / "skills" / "skill-b" / "SKILL.md"
+    step_err_a = (
+        "The model produced an invalid tool call. "
+        '("model output error: invalid tool call error (invalid_args) failed to read file: '
+        f'read {skill_a_dir}: is a directory")'
+    )
+    step1 = _FakeStep(status="ERROR", error=step_err_a, http_code=0)
+    tc_b = ag_types.ToolCall(name="view_file", args={"AbsolutePath": str(skill_b_file)})
+    step2 = type("_Step", (), {"status": "DONE", "error": "", "tool_calls": [tc_b]})()
+
+    # 1. Chronological trajectory order when Turn 2 fires _on_tool_call after Turn 1 dir error
+    rt_multi = AntigravitySdkRuntime(
+        options=AntigravitySdkOptions(model="test-model", early_exit=False),
+    )
+    rt_multi._resident = ("skill-a", "skill-b")
+    _fake_agent(
+        monkeypatch,
+        _FakeResponse(structured=None, text="done", tool_calls=[tc_b]),
+        history=[step1, step2],
+    )
+    outcome_multi = rt_multi.select("use skills", workdir)
+    assert outcome_multi.invoked_skills == ("skill-a", "skill-b")
+
+    # 2. Real-time _on_post_step hook triggers early_exit and cancels connection on Turn 1,
+    # and _select_async suppresses asyncio.CancelledError when early_exit_hit is True
+    rt_early = AntigravitySdkRuntime(
+        options=AntigravitySdkOptions(model="test-model", early_exit=True),
+    )
+    rt_early._resident = ("skill-a", "skill-b")
+    cancelled: list[bool] = []
+
+    from typing import Self
+
+    class _CancellingAgent:
+        def __init__(self, config: Any) -> None:
+            self.config = config
+            conn = type("_Conn", (), {"cancel": staticmethod(lambda: cancelled.append(True))})()
+            self.conversation = type("_Conv", (), {"connection": conn, "history": [step1]})()
+
+        async def __aenter__(self) -> Self:
+            return self
+
+        async def __aexit__(self, *_: object) -> None:
+            return None
+
+        async def chat(self, _query: str) -> Any:
+            await self.config.hooks[1](step1)
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr("reach.runtime.antigravity_sdk.Agent", _CancellingAgent)
+    outcome_early = rt_early.select("use skill a", workdir, target_skill="skill-a")
+    assert outcome_early.error is None
+    assert outcome_early.early_exit is True
+    assert outcome_early.invoked_skills == ("skill-a",)
+    assert cancelled == [True]
+
+
 def test_post_probe_concurrent_workers_do_not_delete_active_sibling_slots(
     tmp_path: Path,
 ) -> None:
@@ -782,13 +928,13 @@ def test_select_async_registers_hooks_in_config(
     runtime: AntigravitySdkRuntime,
     tmp_path: Path,
 ) -> None:
-    """Verify _select_async registers decide hook in LocalAgentConfig hooks."""
+    """Verify _select_async registers decide and post-step hooks in LocalAgentConfig hooks."""
     runtime._resident = ("gke-basics",)
     instances = _fake_agent(monkeypatch, _FakeResponse(structured={"selected_skill": "gke-basics"}))
     runtime.select("how to setup", tmp_path / "work")
     assert len(instances) == 1
     assert instances[0].config.hooks is not None
-    assert len(instances[0].config.hooks) == 1
+    assert len(instances[0].config.hooks) == 2
 
 
 def test_select_async_hook_intercepts_target_skill_early_exit(
