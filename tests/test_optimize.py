@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -2177,14 +2177,14 @@ def test_reciprocal_handoff_upsert_staging_and_apply(
         def install(
             self,
             catalog: Any,
-            skills: Sequence[Skill],
+            skills: Iterable[Skill],
             workdir: Path,
-        ) -> None:
+        ) -> Path:
             for s in skills:
                 md = s.path / "SKILL.md"
                 if md.is_file():
                     installed_bodies[s.name] = md.read_text(encoding="utf-8")
-            super().install(catalog, skills, workdir)
+            return super().install(catalog, skills, workdir)
 
     with patch("reach.optimize._setup_runtime", return_value=InspectingRuntime()):
         cand = OptimizationCandidate(

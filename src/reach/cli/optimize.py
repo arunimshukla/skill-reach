@@ -301,8 +301,9 @@ def _optimize(
     def _on_progress(msg: str) -> None:
         if format != "text":
             return
-        if is_tty and hasattr(status_ctx, "update"):
-            status_ctx.update(f"[cyan]{msg}[/cyan]")
+        update_fn = getattr(status_ctx, "update", None)
+        if is_tty and callable(update_fn):
+            update_fn(f"[cyan]{msg}[/cyan]")
         else:
             err_console.print(f"[dim]\\[reach optimize][/dim] {msg}")
 
