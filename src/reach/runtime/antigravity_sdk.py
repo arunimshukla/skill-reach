@@ -58,7 +58,7 @@ from pydantic import BaseModel, Field
 
 from reach.config import DEFAULT_GEMINI_MODEL, RuntimeSettings
 from reach.runtime import (
-    AgentOptions,
+    AntigravityOptions,
     AntigravityRuntime,
     SelectionOutcome,
     TrajectoryTracker,
@@ -373,7 +373,7 @@ def _resolve_empty_selection_error(
     return "empty selection (likely rate-limited)"
 
 
-class AntigravitySdkOptions(AgentOptions):
+class AntigravitySdkOptions(AntigravityOptions):
     """Specify runtime configuration options for the Antigravity SDK driver."""
 
     model: str = Field(
@@ -597,10 +597,19 @@ class AntigravitySdkRuntime(_AntigravitySdkConfigMixin, AntigravityRuntime):
             )
             enabled_tools = [builtin_by_name.get(t, t) for t in self.allowed_tools]
 
+        skills_paths = [str(self.skills_dir(workdir))]
+        if self.options.use_symlinks and (skills_dir := self.skills_dir(workdir)).is_dir():
+            resolved_targets = {
+                str(resolved)
+                for child in skills_dir.iterdir()
+                if child.is_symlink() and (resolved := child.resolve()).is_dir()
+            }
+            skills_paths.extend(p for p in sorted(resolved_targets) if p not in skills_paths)
+
         kwargs = self._base_config_kwargs(self._model_spec(), self.build_env(workdir))
         kwargs.update(
             {
-                "skills_paths": [str(self.skills_dir(workdir))],
+                "skills_paths": skills_paths,
                 "capabilities": ag_types.CapabilitiesConfig(
                     enabled_tools=enabled_tools,
                     enable_subagents=False,

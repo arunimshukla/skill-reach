@@ -583,6 +583,79 @@ options = { model = "base-model" }
     assert captured_settings.options.get("model") == "override-model"
 
 
+def test_sweep_cli_inherits_agent_from_config_file(
+    sweep_corpus: tuple[Path, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify reach sweep inherits agent from reach.toml [general] and [runtime]."""
+    corpus_dir, queries_file = sweep_corpus
+    config_file = tmp_path / "reach.toml"
+    config_file.write_text(
+        """
+[general]
+default_agent = "keyword"
+
+[study]
+trusted = true
+""",
+        encoding="utf-8",
+    )
+
+    captured_config = None
+    captured_runtime = None
+
+    def fake_sweep(config=None, runtime=None, **kwargs) -> ScalingStudy:
+        nonlocal captured_config, captured_runtime
+        captured_config = config
+        captured_runtime = runtime
+        from reach.sweep import ScalingPoint, ScalingStudy
+
+        return ScalingStudy(
+            scales=(2,),
+            points=(
+                ScalingPoint(
+                    scale=2,
+                    catalog_id="test",
+                    pass_rate=1.0,
+                    pass_rate_interval=(1.0, 1.0),
+                    delta_vs_baseline=0.0,
+                    delta_context=0.0,
+                    delta_shadowing=0.0,
+                    probes_executed=1,
+                ),
+            ),
+            baseline_pass_rate=1.0,
+            final_pass_rate=1.0,
+            total_delta=0.0,
+            total_context_loss=0.0,
+            total_shadowing_loss=0.0,
+            is_corpus_sweep=True,
+        )
+
+    monkeypatch.setattr("reach.cli.sweep.run_scaling_sweep", fake_sweep)
+
+    code = main(
+        [
+            "sweep",
+            str(corpus_dir),
+            "--config",
+            str(config_file),
+            "--queries",
+            str(queries_file),
+            "--scales",
+            "2",
+            "--yes",
+            "--no-early-stop",
+        ]
+    )
+    assert code == 0
+    assert captured_config is not None
+    assert captured_config.runtime.agent == "keyword"
+    assert captured_runtime is not None
+    assert captured_runtime.name == "keyword"
+
+
 def test_sweep_cli_registry_flags_override_config_file(
     sweep_corpus: tuple[Path, Path],
     tmp_path: Path,

@@ -67,6 +67,17 @@ def generator(home_dir: Path) -> AntigravityCliGenerator:
     )
 
 
+def test_antigravity_cli_options_defaults() -> None:
+    """Verify AntigravityCliOptions defaults use_symlinks to False and supports overriding."""
+    opts = AntigravityCliOptions()
+    assert opts.use_symlinks is False
+    assert opts.executable == "agy"
+    assert opts.dangerously_skip_permissions is True
+
+    override = AntigravityCliOptions(use_symlinks=True)
+    assert override.use_symlinks is True
+
+
 def test_parses_the_resolved_model_off_the_init_event() -> None:
     """Verify parse_stream extracts resolved model name from init event payload."""
     summary = parse_stream(agy_stream(model="gemini-3.7-flash"))

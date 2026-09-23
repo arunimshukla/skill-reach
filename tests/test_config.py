@@ -1856,3 +1856,52 @@ def test_run_config_from_toml_and_resolve_presence_based_optimize_workers_inheri
     assert rt.options["vertex"] is True
     assert rt.options["project"] == "test-cloud-project-123"
     assert rt.options["location"] == "us-central1"
+
+
+def test_run_config_inherits_runtime_agent_from_general(tmp_path: Path) -> None:
+    """Verify RunConfig inherits general.default_agent into runtime.agent when unset."""
+    # Case 1: [general] default_agent without [runtime] section
+    d1 = tmp_path / "c1"
+    d1.mkdir()
+    toml_general = write_toml(
+        d1,
+        """
+        [general]
+        default_agent = "antigravity-sdk"
+        """,
+    )
+    cfg1 = RunConfig.from_toml(toml_general)
+    assert cfg1.general.default_agent == "antigravity-sdk"
+    assert cfg1.runtime.agent == "antigravity-sdk"
+
+    # Case 2: [general] default_agent with [runtime.options] but no explicit agent
+    d2 = tmp_path / "c2"
+    d2.mkdir()
+    toml_opts = write_toml(
+        d2,
+        """
+        [general]
+        default_agent = "antigravity-sdk"
+        [runtime.options]
+        use_symlinks = false
+        """,
+    )
+    cfg2 = RunConfig.from_toml(toml_opts)
+    assert cfg2.general.default_agent == "antigravity-sdk"
+    assert cfg2.runtime.agent == "antigravity-sdk"
+
+    # Case 3: [general] default_agent with explicit [runtime] agent preserves explicit agent
+    d3 = tmp_path / "c3"
+    d3.mkdir()
+    toml_explicit = write_toml(
+        d3,
+        """
+        [general]
+        default_agent = "antigravity-sdk"
+        [runtime]
+        agent = "claude-code"
+        """,
+    )
+    cfg3 = RunConfig.from_toml(toml_explicit)
+    assert cfg3.general.default_agent == "antigravity-sdk"
+    assert cfg3.runtime.agent == "claude-code"
