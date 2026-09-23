@@ -1188,6 +1188,47 @@ def test_eval_with_queries_does_not_require_workdir(
     assert main(argv) == 0
 
 
+@pytest.mark.parametrize("corpus_arg_mode", ["skills_flag", "positional"])
+def test_zero_config_corpus_eval_with_skills_or_positional_dir(
+    bodied_corpus: Path,
+    tmp_path: Path,
+    corpus_arg_mode: str,
+) -> None:
+    """Verify zero-config `reach eval` works with --skills or positional corpus path."""
+    subset_queries = tmp_path / "subset_5.json"
+    subset_queries.write_text(
+        json.dumps(
+            {
+                "queries": [
+                    {
+                        "id": "q-1",
+                        "text": "deploy a container to cloud run",
+                        "expected_skill": "gke-basics",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    if corpus_arg_mode == "skills_flag":
+        corpus_args = ["--skills", str(bodied_corpus)]
+    else:
+        corpus_args = [str(bodied_corpus)]
+
+    argv = [
+        "eval",
+        *corpus_args,
+        "--queries",
+        str(subset_queries),
+        "--workers",
+        "4",
+        "--agent",
+        "fake",
+        "--dry-run",
+    ]
+    assert main(argv) == 0
+
+
 @pytest.fixture
 def run_dir_argv(bodied_corpus: Path, tmp_path: Path) -> list[str]:
     """Provide an `eval` command line naming only --run-dir, no file flags."""
@@ -1629,3 +1670,42 @@ def test_eval_direct_skill_md_path(
 def test_eval_nonexistent_path_fails_cleanly() -> None:
     """Verify reach eval exits 2 when given a nonexistent skill path."""
     assert main(["eval", "./nonexistent/path/to/skill", "--agent", "fake"]) == 2
+
+
+def test_eval_filters_existing_queries_file_by_skill_flag(
+    bodied_corpus: Path,
+    tmp_path: Path,
+) -> None:
+    """Verify --skill filters an existing --queries file to only the requested skill(s)."""
+    queries_file = tmp_path / "multi.yaml"
+    queries_file.write_text(
+        "queries:\n"
+        "  - text: deploy gke cluster\n"
+        "    expected_skill: gke-basics\n"
+        "  - text: run bigquery sql\n"
+        "    expected_skill: bigquery-basics\n",
+        encoding="utf-8",
+    )
+    out_file = tmp_path / "eval.json"
+    assert (
+        main(
+            [
+                "eval",
+                "--skills",
+                str(bodied_corpus),
+                "--queries",
+                str(queries_file),
+                "--skill",
+                "gke-basics",
+                "--agent",
+                "fake",
+                "--out",
+                str(out_file),
+                "--yes",
+            ]
+        )
+        == 0
+    )
+    artifact = json.loads(out_file.read_text(encoding="utf-8"))
+    evaluated_skills = {q["expected"] for q in artifact["queries"]}
+    assert evaluated_skills == {"gke-basics"}

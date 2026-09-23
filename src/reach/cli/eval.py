@@ -252,15 +252,64 @@ def _validate_quick_save(save: Path | None, quick: QuickEval | None) -> None:
         )
 
 
+def _promote_positional_corpus(
+    target: str | None,
+    study: StudyFlags,
+    *,
+    auto: bool,
+    run_dir: Path | None,
+) -> tuple[str | None, StudyFlags]:
+    """Promote positional multi-skill corpus directory to study.skills for catalog runs."""
+    if target is None or study.skills is not None:
+        return target, study
+    if study.queries is None and not auto and run_dir is None:
+        return target, study
+    from reach.config import resolve_path
+
+    candidate = resolve_path(target)
+    if (
+        candidate.is_dir()
+        and not (candidate / "SKILL.md").is_file()
+        and any(d.is_dir() and (d / "SKILL.md").is_file() for d in candidate.iterdir())
+    ):
+        return None, study.model_copy(update={"skills": candidate})
+    return target, study
+
+
 def _adjust_eval_catalog_mode(
     settings: RunConfig,
     config: Path | None,
     catalog: CatalogFlags | None,
     quick: QuickEval | None,
+    *,
+    study_flags: StudyFlags | None = None,
+    has_target_filter: bool = False,
 ) -> RunConfig:
     """Apply catalog mode defaults and neighborhood catalog ID for quick evaluation."""
-    if quick is None and not _asks_for_a_mode(config, catalog):
-        return settings.with_overrides(catalog={"mode": CatalogMode.ALL})
+    if quick is None:
+        explicit_partial = study_flags is not None and study_flags.partial is not None
+        if not explicit_partial and config is not None:
+            explicit_partial = RunConfig.declared(config, "study", "partial")
+        study_overrides: dict[str, object] = {}
+        if not explicit_partial and (settings.study.queries is not None or has_target_filter):
+            study_overrides["partial"] = True
+
+        if not _asks_for_a_mode(config, catalog):
+            if (
+                config is None
+                and settings.study.catalog in (None, "auto", "")
+                and not settings.study.rescope
+            ):
+                study_overrides["catalog"] = "all"
+                study_overrides["rescope"] = True
+            return settings.with_overrides(
+                catalog={"mode": CatalogMode.ALL},
+                study=study_overrides,
+            )
+        if study_overrides:
+            return settings.with_overrides(study=study_overrides)
+        return settings
+
     if (
         quick is not None
         and (settings.study.catalog is None or settings.study.catalog in ("auto", ""))
@@ -270,6 +319,40 @@ def _adjust_eval_catalog_mode(
             study={"catalog": f"neighborhood:{quick.target}"},
         )
     return settings
+
+
+def _filter_queries_by_targets(
+    settings: RunConfig,
+    targets: Sequence[str],
+    scratch: Path | None,
+) -> RunConfig:
+    """Filter an existing query set on disk to only queries matching --skill targets."""
+    if (
+        not targets
+        or scratch is None
+        or settings.study.queries is None
+        or not settings.study.queries.is_file()
+    ):
+        return settings
+    from reach.queries import load_query_set
+
+    query_set = load_query_set(settings.study.queries)
+    target_set = frozenset(targets)
+    filtered_queries = tuple(
+        q
+        for q in query_set.queries
+        if q.expected_skill in target_set or q.truth_label in target_set
+    )
+    if not filtered_queries:
+        msg = (
+            f"no queries in {settings.study.queries} match --skill "
+            f"{', '.join(repr(t) for t in targets)}"
+        )
+        raise ValueError(msg)
+    filtered_qs = query_set.model_copy(update={"queries": filtered_queries})
+    filtered_path = scratch / "filtered-queries.json"
+    save_query_set(filtered_qs, filtered_path)
+    return settings.with_overrides(study={"queries": filtered_path})
 
 
 def _default_reach_dir(study: StudyFlags) -> Path:
@@ -387,7 +470,16 @@ def _resolve_eval_settings(
         registry=registry,
         required=() if (quick is not None or auto) else EVAL_REQUIRED,
     )
-    adjusted = _adjust_eval_catalog_mode(settings, config, catalog, quick)
+    adjusted = _adjust_eval_catalog_mode(
+        settings,
+        config,
+        catalog,
+        quick,
+        study_flags=study,
+        has_target_filter=bool(generate.targets),
+    )
+    if quick is None and generate.targets:
+        adjusted = _filter_queries_by_targets(adjusted, generate.targets, scratch)
     return adjusted, generate
 
 
@@ -650,13 +742,31 @@ def _eval(
                 record = record.model_copy(update={"records": out})
         else:
             artifact_out = out
+    target, study = _promote_positional_corpus(
+        target,
+        study,
+        auto=auto,
+        run_dir=run_dir,
+    )
     quick = _quick(target, query, expected, config, study)
     _validate_quick_save(save, quick)
     has_declared_workdir = study.workdir is not None or (
         config is not None and RunConfig.declared(config, "study", "workdir")
     )
+    if (
+        artifact_out is None
+        and record.records is None
+        and study.queries is not None
+        and generate.targets
+    ):
+        from reach.config import resolve_path
+
+        artifact_out = artifact_path(resolve_path(study.queries))
     needs_scratch = (
-        quick is not None or auto or (not has_declared_workdir and run_dir is None and not dry_run)
+        quick is not None
+        or auto
+        or bool(generate.targets)
+        or (not has_declared_workdir and run_dir is None and not dry_run)
     )
     scratch = Path(tempfile.mkdtemp(prefix="reach-")) if needs_scratch else None
     try:

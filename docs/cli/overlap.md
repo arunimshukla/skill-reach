@@ -147,16 +147,20 @@ reach overlap explain <QUERY> --skill <SKILL> [--rival <RIVAL>] [OPTIONS]
 
 ### General & Analysis Options
 
-| Option                 | Type   | Default         | Description                                                                                                 |
-| :--------------------- | :----- | :-------------- | :---------------------------------------------------------------------------------------------------------- |
-| `[SKILLS]`, `--skills` | Path   | Auto-discovered | Path to the skill directory, `SKILL.md` file, or corpus to analyze (discovered from precedence if omitted). |
-| `--skill`              | String | -               | Analyze overlap specifically for this skill against all competitors (repeatable).                           |
-| `--suggest`            | Flag   | `false`         | Generate suggested description rewrites to reduce lexical overlap (requires `--skill`).                     |
-| `--semantic`           | Flag   | `false`         | Include dense semantic similarity and dual-axis diagnostic quadrant matrix.                                 |
-| `--agent`              | Choice | -               | Agent runtime to query for installed skill locations (`claude-code`, `antigravity-cli`, etc.).              |
-| `--global`, `-g`       | Flag   | `false`         | Discover and inspect skills from user global configuration (`~/`).                                          |
-| `--format`             | Choice | `text`          | Output format: `text`, `csv`, `json`, `jsonl`.                                                              |
-| `--config`, `-c`       | Path   | -               | Path to reach.toml configuration file.                                                                      |
+| Option                 | Type    | Default         | Description                                                                                                 |
+| :--------------------- | :------ | :-------------- | :---------------------------------------------------------------------------------------------------------- |
+| `[SKILLS]`, `--skills` | Path    | Auto-discovered | Path to the skill directory, `SKILL.md` file, or corpus to analyze (discovered from precedence if omitted). |
+| `--skill`              | String  | -               | Analyze overlap specifically for this skill against all competitors (repeatable).                           |
+| `--suggest`            | Flag    | `false`         | Generate suggested description rewrites to reduce lexical overlap (single-skill or corpus-wide).            |
+| `--semantic`           | Flag    | `false`         | Include dense semantic similarity and dual-axis diagnostic quadrant matrix.                                 |
+| `--top`                | Integer | -               | Show only the top N ranked skills.                                                                          |
+| `--all`                | Flag    | `false`         | Show all skills without the default 30-row cap or actionable-only filter.                                   |
+| `--quadrant`           | Choice  | -               | Filter by diagnostic quadrant: `near-duplicate`, `latent-collision`, `boilerplate`, `distinct`.             |
+| `--no-truncate`        | Flag    | `false`         | Render full skill names without middle truncation.                                                          |
+| `--agent`              | Choice  | -               | Agent runtime to query for installed skill locations (`claude-code`, `antigravity-cli`, etc.).              |
+| `--global`, `-g`       | Flag    | `false`         | Discover and inspect skills from user global configuration (`~/`).                                          |
+| `--format`             | Choice  | `text`          | Output format: `text`, `csv`, `json`, `jsonl`.                                                              |
+| `--config`, `-c`       | Path    | -               | Path to reach.toml configuration file.                                                                      |
 
 ### Agent Registry Options
 

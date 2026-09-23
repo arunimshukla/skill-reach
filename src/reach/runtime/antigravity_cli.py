@@ -33,6 +33,7 @@ from pydantic import ValidationError as PydanticValidationError
 
 from reach.config import DEFAULT_GEMINI_MODEL, RuntimeSettings, resolve_path
 from reach.runtime import (
+    AntigravityOptions,
     AntigravityRuntime,
     CliAgentRuntime,
     CliOptions,
@@ -135,7 +136,7 @@ def _ensure_isolated_settings(
     path.write_text(json.dumps(settings, sort_keys=True, indent=2))
 
 
-class AntigravityCliOptions(CliOptions):
+class AntigravityCliOptions(AntigravityOptions, CliOptions):
     """Specify runtime configuration options for the Antigravity CLI agent."""
 
     executable: str = "agy"

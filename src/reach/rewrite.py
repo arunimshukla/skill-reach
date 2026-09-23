@@ -116,6 +116,11 @@ class Rewrite(BaseModel):
         """Return True if multiple competitors fall within the contender band."""
         return len(self.contenders) > 1
 
+    @property
+    def actionable(self) -> bool:
+        """Return True if the skill requires rewording or is missing a mutual handoff."""
+        return self.verdict is Verdict.REWORD or bool(self.missing_mutual_handoffs)
+
 
 def skill_body(skill: Skill) -> str:
     """Extract the markdown body of a skill, stripping YAML frontmatter."""
@@ -360,20 +365,26 @@ REWRITE_CAVEAT = (
 def suggest_all(
     overlap: CorpusOverlap,
     skills: Sequence[Skill],
-    names: Sequence[str],
+    names: Sequence[str] = (),
+    *,
+    only_actionable: bool = False,
 ) -> tuple[Rewrite, ...]:
     """Generate rewrite proposals for multiple named skills using a shared scorer."""
+    target_names = tuple(names) if names else tuple(c.skill for c in overlap.competitions)
     scorer = Bm25Scorer.from_skills(skills)
     tokenized = {name: frozenset(tokens) for name, tokens in scorer.documents.items()}
-    return tuple(
+    rewrites = (
         suggest_rewrite(
             overlap.find(name),
             skills,
             scorer=scorer,
             tokenized_corpus=tokenized,
         )
-        for name in names
+        for name in target_names
     )
+    if only_actionable:
+        return tuple(r for r in rewrites if r.actionable)
+    return tuple(rewrites)
 
 
 def synthesize_directional_disclaimer(

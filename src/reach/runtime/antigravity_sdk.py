@@ -17,9 +17,11 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
-from collections.abc import Mapping
+import re
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, cast, override
@@ -56,9 +58,10 @@ from pydantic import BaseModel, Field
 
 from reach.config import DEFAULT_GEMINI_MODEL, RuntimeSettings
 from reach.runtime import (
-    AgentOptions,
+    AntigravityOptions,
     AntigravityRuntime,
     SelectionOutcome,
+    TrajectoryTracker,
     agent_default_model,
 )
 from reach.runtime._env import (
@@ -69,6 +72,7 @@ from reach.runtime._fs import (
     ensure_private_directory,
     extract_tool_path,
     normalize_skill_tool_args,
+    probe_slot_dir,
     resolve_skill_from_path,
     safe_cleanup_isolated_dir,
 )
@@ -199,7 +203,52 @@ _HTTP_TOO_MANY_REQUESTS = 429
 _HTTP_ERROR_THRESHOLD = 400
 
 
-def _format_step_error(step: object, error_status: object) -> str | None:
+_DIR_READ_ERR_PATTERN = re.compile(r"read\s+([^\r\n]+?):\s*is a directory", flags=re.IGNORECASE)
+
+
+def _extract_step_dir_error_skill(step: object, resident: Collection[str]) -> str | None:
+    """Resolve a resident skill name when a step failed attempting to read a skill directory."""
+    raw_err = str(getattr(step, "error", "") or "").strip()
+    if not raw_err or "is a directory" not in raw_err.lower():
+        return None
+    for match in _DIR_READ_ERR_PATTERN.finditer(raw_err):
+        captured_path = match.group(1).strip().strip("'\"`")
+        if skill := resolve_skill_from_path(captured_path, resident):
+            return skill
+    return None
+
+
+def _iter_conversation_history(agent: object) -> Sequence[object]:
+    """Return conversation history steps from an Agent instance when present."""
+    conv = getattr(agent, "conversation", None)
+    history = getattr(conv, "history", None)
+    return history if isinstance(history, Sequence) else ()
+
+
+def _extract_step_skills(step: object, resident: Collection[str]) -> list[str]:
+    """Extract resident skill names from a step's directory error or tool calls."""
+    skills: list[str] = []
+    if dir_skill := _extract_step_dir_error_skill(step, resident):
+        skills.append(dir_skill)
+    for tc in getattr(step, "tool_calls", None) or ():
+        args = getattr(tc, "args", None) or getattr(tc, "arguments", {}) or {}
+        if (
+            isinstance(args, Mapping)
+            and (path := extract_tool_path(args))
+            and (tc_skill := resolve_skill_from_path(path, resident))
+            and tc_skill not in skills
+        ):
+            skills.append(tc_skill)
+    return skills
+
+
+def _format_step_error(
+    step: object,
+    error_status: object,
+    resident: Collection[str] = (),
+    *,
+    is_dir_skill_step: bool = False,
+) -> str | None:
     """Format a single SDK conversation step error when present."""
     status = getattr(step, "status", None)
     raw_err = str(getattr(step, "error", "") or "").strip()
@@ -216,6 +265,11 @@ def _format_step_error(step: object, error_status: object) -> str | None:
     ):
         return None
 
+    if is_dir_skill_step or (
+        resident and _extract_step_dir_error_skill(step, resident) is not None
+    ):
+        return None
+
     err_msg = raw_err or "unknown system error"
     lower_err = err_msg.lower()
     if http_code == _HTTP_TOO_MANY_REQUESTS or any(
@@ -227,10 +281,12 @@ def _format_step_error(step: object, error_status: object) -> str | None:
     return f"sdk step error: {err_msg}"
 
 
-def _extract_history_error(agent: object) -> str | None:
+def _extract_history_error(
+    agent: object,
+    resident: Collection[str] = (),
+) -> str | None:
     """Extract formatted rate-limit or system error from SDK conversation history."""
-    conv = getattr(agent, "conversation", None)
-    history = getattr(conv, "history", None)
+    history = _iter_conversation_history(agent)
     if not history:
         return None
     step_status_cls = getattr(ag_types, "StepStatus", None) if ag_types is not None else None
@@ -240,9 +296,67 @@ def _extract_history_error(agent: object) -> str | None:
         else "STATE_ERROR"
     )
     for step in reversed(history):
-        if formatted := _format_step_error(step, error_status):
+        if formatted := _format_step_error(step, error_status, resident=resident):
             return formatted
     return None
+
+
+def _inspect_conversation_history(
+    agent: object,
+    resident: Collection[str],
+    tracker: TrajectoryTracker,
+    base_tools: Iterable[str],
+    *,
+    post_step_ran: bool = False,
+) -> tuple[tuple[str, ...], str | None]:
+    """Inspect conversation history in a single pass to recover chronological skills and errors."""
+    history = _iter_conversation_history(agent)
+    tools = list(base_tools)
+    if not history:
+        return tuple(tools), None
+
+    step_status_cls = getattr(ag_types, "StepStatus", None) if ag_types is not None else None
+    error_status = (
+        getattr(step_status_cls, "ERROR", "STATE_ERROR")
+        if step_status_cls is not None
+        else "STATE_ERROR"
+    )
+
+    chronological_skills: list[str] = []
+    saw_dir_skill = False
+    latest_error: str | None = None
+
+    for step in history:
+        dir_skill = _extract_step_dir_error_skill(step, resident)
+        is_dir_step = dir_skill is not None
+        if is_dir_step:
+            saw_dir_skill = True
+        for s in _extract_step_skills(step, resident):
+            if s not in chronological_skills:
+                chronological_skills.append(s)
+        if formatted := _format_step_error(
+            step,
+            error_status,
+            resident=resident,
+            is_dir_skill_step=is_dir_step,
+        ):
+            latest_error = formatted
+
+    if saw_dir_skill and "view_file" not in tools:
+        tools.append("view_file")
+
+    if saw_dir_skill and not post_step_ran:
+        # Preserve forward chronological order across Turn-1 directory errors and subsequent hooks
+        merged_order = list(chronological_skills)
+        for existing in tracker.invoked_skills:
+            if existing not in merged_order:
+                merged_order.append(existing)
+        tracker.invoked_skills.clear()
+        tracker.early_exit_hit = False
+        for s in merged_order:
+            tracker.observe(s)
+
+    return tuple(tools), latest_error
 
 
 def _resolve_empty_selection_error(
@@ -259,7 +373,7 @@ def _resolve_empty_selection_error(
     return "empty selection (likely rate-limited)"
 
 
-class AntigravitySdkOptions(AgentOptions):
+class AntigravitySdkOptions(AntigravityOptions):
     """Specify runtime configuration options for the Antigravity SDK driver."""
 
     model: str = Field(
@@ -452,6 +566,12 @@ class AntigravitySdkRuntime(_AntigravitySdkConfigMixin, AntigravityRuntime):
             return (*SELECTION_TOOLS, *MULTI_TURN_SELECTION_TOOLS)
         return MULTI_TURN_SELECTION_TOOLS
 
+    @staticmethod
+    def _resolve_sdk_slot(workdir: Path) -> tuple[Path, Path]:
+        """Resolve the root SDK directory and thread-isolated slot directory."""
+        sdk_root = (Path(workdir) / ".reach_antigravity_sdk").resolve()
+        return sdk_root, probe_slot_dir(sdk_root)
+
     def _select_config(
         self,
         workdir: Path,
@@ -460,9 +580,12 @@ class AntigravitySdkRuntime(_AntigravitySdkConfigMixin, AntigravityRuntime):
         """Assemble LocalAgentConfig with turn budget, inspection tools, and hooks."""
         app_data_dir = None
         if self.options.isolate_config_dir or self.options.app_data_dir:
-            sdk_dir = ensure_private_directory(
-                self.options.app_data_dir or (workdir / ".reach_antigravity_sdk")
+            sdk_target = (
+                self.options.app_data_dir
+                if self.options.app_data_dir is not None
+                else self._resolve_sdk_slot(workdir)[1]
             )
+            sdk_dir = ensure_private_directory(sdk_target)
             app_data_dir = str(sdk_dir)
 
         enabled_tools = list(self._default_selection_tools)
@@ -474,10 +597,19 @@ class AntigravitySdkRuntime(_AntigravitySdkConfigMixin, AntigravityRuntime):
             )
             enabled_tools = [builtin_by_name.get(t, t) for t in self.allowed_tools]
 
+        skills_paths = [str(self.skills_dir(workdir))]
+        if self.options.use_symlinks and (skills_dir := self.skills_dir(workdir)).is_dir():
+            resolved_targets = {
+                str(resolved)
+                for child in skills_dir.iterdir()
+                if child.is_symlink() and (resolved := child.resolve()).is_dir()
+            }
+            skills_paths.extend(p for p in sorted(resolved_targets) if p not in skills_paths)
+
         kwargs = self._base_config_kwargs(self._model_spec(), self.build_env(workdir))
         kwargs.update(
             {
-                "skills_paths": [str(self.skills_dir(workdir))],
+                "skills_paths": skills_paths,
                 "capabilities": ag_types.CapabilitiesConfig(
                     enabled_tools=enabled_tools,
                     enable_subagents=False,
@@ -491,6 +623,71 @@ class AntigravitySdkRuntime(_AntigravitySdkConfigMixin, AntigravityRuntime):
             kwargs["response_schema"] = schema_dict
         return LocalAgentConfig(**kwargs)
 
+    def _build_selection_hooks(
+        self,
+        tracker: TrajectoryTracker,
+        hook_observed_tools: list[str],
+        agent_holder: list[Any],
+        post_step_seen: list[bool],
+    ) -> list[Any]:
+        """Build pre-tool and post-step hooks for real-time skill tracking and early exit."""
+        if ag_hooks is None:
+            return []
+        hooks_list: list[Any] = []
+
+        @ag_hooks.pre_tool_call_decide
+        async def _on_tool_call(call: ag_types.ToolCall) -> ag_types.HookResult:
+            if call_name := getattr(call, "name", None):
+                hook_observed_tools.append(_tool_name(call_name))
+            if tracker.early_exit and tracker.early_exit_hit:
+                return ag_types.HookResult(allow=False)
+            args = getattr(call, "args", None) or getattr(call, "arguments", {}) or {}
+            skill: str | None = None
+            if (
+                isinstance(args, Mapping)
+                and (path := extract_tool_path(args))
+                and (skill := resolve_skill_from_path(path, self._resident))
+            ):
+                should_stop = tracker.observe(skill)
+                if self.options.early_exit and should_stop:
+                    return ag_types.HookResult(allow=False)
+            if isinstance(args, Mapping) and (
+                modified_args := normalize_skill_tool_args(args, skill)
+            ):
+                return ag_types.HookResult(allow=True, modified_args=modified_args)
+            return ag_types.HookResult(allow=True)
+
+        hooks_list.append(_on_tool_call)
+        post_step_dec = getattr(ag_hooks, "_post_step", None) or getattr(
+            getattr(ag_hooks, "hooks", None),
+            "_post_step",
+            None,
+        )
+        if callable(post_step_dec):
+
+            @post_step_dec
+            async def _on_post_step(step: object) -> None:
+                if (skill := _extract_step_dir_error_skill(step, self._resident)) is None:
+                    return
+                post_step_seen.append(True)
+                hook_observed_tools.append("view_file")
+                should_stop = tracker.observe(skill)
+                if self.options.early_exit and should_stop and agent_holder:
+                    conn = getattr(
+                        getattr(agent_holder[0], "conversation", None),
+                        "connection",
+                        None,
+                    )
+                    cancel_fn = getattr(conn, "cancel", None)
+                    if callable(cancel_fn):
+                        with contextlib.suppress(Exception):
+                            res = cancel_fn()
+                            if asyncio.iscoroutine(res):
+                                await res
+
+            hooks_list.append(_on_post_step)
+        return hooks_list
+
     async def _select_async(
         self,
         query_text: str,
@@ -499,48 +696,43 @@ class AntigravitySdkRuntime(_AntigravitySdkConfigMixin, AntigravityRuntime):
     ) -> SelectionOutcome:
         """Execute chat evaluation asynchronously and return observed outcome."""
         tracker = self.make_tracker(target_skill)
-
-        hooks_list: list[Any] = []
         hook_observed_tools: list[str] = []
-        if ag_hooks is not None:
-
-            @ag_hooks.pre_tool_call_decide
-            async def _on_tool_call(call: ag_types.ToolCall) -> ag_types.HookResult:
-                if call_name := getattr(call, "name", None):
-                    hook_observed_tools.append(_tool_name(call_name))
-                if tracker.early_exit and tracker.early_exit_hit:
-                    return ag_types.HookResult(allow=False)
-                args = getattr(call, "args", None) or getattr(call, "arguments", {}) or {}
-                skill: str | None = None
-                if (
-                    isinstance(args, Mapping)
-                    and (path := extract_tool_path(args))
-                    and (skill := resolve_skill_from_path(path, self._resident))
-                ):
-                    should_stop = tracker.observe(skill)
-                    if self.options.early_exit and should_stop:
-                        return ag_types.HookResult(allow=False)
-                if isinstance(args, Mapping) and (
-                    modified_args := normalize_skill_tool_args(args, skill)
-                ):
-                    return ag_types.HookResult(allow=True, modified_args=modified_args)
-                return ag_types.HookResult(allow=True)
-
-            hooks_list.append(_on_tool_call)
-
+        agent_holder: list[Any] = []
+        post_step_seen: list[bool] = []
+        hooks_list = self._build_selection_hooks(
+            tracker,
+            hook_observed_tools,
+            agent_holder,
+            post_step_seen,
+        )
         config = self._select_config(workdir, hooks=hooks_list)
+
+        data: Any = None
+        text_out = ""
+        stream_tools: list[str] = []
+        stop_reason: Any = "END_TURN"
 
         try:
             async with Agent(config) as agent:
-                response = await agent.chat(query_text)
-                data = await response.structured_output()
-                text_fn = getattr(response, "text", None)
-                raw_text = await text_fn() if callable(text_fn) else None
-                text_out = str(raw_text).strip() if isinstance(raw_text, str) else ""
-                stream_tools = [_tool_name(call.name) async for call in response.tool_calls]
-                observed_tools = tuple(stream_tools or hook_observed_tools)
-                stop_reason = response.stop_reason
-                history_error = _extract_history_error(agent)
+                agent_holder.append(agent)
+                try:
+                    response = await agent.chat(query_text)
+                    data = await response.structured_output()
+                    text_fn: Any = getattr(response, "text", None)
+                    raw_text = await text_fn() if text_fn is not None else None
+                    text_out = str(raw_text).strip() if isinstance(raw_text, str) else ""
+                    stream_tools = [_tool_name(call.name) async for call in response.tool_calls]
+                    stop_reason = getattr(response, "stop_reason", "END_TURN")
+                except (Exception, asyncio.CancelledError):
+                    if not tracker.early_exit_hit:
+                        raise
+                observed_tools, history_error = _inspect_conversation_history(
+                    agent,
+                    self._resident,
+                    tracker,
+                    stream_tools or hook_observed_tools,
+                    post_step_ran=bool(post_step_seen),
+                )
         except (AntigravityValidationError, Exception) as err:
             if isinstance(err, RuntimeError):
                 raise
@@ -590,12 +782,19 @@ class AntigravitySdkRuntime(_AntigravitySdkConfigMixin, AntigravityRuntime):
 
     @override
     def post_probe(self, workdir: Path) -> None:
-        """Clean session and agent artifacts after probe execution if auto_clean is enabled."""
-        if not self.options.auto_clean:
+        """Clean ephemeral per-thread SDK slot or isolated app_data_dir after probe execution."""
+        if not self.options.isolate_config_dir:
             return
-        if self.options.isolate_config_dir:
-            sdk_dir = self.options.app_data_dir or (Path(workdir) / ".reach_antigravity_sdk")
-            safe_cleanup_isolated_dir(workdir, sdk_dir)
+        if self.options.app_data_dir is None:
+            sdk_root, slot_dir = self._resolve_sdk_slot(workdir)
+            had_slot = slot_dir.exists()
+            safe_cleanup_isolated_dir(workdir, slot_dir)
+            if self.options.auto_clean or had_slot:
+                # Prune the root only once the last concurrent worker has released its slot.
+                with contextlib.suppress(OSError):
+                    sdk_root.rmdir()
+        elif self.options.auto_clean:
+            safe_cleanup_isolated_dir(workdir, self.options.app_data_dir)
 
     @override
     def select(

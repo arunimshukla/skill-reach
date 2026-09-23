@@ -430,6 +430,42 @@ class RuntimeSettings(BaseModel):
         resolved = resolve_options(self)
         return resolved.model_dump(mode="json") if resolved is not None else {}
 
+    @classmethod
+    def resolve_for_optimize(
+        cls,
+        config: Path | str | None = None,
+        *,
+        agent: str | None = None,
+        options: Mapping[str, Any] | None = None,
+    ) -> RuntimeSettings:
+        """Resolve RuntimeSettings merging reach.toml [runtime.options] with overrides."""
+        from reach.runtime import options_model
+
+        raw_cfg = load_config(config)
+        raw_runtime = raw_cfg.get("runtime", {})
+        cfg_agent = (
+            str(raw_runtime.get("agent"))
+            if isinstance(raw_runtime, Mapping) and raw_runtime.get("agent")
+            else default_agent(config)
+        )
+        resolved_agent = agent or cfg_agent
+        cfg_opts: dict[str, Any] = {}
+        if isinstance(raw_runtime, Mapping) and isinstance(raw_runtime.get("options"), Mapping):
+            raw_opts = dict(raw_runtime["options"])
+            model = options_model(resolved_agent)
+            if resolved_agent == cfg_agent or model is not None:
+                if model is not None:
+                    try:
+                        model.model_validate(raw_opts)
+                        cfg_opts = raw_opts
+                    except ValueError:
+                        cfg_opts = {}
+                else:
+                    cfg_opts = raw_opts
+
+        merged_opts = {**cfg_opts, **dict(options or {})}
+        return cls(agent=resolved_agent, options=merged_opts)
+
 
 class LintSettings(BaseModel):
     """Configuration settings for static skill linting and validation thresholds."""
@@ -465,15 +501,18 @@ class LintSettings(BaseModel):
         rules: dict[str, Any] = {}
 
         if isinstance(lint_section, Mapping):
-            raw_max_desc = lint_section.get("max_description_length")
-            if isinstance(raw_max_desc, int):
-                max_desc = raw_max_desc
-            raw_max_name = lint_section.get("max_name_length")
-            if isinstance(raw_max_name, int):
-                max_name = raw_max_name
-            raw_min_desc = lint_section.get("min_description_length")
-            if isinstance(raw_min_desc, int):
-                min_desc = raw_min_desc
+            int_vals = {
+                k: v
+                for k in (
+                    "max_description_length",
+                    "max_name_length",
+                    "min_description_length",
+                )
+                if isinstance(v := lint_section.get(k), int)
+            }
+            max_desc = int_vals.get("max_description_length", max_desc)
+            max_name = int_vals.get("max_name_length", max_name)
+            min_desc = int_vals.get("min_description_length", min_desc)
             raw_sim = lint_section.get("similarity_threshold")
             if isinstance(raw_sim, (int, float)):
                 sim_threshold = float(raw_sim)
@@ -582,6 +621,8 @@ class OptimizeSettings(BaseModel):
     positive_count: int = Field(default=5, ge=1)
     seed: int = Field(default=42)
     review_timeout: float = Field(default=600.0, gt=0.0)
+    workers: int = Field(default=4, ge=1)
+    with_handoff: bool = Field(default=False)
 
 
 class RegistrySettings(BaseModel):
@@ -732,6 +773,31 @@ class RunConfig(BaseModel):
             return {k: v for k, v in data.items() if k not in {"agents", "models"}}
         return data
 
+    @model_validator(mode="after")
+    def _inherit_optimize_workers_from_plan(self) -> Self:
+        """Inherit plan.workers into optimize.workers when optimize.workers is unset."""
+        if (
+            "workers" not in self.optimize.model_fields_set
+            and "workers" in self.plan.model_fields_set
+        ):
+            object.__setattr__(
+                self,
+                "optimize",
+                self.optimize.model_copy(update={"workers": self.plan.workers}),
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _inherit_runtime_agent_from_general(self) -> Self:
+        """Inherit general.default_agent into runtime.agent when runtime.agent is unset."""
+        if "agent" not in self.runtime.model_fields_set and self.general.default_agent:
+            object.__setattr__(
+                self,
+                "runtime",
+                self.runtime.model_copy(update={"agent": self.general.default_agent}),
+            )
+        return self
+
     def require_queries(self, hint: str = "") -> Path:
         """Forward queries path requirement to study settings."""
         return self.study.require_queries(hint)
@@ -781,7 +847,7 @@ class RunConfig(BaseModel):
         explicit_settings: T | None = None,
         **overrides: object,
     ) -> T:
-        """Resolve effective settings section by layering overrides over this configuration."""
+        """Resolve effective settings section against this RunConfig instance."""
         return self.resolve(
             section_cls,
             config=self,
@@ -914,6 +980,9 @@ def digest_material(material: dict[str, Any]) -> Digests:
         base.pop(key, None)
     if "plan" in base:
         base["plan"].pop("workers", None)
+    if "optimize" in base:
+        base["optimize"].pop("workers", None)
+        base["optimize"].pop("with_handoff", None)
 
     fingerprint = deepcopy(base)
     fingerprint["study"] = {

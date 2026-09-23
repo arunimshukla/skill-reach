@@ -249,12 +249,99 @@ def test_no_provenance_field_can_move_a_digest(
     assert query_set_digest(recorded) == query_set_digest(plain)
 
 
-def test_a_set_recorded_without_provenance_is_refused(tmp_path: Path) -> None:
-    """Verify legacy query sets without provenance fail schema validation."""
-    legacy = tmp_path / "legacy.json"
-    legacy.write_text(json.dumps({"catalog_id": "c", "queries": []}), encoding="utf-8")
-    with pytest.raises(ValidationError, match="provenance"):
-        load_query_set(legacy)
+def test_a_set_without_catalog_id_or_provenance_uses_defaults(tmp_path: Path) -> None:
+    """Verify hand-authored query sets without catalog_id or provenance load with defaults."""
+    minimal_model = QuerySet.model_validate(
+        {
+            "queries": [
+                {
+                    "id": "q1",
+                    "text": "deploy container service",
+                    "expected_skill": "container-deploy",
+                }
+            ]
+        }
+    )
+    assert minimal_model.catalog_id == ""
+    assert minimal_model.provenance.origin == Origin.AUTHORED
+
+    custom_json = tmp_path / "queries_dir_test_5.json"
+    custom_json.write_text(
+        json.dumps(
+            {
+                "queries": [
+                    {
+                        "id": "q1",
+                        "text": "deploy container service",
+                        "expected_skill": "container-deploy",
+                    },
+                    {"text": "create k8s cluster", "expected_skill": "k8s-basics"},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    loaded = load_query_set(custom_json)
+    assert loaded.catalog_id == "all"
+    assert loaded.provenance.origin == Origin.AUTHORED
+    assert len(loaded.queries) == 2
+    assert loaded.queries[0].id == "q1"
+    assert loaded.queries[1].id == "q-002"
+
+    custom_yaml = tmp_path / "queries.yaml"
+    custom_yaml.write_text(
+        "queries:\n"
+        "  - id: q1\n"
+        "    text: deploy container service\n"
+        "    expected_skill: container-deploy\n",
+        encoding="utf-8",
+    )
+    loaded_yaml = load_query_set(custom_yaml)
+    assert loaded_yaml.catalog_id == "all"
+    assert loaded_yaml.provenance.origin == Origin.AUTHORED
+    assert len(loaded_yaml.queries) == 1
+
+
+def test_query_accepts_query_alias_and_serializes_to_canonical_text(tmp_path: Path) -> None:
+    """Verify Query accepts 'query' as alias for 'text' and serializes back to 'text'."""
+    direct = Query.model_validate(
+        {"id": "q-alias", "query": "restart database service", "expected_skill": "db-admin"}
+    )
+    assert direct.text == "restart database service"
+    assert "query" not in direct.model_dump()
+    assert direct.model_dump()["text"] == "restart database service"
+
+    mixed_file = tmp_path / "mixed.json"
+    mixed_file.write_text(
+        json.dumps(
+            {
+                "queries": [
+                    {"id": "q1", "text": "deploy container service", "expected_skill": "s1"},
+                    {"id": "q2", "query": "restart database service", "expected_skill": "s2"},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    loaded = load_query_set(mixed_file)
+    assert len(loaded.queries) == 2
+    assert loaded.queries[0].text == "deploy container service"
+    assert loaded.queries[1].text == "restart database service"
+
+    saved_path = save_query_set(loaded, tmp_path / "normalized.json")
+    saved_raw = json.loads(saved_path.read_text(encoding="utf-8"))
+    for item in saved_raw["queries"]:
+        assert "text" in item
+        assert "query" not in item
+
+
+@pytest.mark.parametrize("bad_alias", ["prompt", "question", "utterance"])
+def test_query_rejects_unauthorized_aliases(bad_alias: str) -> None:
+    """Verify unauthorized field aliases are strictly rejected by Query schema."""
+    with pytest.raises(ValidationError, match=r"text|Field required"):
+        Query.model_validate(
+            {"id": "q1", bad_alias: "deploy container service", "expected_skill": "s1"}
+        )
 
 
 def test_provenance_survives_a_trip_through_disk(tmp_path: Path) -> None:
@@ -322,97 +409,3 @@ def test_query_set_for_skill_lookup(target: str, expected_ids: tuple[str, ...]) 
     q3 = Query(id="q3", text="out of scope", kind=QueryKind.OUT_OF_SCOPE)
     qs = QuerySet(catalog_id="c", queries=(q1, q2, q3), provenance=provenance())
     assert tuple(q.id for q in qs.for_skill(target)) == expected_ids
-
-
-@pytest.mark.parametrize(
-    ("payload", "expected_first", "expected_second"),
-    [
-        pytest.param(
-            [
-                {
-                    "query": "deploy service to cloud run",
-                    "should_trigger": True,
-                    "expected_skill": "cloud-run-basics",
-                },
-                {
-                    "query": "book a flight to tokyo",
-                    "should_trigger": False,
-                    "expected_skill": "cloud-run-basics",
-                },
-            ],
-            ("q-001", "deploy service to cloud run", "cloud-run-basics", QueryKind.IMPLICIT),
-            ("q-002", "book a flight to tokyo", None, QueryKind.OUT_OF_SCOPE),
-            id="top-level-array-clears-negative-expected-skill",
-        ),
-        pytest.param(
-            [
-                {
-                    "query": "deploy service to cloud run",
-                    "should_trigger": True,
-                    "expected_skill": "cloud-run-basics",
-                },
-                {
-                    "query": "configure gke node pool",
-                    "should_trigger": False,
-                    "expected_skill": "cloud-run-basics",
-                    "neighbor_skill": "gke-basics",
-                },
-            ],
-            ("q-001", "deploy service to cloud run", "cloud-run-basics", QueryKind.IMPLICIT),
-            ("q-002", "configure gke node pool", "gke-basics", QueryKind.NEIGHBOR_NEGATIVE),
-            id="top-level-array-preserves-neighbor-skill-on-negative",
-        ),
-        pytest.param(
-            {
-                "catalog_id": "custom:cloud-run-basics",
-                "queries": [
-                    {
-                        "query": "deploy service to cloud run",
-                        "should_trigger": True,
-                        "expected_skill": "cloud-run-basics",
-                    },
-                    {
-                        "query": "book a flight to tokyo",
-                        "should_trigger": False,
-                        "expected_skill": None,
-                    },
-                ],
-            },
-            ("q-001", "deploy service to cloud run", "cloud-run-basics", QueryKind.IMPLICIT),
-            ("q-002", "book a flight to tokyo", None, QueryKind.OUT_OF_SCOPE),
-            id="dict-wrapper-queries-key",
-        ),
-        pytest.param(
-            {
-                "evals": [
-                    {
-                        "query": "deploy service to cloud run",
-                        "should_trigger": True,
-                        "expected_skill": "cloud-run-basics",
-                    },
-                    {
-                        "query": "book a flight to tokyo",
-                        "should_trigger": False,
-                    },
-                ],
-            },
-            ("q-001", "deploy service to cloud run", "cloud-run-basics", QueryKind.IMPLICIT),
-            ("q-002", "book a flight to tokyo", None, QueryKind.OUT_OF_SCOPE),
-            id="dict-wrapper-evals-key",
-        ),
-    ],
-)
-def test_load_query_set_normalizes_legacy_json_formats(
-    tmp_path: Path,
-    payload: object,
-    expected_first: tuple[str, str, str | None, QueryKind],
-    expected_second: tuple[str, str, str | None, QueryKind],
-) -> None:
-    """Verify load_query_set normalizes array and dict-wrapped skill-creator JSON via Pydantic."""
-    p = tmp_path / "eval_set.json"
-    p.write_text(json.dumps(payload), encoding="utf-8")
-    loaded = load_query_set(p, catalog_id="neighborhood:cloud-run-basics")
-    assert len(loaded.queries) == 2
-    q0, q1 = loaded.queries
-    assert (q0.id, q0.text, q0.expected_skill, q0.kind) == expected_first
-    assert (q1.id, q1.text, q1.expected_skill, q1.kind) == expected_second

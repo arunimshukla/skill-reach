@@ -583,6 +583,79 @@ options = { model = "base-model" }
     assert captured_settings.options.get("model") == "override-model"
 
 
+def test_sweep_cli_inherits_agent_from_config_file(
+    sweep_corpus: tuple[Path, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify reach sweep inherits agent from reach.toml [general] and [runtime]."""
+    corpus_dir, queries_file = sweep_corpus
+    config_file = tmp_path / "reach.toml"
+    config_file.write_text(
+        """
+[general]
+default_agent = "keyword"
+
+[study]
+trusted = true
+""",
+        encoding="utf-8",
+    )
+
+    captured_config = None
+    captured_runtime = None
+
+    def fake_sweep(config=None, runtime=None, **kwargs) -> ScalingStudy:
+        nonlocal captured_config, captured_runtime
+        captured_config = config
+        captured_runtime = runtime
+        from reach.sweep import ScalingPoint, ScalingStudy
+
+        return ScalingStudy(
+            scales=(2,),
+            points=(
+                ScalingPoint(
+                    scale=2,
+                    catalog_id="test",
+                    pass_rate=1.0,
+                    pass_rate_interval=(1.0, 1.0),
+                    delta_vs_baseline=0.0,
+                    delta_context=0.0,
+                    delta_shadowing=0.0,
+                    probes_executed=1,
+                ),
+            ),
+            baseline_pass_rate=1.0,
+            final_pass_rate=1.0,
+            total_delta=0.0,
+            total_context_loss=0.0,
+            total_shadowing_loss=0.0,
+            is_corpus_sweep=True,
+        )
+
+    monkeypatch.setattr("reach.cli.sweep.run_scaling_sweep", fake_sweep)
+
+    code = main(
+        [
+            "sweep",
+            str(corpus_dir),
+            "--config",
+            str(config_file),
+            "--queries",
+            str(queries_file),
+            "--scales",
+            "2",
+            "--yes",
+            "--no-early-stop",
+        ]
+    )
+    assert code == 0
+    assert captured_config is not None
+    assert captured_config.runtime.agent == "keyword"
+    assert captured_runtime is not None
+    assert captured_runtime.name == "keyword"
+
+
 def test_sweep_cli_registry_flags_override_config_file(
     sweep_corpus: tuple[Path, Path],
     tmp_path: Path,
@@ -714,3 +787,154 @@ def test_sweep_auto_discovers_skills_when_reach_toml_omits_skills_path(
         ]
     )
     assert code == 0
+
+
+def test_sweep_passes_loaded_skills_once_and_checkpoints_each_scale(
+    sweep_corpus: tuple[Path, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Verify _sweep passes skills=found, prints per-scale lines, and checkpoints --out."""
+    import reach.cli.sweep as cli_sweep_mod
+
+    corpus_dir, queries_file = sweep_corpus
+    out_file = tmp_path / "checkpoints" / "sweep.json"
+
+    captured_kwargs: dict[str, object] = {}
+    checkpoints_seen: list[int] = []
+    orig_run_scaling_sweep = cli_sweep_mod.run_scaling_sweep
+
+    def spy_run_scaling_sweep(*args, **kwargs):
+        captured_kwargs.update(kwargs)
+        orig_cb = kwargs.get("on_scale_complete")
+
+        def wrapped_cb(step, total, point, partial):
+            if orig_cb is not None:
+                orig_cb(step, total, point, partial)
+            if out_file.exists():
+                data = json.loads(out_file.read_text(encoding="utf-8"))
+                checkpoints_seen.append(len(data["points"]))
+
+        kwargs["on_scale_complete"] = wrapped_cb
+        return orig_run_scaling_sweep(*args, **kwargs)
+
+    monkeypatch.setattr(cli_sweep_mod, "run_scaling_sweep", spy_run_scaling_sweep)
+
+    code = main(
+        [
+            "sweep",
+            str(corpus_dir),
+            "--queries",
+            str(queries_file),
+            "--scales",
+            "1,3,6",
+            "--agent",
+            "fake",
+            "--no-early-stop",
+            "--out",
+            str(out_file),
+        ]
+    )
+    assert code == 0
+    passed_skills = captured_kwargs.get("skills")
+    assert isinstance(passed_skills, (list, tuple))
+    assert len(passed_skills) == 6
+    assert checkpoints_seen == [1, 2, 3]
+    captured = capsys.readouterr()
+    combined = captured.out + captured.err
+    assert "[1/3] Scale K=1:" in combined
+    assert "[2/3] Scale K=3:" in combined
+    assert "[3/3] Scale K=6:" in combined
+
+
+def test_sweep_cli_fuzzy_suggestions_for_anchor_and_target(
+    sweep_corpus: tuple[Path, Path],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Verify CLI exits with code 2 and fuzzy suggestions for unknown --anchor or --target."""
+    corpus_dir, queries_file = sweep_corpus
+
+    code_anchor = main(
+        [
+            "sweep",
+            str(corpus_dir),
+            "--queries",
+            str(queries_file),
+            "--scales",
+            "2,4",
+            "--anchor",
+            "skill-0",
+            "--agent",
+            "fake",
+        ]
+    )
+    assert code_anchor == 2
+    err_anchor = capsys.readouterr().err
+    assert "Did you mean:" in err_anchor
+    assert "skill-00" in err_anchor
+
+    code_target = main(
+        [
+            "sweep",
+            str(corpus_dir),
+            "--queries",
+            str(queries_file),
+            "--scales",
+            "2,4",
+            "--target",
+            "skill-0",
+            "--agent",
+            "fake",
+        ]
+    )
+    assert code_target == 2
+    err_target = capsys.readouterr().err
+    assert "Did you mean:" in err_target
+    assert "skill-00" in err_target
+
+
+def test_sweep_warns_when_anchor_has_zero_matching_queries(
+    sweep_corpus: tuple[Path, Path],
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Verify reach sweep logs anchor coverage and warns when an anchor skill has 0 queries."""
+    corpus_dir, _ = sweep_corpus
+    partial_queries_file = tmp_path / "partial_queries.json"
+    save_query_set(
+        QuerySet(
+            catalog_id="synthetic",
+            queries=(
+                Query(
+                    id="q-0",
+                    text="Requesting task number 00",
+                    expected_skill="skill-00",
+                    kind=QueryKind.IMPLICIT,
+                ),
+            ),
+            provenance=QuerySetProvenance(origin=Origin.AUTHORED),
+        ),
+        partial_queries_file,
+    )
+
+    code = main(
+        [
+            "sweep",
+            str(corpus_dir),
+            "--queries",
+            str(partial_queries_file),
+            "--scales",
+            "2,4",
+            "--anchor",
+            "skill-00,skill-05",
+            "--agent",
+            "fake",
+            "--no-early-stop",
+        ]
+    )
+    assert code == 0
+    captured = capsys.readouterr()
+    combined = captured.out + captured.err
+    assert "Anchor coverage:" in combined
+    assert "skill-05" in combined

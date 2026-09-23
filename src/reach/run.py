@@ -208,12 +208,107 @@ def load_results(path: Path | str) -> list[ProbeResult]:
     ]
 
 
-def completed_attempts(path: Path | str) -> set[tuple[str, int]]:
+def _is_resumable_row(
+    row: ProbeResult,
+    *,
+    active_query_ids: set[str] | None = None,
+    corpus_digest: str = "",
+    catalog_skills: set[str] | None = None,
+    config_fingerprint: str = "",
+    condition_digest: str = "",
+) -> bool:
+    """Return whether a recorded ProbeResult satisfies resume criteria for the active run."""
+    if row.error:
+        return False
+    if active_query_ids is not None and row.query_id not in active_query_ids:
+        return False
+    if corpus_digest and row.corpus_digest != corpus_digest:
+        return False
+    if (
+        config_fingerprint
+        and row.config_fingerprint
+        and row.config_fingerprint != config_fingerprint
+        and not (condition_digest and row.condition_digest == condition_digest)
+    ):
+        return False
+    return not (catalog_skills is not None and set(row.observed_catalog) != catalog_skills)
+
+
+def _partition_resumed_results(
+    raw_previous: Sequence[ProbeResult],
+    *,
+    active_query_ids: set[str],
+    corpus_digest: str,
+    catalog_skills: set[str],
+    config_fingerprint: str = "",
+    condition_digest: str = "",
+) -> tuple[list[ProbeResult], set[tuple[str, int]], list[ProbeResult], bool]:
+    """Partition JSONL rows into active resumed rows and preserved other-anchor/arm rows."""
+    by_attempt: dict[tuple[str, int], ProbeResult] = {}
+    other_by_key: dict[tuple[tuple[str, ...], str, str, int], ProbeResult] = {}
+    for row in raw_previous:
+        if _is_resumable_row(
+            row,
+            active_query_ids=active_query_ids,
+            corpus_digest=corpus_digest,
+            catalog_skills=catalog_skills,
+            config_fingerprint=config_fingerprint,
+            condition_digest=condition_digest,
+        ):
+            by_attempt[(row.query_id, row.attempt)] = row
+        elif (
+            not row.error
+            and (not corpus_digest or row.corpus_digest == corpus_digest)
+            and (
+                row.query_id not in active_query_ids
+                or set(row.observed_catalog) != catalog_skills
+                or (
+                    bool(config_fingerprint)
+                    and bool(row.config_fingerprint)
+                    and row.config_fingerprint != config_fingerprint
+                    and not (condition_digest and row.condition_digest == condition_digest)
+                )
+            )
+        ):
+            key = (
+                tuple(sorted(row.observed_catalog)),
+                row.config_fingerprint,
+                row.query_id,
+                row.attempt,
+            )
+            other_by_key[key] = row
+
+    resumed = list(by_attempt.values())
+    retained_other = list(other_by_key.values())
+    needs_compaction = (len(resumed) + len(retained_other)) < len(raw_previous)
+    return resumed, set(by_attempt.keys()), retained_other, needs_compaction
+
+
+def completed_attempts(
+    path: Path | str,
+    *,
+    active_query_ids: set[str] | None = None,
+    corpus_digest: str = "",
+    catalog_skills: set[str] | None = None,
+    config_fingerprint: str = "",
+    condition_digest: str = "",
+) -> set[tuple[str, int]]:
     """Return completed, successful (query_id, attempt) pairs from existing results."""
     resolved = Path(path).expanduser()
     if not resolved.exists():
         return set()
-    return {(r.query_id, r.attempt) for r in load_results(resolved) if not r.error}
+    return {
+        (r.query_id, r.attempt)
+        for r in load_results(resolved)
+        if _is_resumable_row(
+            r,
+            active_query_ids=active_query_ids,
+            corpus_digest=corpus_digest,
+            catalog_skills=catalog_skills,
+            config_fingerprint=config_fingerprint,
+            condition_digest=condition_digest,
+        )
+    }
 
 
 def recorded_fingerprints(path: Path | str) -> set[str]:
@@ -376,11 +471,11 @@ def compose(config: RunConfig, skills: Sequence[Skill] | None = None) -> Composi
     )
 
     if not config.study.catalog or config.study.catalog.strip().lower() == "auto":
-        wanted = query_set.catalog_id
+        wanted = query_set.catalog_id or "all"
     else:
         wanted = config.study.catalog
 
-    if wanted != query_set.catalog_id and not config.study.rescope:
+    if query_set.catalog_id and wanted != query_set.catalog_id and not config.study.rescope:
         msg = (
             f"query set was labeled in {query_set.catalog_id!r} but would be "
             f"probed against {wanted!r}: ground truth derived in one catalog is "
@@ -655,20 +750,21 @@ class ProbeHarness:
         self.runtime.install(catalog, corpus, workdir)
 
         previous: list[ProbeResult] = []
+        retained_other: list[ProbeResult] = []
         skip: set[tuple[str, int]] = set()
-        raw_previous_count = 0
+        needs_compaction = False
         if resolved_out is not None:
             resolved_out.parent.mkdir(parents=True, exist_ok=True)
             if resume and resolved_out.exists():
                 raw_previous = load_results(resolved_out)
-                raw_previous_count = len(raw_previous)
-                skip = completed_attempts(resolved_out)
-                by_attempt: dict[tuple[str, int], ProbeResult] = {
-                    (r.query_id, r.attempt): r
-                    for r in raw_previous
-                    if (r.query_id, r.attempt) in skip
-                }
-                previous = list(by_attempt.values())
+                previous, skip, retained_other, needs_compaction = _partition_resumed_results(
+                    raw_previous,
+                    active_query_ids={q.id for q in query_set.queries},
+                    corpus_digest=provenance.corpus_digest,
+                    catalog_skills=set(catalog.skills),
+                    config_fingerprint=provenance.config_fingerprint,
+                    condition_digest=provenance.condition_digest,
+                )
 
         total = len(query_set.queries) * config.plan.attempts
         results = list(previous)
@@ -690,8 +786,8 @@ class ProbeHarness:
                 progress(index, total, result)
 
         if resolved_out is not None:
-            if resume and len(skip) < raw_previous_count:
-                write_results(resolved_out, results)
+            if resume and needs_compaction:
+                write_results(resolved_out, [*retained_other, *results])
             write_sidecar(config, resolved_out)
 
         return RunOutcome(

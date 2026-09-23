@@ -15,6 +15,7 @@ Lexical, dense embedding, and hybrid retrieval scorers for skill selection model
         - DenseScorer
         - directional_projection
         - HybridScorer
+        - OverlapQuadrant
         - Scorer
         - skill_text
         - TextScorer

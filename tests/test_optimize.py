@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -33,9 +33,11 @@ from reach.optimize import (
     IterationRecord,
     OptimizationCandidate,
     OptimizationReport,
+    ReciprocalHandoff,
     _evaluate_all_candidates,
     _run_candidate_probes,
     _synthesize_via_heuristics,
+    apply_optimization_candidate,
     build_optimization_prompt,
     evaluate_candidate,
     filter_candidates,
@@ -1401,6 +1403,7 @@ def test_multi_round_deduplicates_identical_descriptions(
             skill_name="dedup-tool",
             skills_path=tmp_path,
             queries_path=query_file,
+            agent="fake",
             settings=OptimizeSettings(iterations=3, auto_queries=False),
         )
 
@@ -1452,6 +1455,7 @@ def test_multi_round_prefers_later_round_on_score_tie(
             skill_name="tie-tool",
             skills_path=tmp_path,
             queries_path=query_file,
+            agent="fake",
             settings=OptimizeSettings(iterations=2, auto_queries=False),
         )
 
@@ -1909,24 +1913,454 @@ def test_filter_candidates_rejects_unknown_skill_references() -> None:
     candidates = [
         OptimizationCandidate(
             description=(
-                "Monitors BigQuery operational telemetry and slot utilization. "
-                "Don't use for root-cause troubleshooting (use `bigquery-troubleshooting` first)."
+                "Monitors system operational telemetry and metrics. "
+                "Don't use for root-cause troubleshooting (use `metrics-troubleshooting` first)."
             ),
             origin=CandidateOrigin.LLM,
         ),
         OptimizationCandidate(
             description=(
-                "Monitors BigQuery operational telemetry and slot utilization. "
-                "Don't use for slot cost optimization (use `bigquery-slot-cost-optimizer`)."
+                "Monitors system operational telemetry and metrics. "
+                "Don't use for cost optimization (use `metrics-analyzer`)."
             ),
             origin=CandidateOrigin.LLM,
         ),
     ]
     filtered = filter_candidates(
         candidates,
-        skill_name="bigquery-observability",
-        known_skills={"bigquery-observability", "bigquery-slot-cost-optimizer"},
+        skill_name="metrics-collector",
+        known_skills={"metrics-collector", "metrics-analyzer"},
     )
     assert filtered[0].lint_clean is False
-    assert "bigquery-troubleshooting" in (filtered[0].filter_reason or "")
+    assert "metrics-troubleshooting" in (filtered[0].filter_reason or "")
     assert filtered[1].lint_clean is True
+
+
+# ===========================================================================
+# 15. Reliability, Concurrency, Rival Interleaving & Layer-2 Reciprocal Handoffs
+# ===========================================================================
+
+
+def test_pydantic_unit_and_delta_metric_rounding_and_bounds() -> None:
+    """Verify UnitMetric and DeltaMetric round floats via AfterValidator and enforce bounds."""
+    cand = OptimizationCandidate(
+        description="Valid candidate description for testing metric rounding.",
+        recall=0.3333333,
+        trajectory_recall=1.0000000002,
+        delta_recall=0.6666666,
+        delta_trajectory_recall=-0.3333333,
+        test_recall=0.8888888,
+        test_trajectory_recall=0.9999999,
+    )
+    assert cand.recall == 0.3333
+    assert cand.trajectory_recall == 1.0
+    assert cand.delta_recall == 0.6667
+    assert cand.delta_trajectory_recall == -0.3333
+    assert cand.test_recall == 0.8889
+    assert cand.test_trajectory_recall == 1.0
+
+    with pytest.raises(ValidationError):
+        OptimizationCandidate(
+            description="Invalid metric candidate.",
+            trajectory_recall=1.5,
+        )
+
+
+def test_resolve_runtime_settings_forwards_toml_runtime_options(tmp_path: Path) -> None:
+    """Verify _resolve_runtime_settings merges [runtime.options] from reach.toml with overrides."""
+    from reach.optimize import _resolve_runtime_settings, _setup_driver, _setup_runtime
+
+    cfg_file = tmp_path / "custom_reach.toml"
+    cfg_file.write_text(
+        '[runtime]\nagent = "antigravity-sdk"\n\n'
+        '[runtime.options]\nvertex = true\nproject = "test-cloud-project-123"\n',
+        encoding="utf-8",
+    )
+
+    resolved = _resolve_runtime_settings(
+        agent="antigravity-sdk",
+        runtime_options={"location": "us-central1"},
+        config=cfg_file,
+    )
+    assert resolved.agent == "antigravity-sdk"
+    assert resolved.options["vertex"] is True
+    assert resolved.options["project"] == "test-cloud-project-123"
+    assert resolved.options["location"] == "us-central1"
+
+    with (
+        patch("reach.optimize.build_text_generator") as mock_gen,
+        patch("reach.optimize.build_runtime") as mock_rt,
+    ):
+        _setup_driver(
+            "antigravity-sdk",
+            runtime_options={"location": "us-central1"},
+            config=cfg_file,
+        )
+        assert mock_gen.call_args.kwargs["options"]["vertex"] is True
+        assert mock_gen.call_args.kwargs["options"]["project"] == "test-cloud-project-123"
+        assert mock_gen.call_args.kwargs["options"]["location"] == "us-central1"
+
+        _setup_runtime(
+            "antigravity-sdk",
+            runtime_options={"location": "us-central1"},
+            config=cfg_file,
+        )
+        rt_settings = mock_rt.call_args.args[0]
+        assert rt_settings.options["vertex"] is True
+        assert rt_settings.options["project"] == "test-cloud-project-123"
+        assert rt_settings.options["location"] == "us-central1"
+
+
+def test_run_candidate_probes_batches_workers_and_tracks_trajectory_recall(
+    tmp_path: Path,
+) -> None:
+    """Verify _run_candidate_probes batches probes across workers and scores trajectory hits."""
+    from reach.models import CatalogMode, ProbeResult
+
+    queries = [
+        Query(id="q1", text="query 1", expected_skill="metrics-collector"),
+        Query(id="q2", text="query 2", expected_skill="metrics-collector"),
+    ]
+    mock_runtime = MagicMock()
+    batch_calls: list[tuple[int, int]] = []
+
+    class FakeBatchHarness:
+        def __init__(self, runtime: Any, workers: int = 1, **_kwargs: Any) -> None:
+            self.workers = workers
+
+        def run_probes(
+            self,
+            probe_queries: Sequence[Query],
+            *_args: Any,
+            **_kwargs: Any,
+        ) -> list[ProbeResult]:
+            batch_calls.append((self.workers, len(probe_queries)))
+            return [
+                # q1: Direct entrypoint hit
+                ProbeResult(
+                    query_id="q1",
+                    catalog_id="opt-catalog",
+                    catalog_mode=CatalogMode.ALL,
+                    catalog_size=2,
+                    model="fake",
+                    runtime="fake",
+                    attempt=1,
+                    invoked_skills=("metrics-collector",),
+                ),
+                # q2: Initial misroute to rival, recovered via Layer-2 handoff in trajectory!
+                ProbeResult(
+                    query_id="q2",
+                    catalog_id="opt-catalog",
+                    catalog_mode=CatalogMode.ALL,
+                    catalog_size=2,
+                    model="fake",
+                    runtime="fake",
+                    attempt=1,
+                    invoked_skills=("metrics-analyzer", "metrics-collector"),
+                ),
+            ]
+
+    with patch("reach.run.ProbeHarness", FakeBatchHarness):
+        tally = _run_candidate_probes(
+            runtime=mock_runtime,
+            queries_to_run=queries,
+            target_name="metrics-collector",
+            workdir=tmp_path,
+            workers=4,
+        )
+
+    assert batch_calls == [(4, 2)]
+    assert tally.recall == 0.5
+    assert tally.trajectory_recall == 1.0
+    assert tally.misroute_rate == 0.5
+
+
+def test_load_optimization_queries_retains_and_interleaves_primary_rival(
+    tmp_path: Path,
+) -> None:
+    """Verify _load_optimization_queries includes primary rival queries and interleaves them."""
+    from reach.optimize import _load_optimization_queries
+    from reach.queries import save_query_set
+
+    target = Skill(
+        name="metrics-collector",
+        description="Target desc.",
+        path=tmp_path / "metrics-collector",
+    )
+    rival = Skill(
+        name="metrics-analyzer",
+        description="Rival desc.",
+        path=tmp_path / "metrics-analyzer",
+    )
+    qs = QuerySet(
+        catalog_id="cloud",
+        provenance=QuerySetProvenance(origin=Origin.AUTHORED),
+        queries=(
+            Query(id="pos-1", text="pos 1", expected_skill=target.name),
+            Query(id="pos-2", text="pos 2", expected_skill=target.name),
+            Query(id="riv-1", text="riv 1", expected_skill=rival.name),
+            Query(id="riv-2", text="riv 2", expected_skill=rival.name),
+            Query(id="other-1", text="other 1", expected_skill="network-helper"),
+        ),
+    )
+    qfile = tmp_path / "queries.json"
+    save_query_set(qs, qfile)
+
+    loaded = _load_optimization_queries(
+        qfile,
+        target.name,
+        rival_skills=[rival],
+        adversarial_count=2,
+    )
+    assert len(loaded) == 4
+    assert {q.expected_skill for q in loaded} == {target.name, rival.name}
+    # Verify interleaving so even budget=2 tests 1 positive + 1 primary rival query
+    assert loaded[0].expected_skill == target.name
+    assert loaded[1].expected_skill == rival.name
+
+
+def test_reciprocal_handoff_upsert_staging_and_apply(
+    write_skill: Callable[..., Path],
+    tmp_path: Path,
+) -> None:
+    """Verify ReciprocalHandoff idempotent body insertion, staging, and apply."""
+    from reach.optimize import (
+        apply_optimization_candidate,
+        build_reciprocal_handoff,
+        upsert_skill_routing_note,
+    )
+
+    target_dir = write_skill(
+        name="metrics-collector",
+        description="Old target description.",
+        body="# Metrics Collector\n\nCollect system metrics and traces.\n",
+    )
+    rival_dir = write_skill(
+        name="metrics-analyzer",
+        description="Rival analyzer description.",
+        body="# Metrics Analyzer\n\nAnalyze performance metrics and bottlenecks.\n",
+    )
+    target = Skill(
+        name="metrics-collector",
+        description="Old target description.",
+        path=target_dir,
+    )
+    rival = Skill(
+        name="metrics-analyzer",
+        description="Rival analyzer description.",
+        path=rival_dir,
+    )
+
+    handoff = build_reciprocal_handoff(
+        target=target,
+        rival=rival,
+        ceded_terms=("bottlenecks", "analysis"),
+        unclaimed_terms=("traces", "collector"),
+    )
+    assert handoff.target_skill == "metrics-collector"
+    assert handoff.rival_skill == "metrics-analyzer"
+    assert "metrics-analyzer" in handoff.target_note
+    assert "metrics-collector" in handoff.rival_note
+
+    # Idempotent upsert right after # Heading
+    target_md = target_dir / "SKILL.md"
+    assert upsert_skill_routing_note(target_md, rival.name, handoff.target_note) is True
+    assert upsert_skill_routing_note(target_md, rival.name, handoff.target_note) is True
+    text_after = target_md.read_text(encoding="utf-8")
+    assert text_after.count("> **Routing Note:**") == 1
+    assert "# Metrics Collector\n\n> **Routing Note:**" in text_after
+
+    # Verify evaluate_candidate stages both target and rival with Routing Notes
+    installed_bodies: dict[str, str] = {}
+
+    class InspectingRuntime(FakeRuntime):
+        def install(
+            self,
+            catalog: Any,
+            skills: Iterable[Skill],
+            workdir: Path,
+        ) -> Path:
+            for s in skills:
+                md = s.path / "SKILL.md"
+                if md.is_file():
+                    installed_bodies[s.name] = md.read_text(encoding="utf-8")
+            return super().install(catalog, skills, workdir)
+
+    with patch("reach.optimize._setup_runtime", return_value=InspectingRuntime()):
+        cand = OptimizationCandidate(description="Updated telemetry guidance for collection.")
+        evaluate_candidate(
+            candidate=cand,
+            target=target,
+            rivals=[rival],
+            queries=[Query(id="q1", text="test", expected_skill=target.name)],
+            budget=1,
+            handoff=handoff,
+        )
+
+    assert "> **Routing Note:**" in installed_bodies["metrics-collector"]
+    assert "metrics-analyzer" in installed_bodies["metrics-collector"]
+    assert "> **Routing Note:**" in installed_bodies["metrics-analyzer"]
+    assert "metrics-collector" in installed_bodies["metrics-analyzer"]
+
+    # Verify apply_optimization_candidate updates both target and rival SKILL.md on disk
+    report = OptimizationReport(
+        skill_name=target.name,
+        manifest_path=target_md,
+        baseline_description=target.description,
+        rival_name=rival.name,
+        candidates=(cand,),
+        handoff=handoff,
+    )
+    assert apply_optimization_candidate(report, cand) is True
+    assert "Updated telemetry guidance" in target_md.read_text(encoding="utf-8")
+    assert "> **Routing Note:**" in (rival_dir / "SKILL.md").read_text(encoding="utf-8")
+
+    # Verify render_optimization_diff still renders full routing-note diffs even AFTER apply!
+    from reach.views.optimize import render_optimization_diff
+
+    diff_after_apply = render_optimization_diff(report, candidate_index=1)
+    assert "+> **Routing Note:**" in diff_after_apply
+    assert f"a/{target.name}/SKILL.md" in diff_after_apply
+    assert f"a/{rival.name}/SKILL.md" in diff_after_apply
+
+    # Verify apply_optimization_candidate returns False if rival manifest is missing/unwritable
+    missing_rival_handoff = handoff.model_copy(
+        update={"rival_manifest_path": tmp_path / "nonexistent-dir" / "SKILL.md"}
+    )
+    bad_report = report.model_copy(update={"handoff": missing_rival_handoff})
+    assert apply_optimization_candidate(bad_report, cand) is False
+
+
+def test_baseline_evaluation_populates_trajectory_hits_by_id_for_paired_deltas(
+    write_skill: Callable[..., Path],
+    tmp_path: Path,
+) -> None:
+    """Verify _evaluate_baseline_performance populates trajectory_hits_by_id for paired deltas."""
+    from reach.optimize import _evaluate_baseline_performance
+
+    target_dir = write_skill(name="metrics-collector", description="Target desc.")
+    target = Skill(name="metrics-collector", description="Target desc.", path=target_dir)
+    queries = [
+        Query(id="q1", text="query 1", expected_skill=target.name),
+        Query(id="q2", text="query 2", expected_skill=target.name),
+    ]
+
+    mock_eval_base = OptimizationCandidate(
+        description=target.description,
+        recall=0.5,
+        trajectory_recall=1.0,
+        accuracy=0.5,
+        misroute_rate=0.5,
+        failed_queries=("query 2",),
+        failed_trajectory_queries=(),
+    )
+    with patch("reach.optimize.evaluate_candidate", return_value=mock_eval_base):
+        base = _evaluate_baseline_performance(
+            target_skill=target,
+            rival_skills=[],
+            all_skills=[target],
+            train_queries=queries,
+            agent="fake",
+            config=None,
+        )
+
+    assert base.hits_by_id == {"q1": True, "q2": False}
+    assert base.trajectory_hits_by_id == {"q1": True, "q2": True}
+
+
+def test_apply_optimization_candidate_rolls_back_target_on_rival_failure(
+    tmp_path: Path,
+) -> None:
+    """Verify apply_optimization_candidate rolls back target modification if rival write fails."""
+    target_dir = tmp_path / "target-skill"
+    target_dir.mkdir()
+    target_manifest = target_dir / "SKILL.md"
+    orig_content = "---\nname: target-skill\ndescription: Original desc.\n---\n# Target\nBody\n"
+    target_manifest.write_text(orig_content, encoding="utf-8")
+
+    # 1. Preflight check: missing rival manifest prevents modification
+    rival_manifest = tmp_path / "rival-skill" / "SKILL.md"
+    handoff = ReciprocalHandoff(
+        target_skill="target-skill",
+        rival_skill="rival-skill",
+        target_note="> **Routing Note:** Use rival.",
+        rival_note="> **Routing Note:** Use target.",
+        target_manifest_path=target_manifest,
+        rival_manifest_path=rival_manifest,
+        target_body_before="# Target\nBody\n",
+        rival_body_before="# Rival\nBody\n",
+    )
+    report = OptimizationReport(
+        skill_name="target-skill",
+        baseline_description="Original desc.",
+        manifest_path=target_manifest,
+        handoff=handoff,
+    )
+    cand = OptimizationCandidate(description="New candidate desc.")
+
+    # Preflight fails because rival_manifest does not exist yet
+    assert not apply_optimization_candidate(report, cand)
+    assert target_manifest.read_text(encoding="utf-8") == orig_content
+
+    # 2. Mid-write rollback: rival manifest exists, but upsert fails
+    rival_manifest.parent.mkdir(parents=True)
+    rival_manifest.write_text("# Rival\nBody\n", encoding="utf-8")
+    with patch("reach.optimize.upsert_skill_routing_note", return_value=False):
+        assert not apply_optimization_candidate(report, cand)
+    # Target manifest must be rolled back to original content
+    assert target_manifest.read_text(encoding="utf-8") == orig_content
+
+
+def test_candidate_rank_key_test_trajectory_recall_sentinel() -> None:
+    """Verify _candidate_rank_key sets test_trajectory_recall to -1.0 when None, not test_recall."""
+    from reach.optimize import _candidate_rank_key
+
+    cand_with_traj = OptimizationCandidate(
+        description="With trajectory",
+        recall=0.8,
+        test_recall=0.8,
+        test_trajectory_recall=0.9,
+    )
+    cand_without_traj = OptimizationCandidate(
+        description="Without trajectory",
+        recall=0.8,
+        test_recall=0.8,
+        test_trajectory_recall=None,
+    )
+
+    key_with = _candidate_rank_key(cand_with_traj, has_test=True)
+    key_without = _candidate_rank_key(cand_without_traj, has_test=True)
+
+    # key_with has 0.9 as second element
+    assert key_with[0] == 0.8
+    assert key_with[1] == 0.9
+
+    # key_without must have -1.0 as second element, NOT 0.8
+    assert key_without[0] == 0.8
+    assert key_without[1] == -1.0
+    assert key_with > key_without
+
+
+def test_compute_paired_delta_clamps_extreme_bounds() -> None:
+    """Verify _compute_paired_delta clamps values strictly to [-1.0, 1.0]."""
+    from reach.optimize import _compute_paired_delta
+
+    # candidate_metric far exceeding 1.0
+    clamped_high = _compute_paired_delta(
+        candidate_metric=2.5,
+        fallback_baseline=0.0,
+        baseline_hits_by_id=None,
+        queries_to_run=[],
+        target_name="test",
+    )
+    assert clamped_high == 1.0
+
+    # candidate_metric negative
+    clamped_low = _compute_paired_delta(
+        candidate_metric=-2.5,
+        fallback_baseline=1.0,
+        baseline_hits_by_id=None,
+        queries_to_run=[],
+        target_name="test",
+    )
+    assert clamped_low == -1.0

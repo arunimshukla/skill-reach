@@ -143,7 +143,9 @@ def parse_session_entries(
     resolved_model = ""
     assistant_turns = 0
 
+    has_entries = False
     for entry in entries:
+        has_entries = True
         msg = entry.get("message")
         if not isinstance(msg, dict) or msg.get("role") != "assistant":
             continue
@@ -167,7 +169,7 @@ def parse_session_entries(
         observed_tools=tuple(observed_tools),
         cost_usd=cost_usd,
         resolved_model=resolved_model,
-        status=SessionStatus.SUCCESS if entries else None,
+        status=SessionStatus.SUCCESS if has_entries else None,
         error=None,
     )
 

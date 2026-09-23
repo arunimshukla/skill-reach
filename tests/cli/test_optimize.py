@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING
 from unittest.mock import patch
 
 from reach.cli import main
-from reach.optimize import OptimizationCandidate
+from reach.optimize import OptimizationCandidate, OptimizationReport
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -810,3 +810,151 @@ def test_optimize_safety_notice_displays_inferred_catalog_count(
     captured = capsys.readouterr()
     output = captured.err + captured.out
     assert "Target Catalog: 2 skills" in output
+
+
+def test_optimize_yes_skips_interactive_apply_prompt_in_tty(
+    write_skill: Callable[..., Path],
+    tmp_path: Path,
+) -> None:
+    """Verify --yes skips _prompt_interactive_apply even when stdin/stdout are TTYs."""
+    write_skill(name="yes-tool", description="Initial description.")
+    with (
+        patch("sys.stdin.isatty", return_value=True),
+        patch("sys.stdout.isatty", return_value=True),
+        patch("reach.cli.optimize._prompt_interactive_apply") as mock_prompt,
+    ):
+        ret = main(
+            [
+                "optimize",
+                "yes-tool",
+                "--skills",
+                str(tmp_path),
+                "--agent",
+                "fake",
+                "--yes",
+            ]
+        )
+        assert ret == 0
+        mock_prompt.assert_not_called()
+
+
+def test_optimize_non_tty_emits_progress_lines_to_stderr(
+    write_skill: Callable[..., Path],
+    write_queries: Callable[..., Path],
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Verify reach optimize emits phase progress lines to stderr when stderr is not a TTY."""
+    write_skill(name="prog-tool", description="Initial description.")
+    qfile = write_queries(target="prog-tool", count=2)
+    with patch("sys.stderr.isatty", return_value=False):
+        ret = main(
+            [
+                "optimize",
+                "prog-tool",
+                "--skills",
+                str(tmp_path),
+                "--queries",
+                str(qfile),
+                "--agent",
+                "fake",
+                "--budget",
+                "4",
+            ]
+        )
+    assert ret == 0
+    captured = capsys.readouterr()
+    assert "[reach optimize]" in captured.err
+
+
+def test_optimize_with_handoff_cli_diff_and_auto_apply(
+    write_skill: Callable[..., Path],
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Verify --with-handoff renders target+rival diffs and patches both SKILL.md files."""
+    target_dir = write_skill(
+        name="metrics-collector",
+        description="Provides query bottlenecks and telemetry collection.",
+        body="# Metrics Collector\n\nUse region qualifier lookups in metric schemas.\n",
+    )
+    rival_dir = write_skill(
+        name="metrics-analyzer",
+        description="Analyzes query bottlenecks and cost optimization.",
+        body="# Metrics Analyzer\n\nFix query plan bottlenecks and contention.\n",
+    )
+    ret_diff = main(
+        [
+            "optimize",
+            "metrics-collector",
+            "--skills",
+            str(tmp_path),
+            "--agent",
+            "fake",
+            "--with-handoff",
+            "--format",
+            "diff",
+        ]
+    )
+    assert ret_diff == 0
+    diff_out = capsys.readouterr().out
+    assert "a/metrics-collector/SKILL.md" in diff_out
+    assert "a/metrics-analyzer/SKILL.md" in diff_out
+    assert "> **Routing Note:**" in diff_out
+
+    ret_apply = main(
+        [
+            "optimize",
+            "metrics-collector",
+            "--skills",
+            str(tmp_path),
+            "--agent",
+            "fake",
+            "--with-handoff",
+            "--auto-apply",
+            "--force",
+            "--yes",
+        ]
+    )
+    assert ret_apply == 0
+    assert "> **Routing Note:**" in (target_dir / "SKILL.md").read_text(encoding="utf-8")
+    assert "> **Routing Note:**" in (rival_dir / "SKILL.md").read_text(encoding="utf-8")
+
+
+def test_optimize_short_flag_jobs_for_workers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify that -j short flag sets worker count for empirical probes."""
+    target_dir = tmp_path / "sample-target"
+    target_dir.mkdir(parents=True)
+    (target_dir / "SKILL.md").write_text(
+        "---\nname: sample-target\ndescription: Target skill description.\n---\n# Sample\nBody\n",
+        encoding="utf-8",
+    )
+    observed_workers: list[int] = []
+
+    def mock_optimize_skill(*args: object, **kwargs: object) -> OptimizationReport:
+        settings = kwargs.get("settings")
+        observed_workers.append(getattr(settings, "workers", 0))
+        return OptimizationReport(
+            skill_name="sample-target",
+            baseline_description="Target skill description.",
+        )
+
+    monkeypatch.setattr("reach.optimize.optimize_skill", mock_optimize_skill)
+    ret = main(
+        [
+            "optimize",
+            "sample-target",
+            "--skills",
+            str(tmp_path),
+            "--agent",
+            "fake",
+            "-j",
+            "3",
+            "--yes",
+        ]
+    )
+    assert ret == 0
+    assert observed_workers == [3]

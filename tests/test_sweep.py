@@ -1143,3 +1143,346 @@ def test_render_ascii_curve_single_bullet_per_column_on_midpoint_boundaries() ->
     level_rows = [line.split("|", 1)[1] for line in lines if "|" in line]
     total_bullets = sum(row.count("●") for row in level_rows)
     assert total_bullets == len(points)
+
+
+def test_resolve_anchor_and_target_skills_fuzzy_suggestions(tmp_path: Path) -> None:
+    """Verify missing --anchor and --target skill names include fuzzy close-match hints."""
+    skills = [
+        Skill(
+            name="cloud-logging-configuration-basics",
+            description="Configure logging sinks and buckets",
+            path=tmp_path / "s1",
+        ),
+        Skill(
+            name="cloud-logging-cross-project-configuration",
+            description="Route cross-project logs",
+            path=tmp_path / "s2",
+        ),
+        Skill(
+            name="gke-cluster-autoscaling",
+            description="Autoscale GKE node pools",
+            path=tmp_path / "s3",
+        ),
+    ]
+    qs = QuerySet(
+        catalog_id="all",
+        queries=(
+            Query(
+                id="q1",
+                text="configure sink",
+                kind=QueryKind.IMPLICIT,
+                expected_skill="cloud-logging-configuration-basics",
+            ),
+        ),
+        provenance=QuerySetProvenance(origin=Origin.AUTHORED),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            r"anchor skill\(s\) not found in corpus: cloud-logging-sinks\. "
+            r"Did you mean: .*cloud-logging-configuration-basics"
+        ),
+    ):
+        run_scaling_sweep(
+            skills=skills,
+            query_set=qs,
+            scales=(2, 3),
+            anchor="cloud-logging-sinks",
+        )
+
+    with pytest.raises(
+        (ValueError, KeyError),
+        match=(
+            r"target skill 'cloud-logging-sinks' not found in loaded skills\. "
+            r"Did you mean: .*cloud-logging-configuration-basics"
+        ),
+    ):
+        run_scaling_sweep(
+            skills=skills,
+            query_set=qs,
+            scales=(2, 3),
+            target_skill="cloud-logging-sinks",
+        )
+
+
+@pytest.mark.parametrize(
+    ("base_workers", "scale", "ref_scale", "expected"),
+    [
+        (1, 128, 25, 1),
+        (16, 12, 25, 16),
+        (16, 25, 25, 16),
+        (16, 50, 25, 8),
+        (16, 90, 25, 4),
+        (16, 128, 25, 3),
+    ],
+)
+def test_scale_adaptive_workers_tapers_concurrency(
+    base_workers: int,
+    scale: int,
+    ref_scale: int,
+    expected: int,
+) -> None:
+    """Verify _scale_adaptive_workers tapers worker concurrency linearly with catalog size K."""
+    from reach.sweep import _scale_adaptive_workers
+
+    assert _scale_adaptive_workers(base_workers, scale, reference_scale=ref_scale) == expected
+
+
+def test_run_scaling_sweep_invokes_on_scale_complete_and_tapers_workers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify run_scaling_sweep invokes on_scale_complete after each step and tapers workers."""
+    import reach.sweep as sweep_mod
+
+    skills = [
+        Skill(name=f"skill-{i:02d}", description=f"Skill {i} description", path=tmp_path / f"s{i}")
+        for i in range(60)
+    ]
+    qs = QuerySet(
+        catalog_id="in-memory",
+        queries=(
+            Query(id="q0", text="run skill 0", kind=QueryKind.IMPLICIT, expected_skill="skill-00"),
+        ),
+        provenance=QuerySetProvenance(origin=Origin.AUTHORED),
+    )
+    runtime = FakeRuntime({"run skill 0": "skill-00"}, model="mock-model", materialize=False)
+
+    observed_workers: list[tuple[int, int]] = []
+    orig_conduct = sweep_mod.conduct
+
+    def spy_conduct(*args, **kwargs):
+        composed = kwargs["composed"]
+        observed_workers.append((len(composed.catalog.skills), kwargs["workers"]))
+        return orig_conduct(*args, **kwargs)
+
+    monkeypatch.setattr(sweep_mod, "conduct", spy_conduct)
+
+    callbacks: list[tuple[int, int, int, int]] = []
+
+    def on_step(step: int, total: int, point: ScalingPoint, partial: ScalingStudy) -> None:
+        callbacks.append((step, total, point.scale, len(partial.points)))
+
+    out_file = tmp_path / ".reach" / "sweep.json"
+    cfg = RunConfig(study=StudySettings(out=out_file))
+
+    study = run_scaling_sweep(
+        config=cfg,
+        skills=skills,
+        query_set=qs,
+        target_skill="skill-00",
+        scales=(12, 25, 50),
+        workers=16,
+        runtime=runtime,
+        on_scale_complete=on_step,
+    )
+
+    assert len(study.points) == 4  # 12, 25, 50, 60 (clamped corpus max)
+    assert callbacks == [
+        (1, 4, 12, 1),
+        (2, 4, 25, 2),
+        (3, 4, 50, 3),
+        (4, 4, 60, 4),
+    ]
+    assert observed_workers == [
+        (12, 16),
+        (25, 16),
+        (50, 8),
+        (60, 7),
+    ]
+
+    # Verify interrupted sweep preserves intermediate .jsonl files in temp workdir
+    interrupted_workdirs: list[Path] = []
+
+    def fail_on_second_step(
+        step: int, total: int, point: ScalingPoint, partial: ScalingStudy
+    ) -> None:
+        if step == 2:
+            err_msg = "Simulated mid-sweep interruption"
+            raise RuntimeError(err_msg)
+
+    def capture_workdir(*args, **kwargs):
+        cfg_arg = kwargs["config"]
+        interrupted_workdirs.append(cfg_arg.study.workdir)
+        return orig_conduct(*args, **kwargs)
+
+    monkeypatch.setattr(sweep_mod, "conduct", capture_workdir)
+    with pytest.raises(RuntimeError, match="Simulated mid-sweep interruption"):
+        run_scaling_sweep(
+            skills=skills,
+            query_set=qs,
+            target_skill="skill-00",
+            scales=(12, 25, 50),
+            runtime=runtime,
+            on_scale_complete=fail_on_second_step,
+        )
+    assert interrupted_workdirs
+    assert interrupted_workdirs[0].is_dir()
+    assert list(interrupted_workdirs[0].glob("sweep_*.jsonl"))
+    import shutil
+
+    shutil.rmtree(interrupted_workdirs[0], ignore_errors=True)
+
+
+def test_sweep_scores_two_turn_mutual_handoff_as_true_positive_and_records_entrypoint() -> None:
+    """Verify 2-turn mutual handoff (mixed_oracle) and acceptable_skills score as TP in sweep."""
+    from reach.models import CatalogMode, InvocationPattern, ProbeResult
+    from reach.sweep import _build_scaling_point
+
+    queries = (
+        Query(
+            id="q-handoff",
+            text="harden GKE cluster security posture",
+            expected_skill="gke-platform-security",
+            kind=QueryKind.IMPLICIT,
+        ),
+        Query(
+            id="q-acceptable",
+            text="deploy agent endpoint on Vertex",
+            expected_skill="agent-platform-deploy",
+            acceptable_skills=("gcloud",),
+            kind=QueryKind.IMPLICIT,
+        ),
+    )
+    qs = QuerySet(
+        catalog_id="sweep:corpus:128",
+        queries=queries,
+        provenance=QuerySetProvenance(origin=Origin.AUTHORED),
+    )
+    baseline_results = (
+        ProbeResult(
+            query_id="q-handoff",
+            catalog_id="sweep:corpus:12",
+            invoked_skills=("gke-platform-security",),
+            invocation_pattern=InvocationPattern.ORACLE_ONLY,
+            turns_taken=1,
+            catalog_mode=CatalogMode.SWEEP,
+            catalog_size=12,
+            model="gemini-3.8-flash",
+            runtime="antigravity-sdk",
+        ),
+        ProbeResult(
+            query_id="q-acceptable",
+            catalog_id="sweep:corpus:12",
+            invoked_skills=("agent-platform-deploy",),
+            invocation_pattern=InvocationPattern.ORACLE_ONLY,
+            turns_taken=1,
+            catalog_mode=CatalogMode.SWEEP,
+            catalog_size=12,
+            model="gemini-3.8-flash",
+            runtime="antigravity-sdk",
+        ),
+    )
+    scaled_results = (
+        ProbeResult(
+            query_id="q-handoff",
+            catalog_id="sweep:corpus:128",
+            invoked_skills=("gke-basics", "gke-platform-security"),
+            invocation_pattern=InvocationPattern.MIXED_ORACLE,
+            turns_taken=2,
+            catalog_mode=CatalogMode.SWEEP,
+            catalog_size=128,
+            model="gemini-3.8-flash",
+            runtime="antigravity-sdk",
+        ),
+        ProbeResult(
+            query_id="q-acceptable",
+            catalog_id="sweep:corpus:128",
+            invoked_skills=("gcloud", "agent-platform-deploy"),
+            invocation_pattern=InvocationPattern.ORACLE_ONLY,
+            turns_taken=2,
+            catalog_mode=CatalogMode.SWEEP,
+            catalog_size=128,
+            model="gemini-3.8-flash",
+            runtime="antigravity-sdk",
+        ),
+    )
+
+    point, decomp = _build_scaling_point(
+        scale=128,
+        catalog_id="sweep:corpus:128",
+        results=scaled_results,
+        resolved_query_set=qs,
+        baseline_results=baseline_results,
+        installed_skills={
+            "gke-basics",
+            "gke-platform-security",
+            "gcloud",
+            "agent-platform-deploy",
+        },
+        target_skill=None,
+    )
+
+    assert point.pass_rate == 1.0
+    assert point.recall == 1.0
+    assert point.precision == 1.0
+    assert point.f1_score == 1.0
+    assert point.delta_vs_baseline == 0.0
+    assert decomp is not None
+    assert decomp.delta_total == 0.0
+    # Turn-1 entrypoint metrics reflect that q-handoff needed 2 turns
+    # while q-acceptable used neutral gcloud first
+    assert point.entrypoint_pass_rate == 0.5
+    assert point.entrypoint_f1_score == 0.5
+
+
+def test_run_scaling_sweep_invalidates_workdir_cache_on_anchor_or_skill_edit(
+    tmp_path: Path,
+) -> None:
+    """Verify persistent workdir sweep_*.jsonl cache invalidates on anchor or SKILL.md change."""
+    from reach.catalog import load_skills
+    from reach.config import RunConfig, StudySettings
+
+    skills_dir = tmp_path / "corpus"
+    _create_mock_skills(skills_dir, 4)
+    skills_v1 = load_skills(skills_dir)
+    qs = QuerySet(
+        catalog_id="corpus",
+        queries=tuple(
+            Query(
+                id=f"q-{idx}",
+                text=f"query for skill-{idx:02d}",
+                kind=QueryKind.IMPLICIT,
+                expected_skill=f"skill-{idx:02d}",
+            )
+            for idx in range(4)
+        ),
+        provenance=QuerySetProvenance(origin=Origin.AUTHORED),
+    )
+
+    workdir = tmp_path / "persistent_wd"
+    cfg = RunConfig(study=StudySettings(workdir=workdir))
+    answers = {f"query for skill-{idx:02d}": f"skill-{idx:02d}" for idx in range(4)}
+
+    def _probe_count(anchor: str, corpus: list[Skill]) -> int:
+        rt = FakeRuntime(answers, model="mock-model", materialize=False)
+        study = run_scaling_sweep(
+            skills=corpus,
+            query_set=qs,
+            scales=(2, 4),
+            anchor=anchor,
+            attempts=1,
+            runtime=rt,
+            config=cfg,
+        )
+        assert study.points[0].scale == 2
+        return len(rt.queries)
+
+    # Initial run for anchor="skill-00" executes 2 probes (K=2 and K=4)
+    assert _probe_count("skill-00", skills_v1) == 2
+
+    # 1. Change --anchor to "skill-00,skill-03": K=2 catalog changed, so both q-0 and q-3 run at K=2
+    #    (2 probes) while at K=4 q-0 reuses K=4 and q-3 runs (1 probe) -> 3 probes total
+    assert _probe_count("skill-00,skill-03", skills_v1) == 3
+
+    # 2. Switching back to anchor="skill-00" reuses preserved K=2 and K=4 rows on disk (0 probes)
+    assert _probe_count("skill-00", skills_v1) == 0
+
+    # 3. Editing SKILL.md changes corpus_digest and invalidates all cached rows (4 probes)
+    (skills_dir / "skill-03" / "SKILL.md").write_text(
+        "---\nname: skill-03\ndescription: Updated Desc 3\n---\nUpdated Body 3\n",
+        encoding="utf-8",
+    )
+    skills_v2 = load_skills(skills_dir)
+    assert _probe_count("skill-00,skill-03", skills_v2) == 4

@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Self
 
 from pydantic import (
+    AliasChoices,
     BaseModel,
     ConfigDict,
     Field,
@@ -146,7 +147,10 @@ class Query(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     id: str = Field(description="Unique identifier for the evaluation query.")
-    text: str = Field(description="Realistic user request text presented to the agent.")
+    text: str = Field(
+        validation_alias=AliasChoices("text", "query"),
+        description="Realistic user request text presented to the agent.",
+    )
     kind: QueryKind | None = Field(
         default=None,
         description="Structural category of query (implicit, contextual, negative, out of scope).",

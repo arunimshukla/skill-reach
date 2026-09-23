@@ -111,7 +111,7 @@ missing-mutual-handoff = "warn"
 missing-name = "error"
 name-mismatch = "error"
 reserved-name-collision = "warn"
-unknown-skill-reference = "error"
+unknown-skill-reference = "warn"
 unresolved-declared-dependency = "warn"
 unresolved-placeholder = "warn"
 unbounded-attractor = "warn"
@@ -423,6 +423,8 @@ Parameters for closed-loop skill description optimization.
 | `positive_count`    | Integer | `5`     | Number of positive in-scope trigger queries to synthesize per round.          |
 | `seed`              | Integer | `42`    | Pseudo-random seed for train/test query splitting and reproducible runs.      |
 | `review_timeout`    | Float   | `600.0` | Maximum timeout in seconds waiting for interactive browser query review.      |
+| `workers`           | Integer | `4`     | Number of parallel probe workers (inherits from `[plan].workers` if unset).   |
+| `with_handoff`      | Boolean | `false` | Synthesize and stage reciprocal Layer-2 `SKILL.md` Routing Notes.             |
 
 ### `[registry]`
 
