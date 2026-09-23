@@ -599,10 +599,12 @@ class AntigravitySdkRuntime(_AntigravitySdkConfigMixin, AntigravityRuntime):
 
         skills_paths = [str(self.skills_dir(workdir))]
         if self.options.use_symlinks and (skills_dir := self.skills_dir(workdir)).is_dir():
-            resolved_parents = {
-                str(child.resolve().parent) for child in skills_dir.iterdir() if child.is_symlink()
+            resolved_targets = {
+                str(resolved)
+                for child in skills_dir.iterdir()
+                if child.is_symlink() and (resolved := child.resolve()).is_dir()
             }
-            skills_paths.extend(p for p in sorted(resolved_parents) if p not in skills_paths)
+            skills_paths.extend(p for p in sorted(resolved_targets) if p not in skills_paths)
 
         kwargs = self._base_config_kwargs(self._model_spec(), self.build_env(workdir))
         kwargs.update(

@@ -464,11 +464,14 @@ def _resolve_sweep_effective_config(
         agent
         or (
             run_config.runtime.agent
-            if run_config is not None and "agent" in run_config.runtime.model_fields_set
+            if run_config is not None and run_config.runtime.agent
             else None
         )
-        or (run_config.general.default_agent if run_config is not None else None)
-        or (run_config.runtime.agent if run_config is not None else None)
+        or (
+            run_config.general.default_agent
+            if run_config is not None and run_config.general.default_agent
+            else None
+        )
         or default_agent()
     )
     eff_runtime = RunConfig.resolve(

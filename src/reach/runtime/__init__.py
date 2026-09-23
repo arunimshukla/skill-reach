@@ -134,7 +134,7 @@ class AgentOptions(BaseModel):
 
 
 class AntigravityOptions(AgentOptions):
-    """Hold common configuration options for Antigravity-ecosystem agent runtimes."""
+    """Configure common options for Antigravity-ecosystem agent runtimes."""
 
     use_symlinks: bool = False
 

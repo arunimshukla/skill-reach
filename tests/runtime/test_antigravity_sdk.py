@@ -217,10 +217,10 @@ def test_select_config_points_at_the_installed_skills_directory(
     assert config.skills_paths == [str(runtime.skills_dir(workdir))]
 
 
-def test_select_config_includes_symlink_parents_when_use_symlinks_true(
+def test_select_config_includes_symlink_targets_when_use_symlinks_true(
     tmp_path: Path,
 ) -> None:
-    """Verify skills_paths includes resolved symlink parent directories when enabled."""
+    """Verify skills_paths includes resolved symlink target directories when enabled."""
     runtime = AntigravitySdkRuntime(options=AntigravitySdkOptions(use_symlinks=True))
     workdir = tmp_path / "work"
     skills_dir = runtime.skills_dir(workdir)
@@ -233,7 +233,7 @@ def test_select_config_includes_symlink_parents_when_use_symlinks_true(
 
     config = runtime._select_config(workdir)
     assert str(skills_dir) in config.skills_paths
-    assert str(external_source.parent) in config.skills_paths
+    assert str(external_source) in config.skills_paths
 
 
 def test_select_reports_the_structured_selection(

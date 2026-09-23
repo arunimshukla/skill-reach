@@ -790,7 +790,7 @@ class RunConfig(BaseModel):
     @model_validator(mode="after")
     def _inherit_runtime_agent_from_general(self) -> Self:
         """Inherit general.default_agent into runtime.agent when runtime.agent is unset."""
-        if "agent" not in self.runtime.model_fields_set:
+        if "agent" not in self.runtime.model_fields_set and self.general.default_agent:
             object.__setattr__(
                 self,
                 "runtime",
